@@ -24,6 +24,9 @@
 .DS_Store
 *.pem
 
+# traces IA (observabilité locale)
+/logs/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
