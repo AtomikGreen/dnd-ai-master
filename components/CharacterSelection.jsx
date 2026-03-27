@@ -7,15 +7,16 @@ const STORAGE_KEY = "dnd_characters";
 
 function characterIdentityKey(c) {
   if (!c || typeof c !== "object") return "";
-  return `${String(c.nom ?? "").trim()}|${String(c.race ?? "").trim()}|${String(c.classe ?? "").trim()}`;
+  return `${String(c.name ?? c.nom ?? "").trim()}|${String(c.race ?? "").trim()}|${String(c.entityClass ?? c.classe ?? "").trim()}`;
 }
 
 /** Pré-tirés (fiches exportées depuis le créateur intégré). */
 const PREGENERATED = [
   {
     id: "pre-1",
-    nom: "Thorin Pied-de-Pierre",
-    classe: "Guerrier",
+    type: "player",
+    name: "Thorin Pied-de-Pierre",
+    entityClass: "Guerrier",
     race: "Nain des Montagnes",
     level: 1,
     alignment: "Loyal Bon",
@@ -30,8 +31,10 @@ const PREGENERATED = [
       "Nain trapu aux larges épaules, barbe rousse tressée avec des anneaux d'acier. Regard sévère mais protecteur, toujours prêt à dégainer.",
     initiative: 1,
     speed: "25 ft",
+    visible: true,
+    isAlive: true,
     hp: { current: 13, max: 13 },
-    armorClass: 19,
+    ac: 19,
     xp: 0,
     hitDie: "d10",
     hitDiceTotal: 1,
@@ -49,12 +52,13 @@ const PREGENERATED = [
     classFeatures: ["Style de combat", "Second souffle"],
     languages: ["Commun", "Nain"],
     selectedSpells: [],
-    inventaire: [
+    inventory: [
       "Cotte de mailles",
       "Bouclier",
       "Épée longue",
       "Arbalète légère",
       "Sac d'explorateur",
+      "Outils de voleur",
     ],
     weapons: [
       { name: "Épée longue", attackBonus: 5, damageDice: "1d8", damageBonus: 3 },
@@ -70,8 +74,9 @@ const PREGENERATED = [
   },
   {
     id: "pre-2",
-    nom: "Elyndra Lame-d'Ombre",
-    classe: "Magicien",
+    type: "player",
+    name: "Elyndra Lame-d'Ombre",
+    entityClass: "Magicien",
     race: "Haut-Elfe",
     level: 1,
     alignment: "Neutre Bon",
@@ -87,8 +92,10 @@ const PREGENERATED = [
       "Elfe élancée aux cheveux argentés et yeux violets perçants. Porte de longues robes sombres et consulte nerveusement son grimoire.",
     initiative: 2,
     speed: "30 ft",
+    visible: true,
+    isAlive: true,
     hp: { current: 8, max: 8 },
-    armorClass: 12,
+    ac: 12,
     xp: 0,
     hitDie: "d6",
     hitDiceTotal: 1,
@@ -120,7 +127,7 @@ const PREGENERATED = [
       "Bouclier",
       "Projectile magique",
     ],
-    inventaire: ["Bâton", "Dague", "Sac d'érudit", "Focaliseur arcanique", "Grimoire"],
+    inventory: ["Bâton", "Dague", "Sac d'érudit", "Focaliseur arcanique", "Grimoire"],
     weapons: [
       { name: "Bâton", attackBonus: 2, damageDice: "1d6", damageBonus: 0 },
       { name: "Dague", attackBonus: 4, damageDice: "1d4", damageBonus: 2 },
@@ -243,16 +250,16 @@ export default function CharacterSelection({ onSelect }) {
               className="group text-left rounded-xl border border-slate-800 bg-slate-900/70 p-4 hover:border-blue-500 hover:bg-slate-900/90 transition-colors"
             >
               <div className="flex items-center justify-between gap-2 mb-1">
-                <p className="text-base font-semibold text-slate-50">{c.nom}</p>
+                <p className="text-base font-semibold text-slate-50">{c.name ?? c.nom}</p>
                 <span className="text-[11px] rounded-full border border-slate-700 px-2 py-0.5 text-slate-300">
                   Niveau {c.level ?? 1}
                 </span>
               </div>
               <p className="text-xs text-slate-400 mb-1">
-                {c.race} — {c.classe}
+                {c.race} — {c.entityClass ?? c.classe}
               </p>
               <p className="text-xs text-slate-500">
-                PV {c.hp?.current ?? "?"}/{c.hp?.max ?? "?"} · CA {c.armorClass ?? "?"} · Vitesse {c.speed ?? "—"}
+                PV {c.hp?.current ?? "?"}/{c.hp?.max ?? "?"} · CA {c.ac ?? c.armorClass ?? "?"} · Vitesse {c.speed ?? "—"}
               </p>
             </button>
           ))}

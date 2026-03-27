@@ -44,6 +44,9 @@ function formatRecentChatScript(rawMessages, playerName = "Joueur") {
         return `Maître du Jeu : ${text}`;
       }
       if (m?.role === "user") {
+        if (m?.type === "auto-player-nudge") {
+          return `[Consigne moteur — pas une réplique du PJ] : ${text}`;
+        }
         return `Moi (${playerName}) : ${text}`;
       }
       return null;
@@ -140,6 +143,48 @@ function formatBattleSnapshotForPrompt(snapshot) {
   }
   if (p) {
     lines.push(`Réaction du PJ encore disponible ce round (AoO, etc.) : ${p.reactionAvailable ? "oui" : "non"}.`);
+  }
+
+  const actionCatalog =
+    s.actionCatalog && typeof s.actionCatalog === "object"
+      ? /** @type {Record<string, unknown>} */ (s.actionCatalog)
+      : null;
+  if (actionCatalog) {
+    const fmtList = (arr) =>
+      (Array.isArray(arr) ? arr : [])
+        .map((x) => {
+          if (!x || typeof x !== "object") return null;
+          const o = /** @type {Record<string, unknown>} */ (x);
+          const label = typeof o.label === "string" ? o.label : String(o.key ?? "Action");
+          const available = o.available === false ? "indisponible" : "disponible";
+          const costObj = o.cost && typeof o.cost === "object" ? /** @type {Record<string, unknown>} */ (o.cost) : null;
+          const cost = costObj
+            ? Object.entries(costObj)
+                .map(([k, v]) => `${k}=${String(v)}`)
+                .join(", ")
+            : "coût inconnu";
+          const note = typeof o.note === "string" && o.note.trim() ? ` | note: ${o.note.trim()}` : "";
+          return `- ${label} | coût: ${cost} | ${available}${note}`;
+        })
+        .filter(Boolean);
+
+    const main = fmtList(actionCatalog.mainActionOptions);
+    const move = fmtList(actionCatalog.movementOptions);
+    const bonus = fmtList(actionCatalog.bonusActionOptions);
+    lines.push("=== CATALOGUE D'ACTIONS DU TOUR (source moteur) ===");
+    if (main.length) {
+      lines.push("Actions principales:");
+      lines.push(main.join("\n"));
+    }
+    if (move.length) {
+      lines.push("Déplacement:");
+      lines.push(move.join("\n"));
+    }
+    if (bonus.length) {
+      lines.push("Actions bonus:");
+      lines.push(bonus.join("\n"));
+    }
+    lines.push("Priorité stricte: choisis d'abord dans ce catalogue et respecte les actions marquées indisponibles.");
   }
 
   const hostileList = Array.isArray(s.hostiles) ? s.hostiles : [];
@@ -244,11 +289,11 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
     `Ton rôle : parler et agir À LA PLACE du personnage joueur humain.`,
     ``,
     `=== PERSONNAGE JOUEUR ===`,
-    `Nom: ${player?.nom ?? "Inconnu"}`,
-    `Race: ${player?.race ?? "Inconnue"}, Classe: ${player?.classe ?? "Inconnue"}, Niveau: ${player?.level ?? "?"}.`,
+    `Nom: ${player?.name ?? "Inconnu"}`,
+    `Race: ${player?.race ?? "Inconnue"}, Classe: ${player?.entityClass ?? "Inconnue"}, Niveau: ${player?.level ?? "?"}.`,
     `Alignement: ${player?.alignment ?? "Non spécifié"}.`,
     `HP: ${player?.hp?.current ?? "?"}/${player?.hp?.max ?? "?"}, CA: ${
-      player?.armorClass ?? "?"
+      player?.ac ?? "?"
     }, Vitesse: ${player?.speed ?? "30 ft"}.`,
     `Stats: FOR ${stats.FOR ?? "?"}, DEX ${stats.DEX ?? "?"}, CON ${
       stats.CON ?? "?"
@@ -317,6 +362,23 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
       ? [
           `- MODE COMBAT : tu es en situation de danger ; priorité au combat tactique (frapper avec une arme nommée, te rapprocher si tu es à distance et veux la mêlée, te désengager, intimider brièvement un adversaire). Évite les longues scènes sociales ou « calmes » tant que le mode moteur est COMBAT et qu'il reste des hostiles.`,
           `- La section « ÉTAT DU MOTEUR » indique qui est au corps à corps avec qui : sers-toi-en pour choisir une attaque de mêlée vs à distance (ex. arc si hors contact).`,
+          ``,
+          `=== COMBAT — ACTIONS POSSIBLES (CONCEPTS D&D) ===`,
+          `Tu ne fais PAS de jets : tu annonces seulement UNE intention ("Je ..."). Le moteur résout la mécanique.`,
+          `Chaque tour, choisis au plus UNE de ces intentions :`,
+          `- Attaquer : frapper/tirer avec UNE arme (nom EXACT dans ta liste). Exemple: "Je frappe le gobelin avec mon Épée longue."`,
+          `- Lancer un sort : uniquement si ton personnage a vraiment un sort pertinent (sinon n'invente pas). Exemple: "Je lance [Nom du sort] sur [cible visible]."`,
+          `- Foncer (Dash) : courir / s'éloigner / se rapprocher rapidement. Exemple: "Je fonce pour me mettre à couvert."`,
+          `- Se désengager (Disengage) : quitter un contact sans attaque d'opportunité. Exemple: "Je me désengage et recule."`,
+          `- Esquiver (Dodge) : se défendre. Exemple: "Je me mets en garde et j'esquive."`,
+          `- Aider (Help) : aider un allié (rare si aucun allié visible). Exemple: "J'aide [allié] contre [ennemi]."`,
+          `- Se cacher (Hide) : tenter de se dissimuler. Exemple: "Je me cache derrière un rocher."`,
+          `- Chercher (Search) : observer/fouiller. Exemple: "Je scrute les fourrés à la recherche d'une menace."`,
+          `- Utiliser un objet : ex. boire une potion (si tu en as). Exemple: "Je bois une potion de soin."`,
+          `- Se tenir prêt (Ready) : préparer une réaction conditionnelle. Exemple: "Je me tiens prêt: si le gobelin avance, je tire."`,
+          ``,
+          `Déplacement : tu peux dire "je m'approche", "je recule", "je me mets à couvert", etc. Le moteur gère la distance. Mais ne combine pas déplacement + attaque dans la même phrase (une seule intention).`,
+          `Action bonus : n'annonce une action bonus que si ton personnage a réellement une capacité qui le justifie. Sinon, n'en parle pas.`,
           `- Si tu penses qu'il n'y a rien de mieux à faire (ou aucune action légale pertinente), termine ton tour : écris une phrase du type "Je termine mon tour."`,
         ].join("\n")
       : ``,
@@ -408,7 +470,7 @@ export async function POST(request) {
         ? messagesBody
         : [];
 
-    const playerDisplayName = String(player?.nom ?? "Joueur").trim() || "Joueur";
+    const playerDisplayName = String(player?.name ?? "Joueur").trim() || "Joueur";
     const recentChatScript = formatRecentChatScript(rawHistory, playerDisplayName);
 
     const basePrompt = buildAutoPlayerSystemPrompt(

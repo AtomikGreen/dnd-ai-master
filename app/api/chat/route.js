@@ -5,8 +5,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAICacheManager } from "@google/generative-ai/server";
 import { NextResponse } from "next/server";
-import { BESTIARY } from "@/data/bestiary";
-import { assignSpawnAdjectiveName, isGenericOrColdSpawnName } from "@/lib/spawnDisplayNames";
 import { CAMPAIGN_CONTEXT, GOBLIN_CAVE } from "@/data/campaign";
 import { logInteraction } from "@/lib/aiTraceLog";
 import {
@@ -26,7 +24,8 @@ const OPENROUTER_BASE  = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
 const GEMINI_MODEL     = "gemini-3-flash-preview";
 const NARRATOR_CACHE_TTL_SECONDS = 3 * 60 * 60;
-const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v1";
+/** Incrémenter ou purger le cache Gemini quand getStaticSystemRules() change matériellement. */
+const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v13";
 let narratorCachePromise = null;
 /** Active le Context Caching : seul getStaticSystemRules() est stocké côté API ; le tour courant passe en JSON (dynamicContext). */
 const USE_GEMINI_CACHE = process.env.USE_GEMINI_CACHE === "true";
@@ -100,6 +99,119 @@ function buildOpenRouterMessages(messages, systemInstruction) {
 function truncateText(s, n = 800) {
   const str = typeof s === "string" ? s : String(s ?? "");
   return str.length > n ? str.slice(0, n) + "…" : str;
+}
+
+function safeGeminiResponseText(generateContentResult) {
+  try {
+    const t = generateContentResult?.response?.text?.();
+    return typeof t === "string" ? t : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Métadonnées de fin de génération Gemini (observabilité : MAX_TOKENS, SAFETY, STOP, etc.). */
+function getGeminiResponseDiagnosticsFromResult(generateContentResult, phase = "unknown") {
+  const out = {
+    phase,
+    finishReason: null,
+    blockReason: null,
+    textLength: 0,
+    usageMetadata: null,
+  };
+  try {
+    const resp = generateContentResult?.response;
+    if (!resp) return out;
+    const c0 = resp.candidates?.[0];
+    out.finishReason = c0?.finishReason ?? null;
+    out.blockReason = resp.promptFeedback?.blockReason ?? null;
+    const um = resp.usageMetadata;
+    if (um && typeof um === "object") {
+      out.usageMetadata = {
+        promptTokenCount: um.promptTokenCount,
+        candidatesTokenCount: um.candidatesTokenCount,
+        totalTokenCount: um.totalTokenCount,
+      };
+    }
+    try {
+      const t = typeof resp.text === "function" ? resp.text() : "";
+      out.textLength = typeof t === "string" ? t.length : 0;
+    } catch {
+      out.textLength = -1;
+    }
+  } catch (e) {
+    out.extractionError = String(e?.message ?? e);
+  }
+  return out;
+}
+
+function logGeminiAttemptIfNoteworthy(diag) {
+  const fr = diag?.finishReason;
+  if (!fr || fr === "STOP") return;
+  console.warn(`[/api/chat] Gemini [${diag.phase}] finishReason=${fr}`, {
+    blockReason: diag.blockReason,
+    textLength: diag.textLength,
+    usage: diag.usageMetadata,
+  });
+}
+
+async function runGeminiNarratorEmergencyRepair(genAI, options) {
+  const { useCache, cacheName, systemInstruction, userMessage, engineEvent, previousRaw } = options;
+  const generationConfig = {
+    responseMimeType: "application/json",
+    temperature: 0.15,
+  };
+  const modelOpts = { model: GEMINI_MODEL, generationConfig };
+  if (useCache && cacheName) {
+    modelOpts.cachedContent = cacheName;
+  } else if (systemInstruction != null && String(systemInstruction).trim()) {
+    modelOpts.systemInstruction = systemInstruction;
+  } else {
+    throw new Error("runGeminiNarratorEmergencyRepair: cache ou systemInstruction requis");
+  }
+  const emergencyModel = genAI.getGenerativeModel(modelOpts);
+  const payload = {
+    emergency_json_only: true,
+    instruction:
+      "Réponds UNIQUEMENT par un objet JSON (pas de tableau racine) avec EXACTEMENT ces clés: \"narrative\" (string) et \"imageDecision\" (object). " +
+      "imageDecision doit être {\"shouldGenerate\": boolean, \"reason\": string, \"focus\": string}. " +
+      "Pas de markdown. Narration en français, 2 phrases maximum.",
+    player_message: String(userMessage ?? "").slice(0, 900),
+    engine_event: engineEvent ?? null,
+    previous_model_output_excerpt: truncateText(String(previousRaw ?? ""), 500),
+  };
+  return emergencyModel.generateContent(JSON.stringify(payload));
+}
+
+const NARRATOR_JSON_FALLBACK_REPLY =
+  "Le narrateur n'a pas pu achever une réponse lisible (sortie interrompue ou mal formée). Tu peux réessayer dans un instant ou reformuler ton action en une courte phrase.";
+
+const GEMINI_RECENT_CHAT_INSTRUCTION =
+  "Utilise recentChat pour le ton et la continuité. Si le dernier message assistant a déjà couvert le même lieu / le même danger (ex. piège repéré, même couloir), ta narration doit être TRÈS courte : 1 à 2 phrases, ~35–55 mots max, sans re-décrire le décor ni les issues. Ne cumule pas impasse + sorties + ambiance dans le même message.";
+
+function buildNarratorClientResponse(raw) {
+  if (!detectFormatIssue(raw)) {
+    return { response: parseResponse(raw, []), narratorFallback: false };
+  }
+  console.warn("[/api/chat] Narrateur: JSON toujours invalide après tous les essais.", {
+    excerpt: truncateText(String(raw ?? ""), 600),
+  });
+  return {
+    response: {
+      valid: true,
+      reply: NARRATOR_JSON_FALLBACK_REPLY,
+      imageDecision: null,
+      rollRequest: null,
+      actionIntent: null,
+      gameMode: null,
+      entityUpdates: null,
+      combatOrder: null,
+      playerHpUpdate: null,
+      sceneUpdate: null,
+      gmContinue: false,
+    },
+    narratorFallback: true,
+  };
 }
 
 function previewMessages(msgs, maxMsgs = 10) {
@@ -384,47 +496,6 @@ function normalizeRollRequestFromLooseAi(raw) {
   return out;
 }
 
-/** Nom bestaire pour un spawn (templateId ou heuristique sur id). */
-function templateNameForSpawnUpdate(update) {
-  const tid =
-    typeof update?.templateId === "string" && update.templateId.trim()
-      ? update.templateId.trim()
-      : null;
-  if (tid && BESTIARY[tid]?.name) return String(BESTIARY[tid].name).trim();
-  const id = String(update?.id ?? "");
-  for (const key of Object.keys(BESTIARY)) {
-    if (id.toLowerCase().includes(key.toLowerCase()) && BESTIARY[key]?.name) {
-      return String(BESTIARY[key].name).trim();
-    }
-  }
-  return "";
-}
-
-/**
- * Filet serveur : spawns sans name distinct ou avec le seul nom du template (ex. plusieurs « Gobelin »).
- * Aligné sur le moteur client (GameContext.applyEntityUpdates).
- */
-function normalizeSpawnNamesInEntityUpdates(entityUpdates, existingEntities = []) {
-  if (!Array.isArray(entityUpdates) || entityUpdates.length === 0) return entityUpdates;
-  const usedByBase = {};
-  let virtualEntities = [...(existingEntities || [])];
-  return entityUpdates.map((u) => {
-    if (!u || u.action !== "spawn") return u;
-    const templateBaseName = templateNameForSpawnUpdate(u);
-    const providedName = typeof u.name === "string" ? u.name.trim() : "";
-    const nameMissingOrGeneric =
-      !providedName ||
-      (!!templateBaseName && isGenericOrColdSpawnName(templateBaseName, providedName));
-    if (!nameMissingOrGeneric) return u;
-    const base = templateBaseName || providedName || "Créature";
-    const key = base.toLowerCase();
-    if (!usedByBase[key]) usedByBase[key] = new Set();
-    const name = assignSpawnAdjectiveName(base, virtualEntities, usedByBase[key]);
-    virtualEntities = [...virtualEntities, { name }];
-    return { ...u, name };
-  });
-}
-
 function tryParseJsonLenient(raw) {
   const text = String(raw ?? "").trim();
   if (!text) return null;
@@ -481,6 +552,22 @@ function tryParseJsonLenient(raw) {
   return null;
 }
 
+/** Si le modèle dépasse encore la consigne, coupe à une fin de phrase propre quand c’est possible. */
+function clampNarrativeLength(reply, maxWords = 95) {
+  const s = String(reply ?? "").trim();
+  if (!s) return s;
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return s;
+  const slice = words.slice(0, maxWords).join(" ");
+  const cut = Math.max(
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf("! ")
+  );
+  if (cut > 24) return slice.slice(0, cut + 1).trim();
+  return `${slice}…`;
+}
+
 function parseResponse(raw, existingEntities = []) {
   try {
     const parsed = tryParseJsonLenient(raw);
@@ -497,17 +584,31 @@ function parseResponse(raw, existingEntities = []) {
       data.text ||
       data.dialogue ||
       "";
-    const reply =
+    let reply =
       typeof textContent === "string"
         ? textContent.trim()
         : JSON.stringify(textContent);
+    reply = clampNarrativeLength(reply, 95);
     if (reply === "") {
       console.warn("JSON PARSING WARNING: Missing narrative key. Raw data:", data);
+    }
+
+    let imageDecision = null;
+    if (data.imageDecision && typeof data.imageDecision === "object" && !Array.isArray(data.imageDecision)) {
+      const shouldGenerate = data.imageDecision.shouldGenerate === true;
+      const reason = String(data.imageDecision.reason ?? "").trim();
+      const focus = String(data.imageDecision.focus ?? "").trim();
+      imageDecision = {
+        shouldGenerate,
+        reason: reason.slice(0, 240),
+        focus: focus.slice(0, 320),
+      };
     }
 
     return {
       valid: true,
       reply,
+      imageDecision,
       rollRequest: null,
       actionIntent: null,
       gameMode: null,
@@ -520,7 +621,8 @@ function parseResponse(raw, existingEntities = []) {
   } catch {
     return {
       valid: true,
-      reply: raw,
+      reply: clampNarrativeLength(String(raw ?? "").trim(), 95),
+      imageDecision: null,
       rollRequest: null,
       actionIntent: null,
       gameMode: null,
@@ -539,7 +641,8 @@ function buildFormatRetryInstruction(formatIssue, previousRaw) {
   return (
     `[FORMAT INVALIDE DETECTE] ${safeIssue}\n` +
     `Ta réponse précédente ne respecte pas le contrat JSON du narrateur.\n` +
-    `Respecte STRICTEMENT le format demandé: un objet JSON unique avec la clé "narrative".\n` +
+    `Respecte STRICTEMENT le format demandé: un objet JSON unique avec les clés "narrative" ET "imageDecision".\n` +
+    `imageDecision doit être un objet { shouldGenerate: boolean, reason: string, focus: string }.\n` +
     `Renvoie UNIQUEMENT le JSON final, sans markdown ni texte hors JSON.\n` +
     `Réponse invalide précédente (extrait):\n${rawPreview}`
   );
@@ -553,6 +656,11 @@ function detectFormatIssue(raw) {
   const narrative = data.narrative ?? data.narration ?? data.reply ?? data.message ?? data.text ?? "";
   if (typeof narrative !== "string") return "narrative non-string";
   if (!narrative.trim()) return "narrative manquante ou vide";
+  const img = data.imageDecision;
+  if (!img || typeof img !== "object" || Array.isArray(img)) return "imageDecision manquante ou invalide (objet requis)";
+  if (typeof img.shouldGenerate !== "boolean") return "imageDecision.shouldGenerate manquant ou non-booléen";
+  if (typeof img.reason !== "string") return "imageDecision.reason manquant ou non-string";
+  if (typeof img.focus !== "string") return "imageDecision.focus manquant ou non-string";
   return null;
 }
 
@@ -571,6 +679,7 @@ export async function POST(request) {
       entities = [],
       gameMode = "exploration",
       engineEvent = null,
+      roomMemory = "",
       debugMode = false,
     } = body;
 
@@ -619,7 +728,6 @@ export async function POST(request) {
         })
         .filter(Boolean);
       campaignContext = {
-        currentRoomSecrets: currentRoom.secrets ?? "",
         currentRoomTitle: currentRoom.title ?? roomId,
         allowedExits,
         encounterEntities: Array.isArray(currentRoom.encounterEntities)
@@ -640,7 +748,8 @@ export async function POST(request) {
       entities,
       gameMode,
       engineEvent,
-      campaignContext
+      campaignContext,
+      roomMemory
     );
     const staticSystemRules = getStaticSystemRules();
     /** Même ordre que l’ancien prompt monolithique : faits de partie puis règles invariantes. */
@@ -648,6 +757,14 @@ export async function POST(request) {
       dynamicContext,
       staticSystemRules
     );
+    const { userMessage } = formatHistoryForGemini(limitedMessages);
+    const recentChat = buildRecentChatForNarrator(limitedMessages, 14);
+    const geminiDynamicInput = {
+      dynamicContext,
+      playerMessage: userMessage,
+      recentChat,
+      recentChatInstruction: GEMINI_RECENT_CHAT_INSTRUCTION,
+    };
 
     // -----------------------------------------------------------------------
     // Chemin A : Google Gemini (SDK natif)
@@ -659,55 +776,91 @@ export async function POST(request) {
           const model = genAI.getGenerativeModel({
             model: GEMINI_MODEL,
             cachedContent: cache.name,
-            generationConfig: { responseMimeType: "application/json" },
+            generationConfig: {
+              responseMimeType: "application/json",
+              // Défaut Gemini sans temperature = variabilité plus haute → JSON vide / clés hors contrat plus souvent.
+              temperature: 0.2,
+            },
           });
 
-          const { userMessage } = formatHistoryForGemini(limitedMessages);
-          const recentChat = buildRecentChatForNarrator(limitedMessages, 14);
-          const dynamicInput = {
-            dynamicContext,
-            gameContext: {
-              player,
-              currentScene: sceneStr,
-              currentRoomId: roomId || null,
-              entities,
-              gameMode,
-              engineEvent,
-              campaignContext,
-            },
-            playerMessage: userMessage,
-            recentChat,
-            recentChatInstruction:
-              "Utilise recentChat pour comprendre le contexte et éviter les répétitions. Ne re-raconte pas un déplacement ou une arrivée déjà narrés si le joueur n'apporte pas d'élément nouveau.",
-          };
           let formatRetryUsed = false;
           let formatRetryReason = null;
-          const result = await model.generateContent(JSON.stringify(dynamicInput));
-          let raw = result.response.text();
+          let firstAttemptRaw = null;
+          let formatEmergencyUsed = false;
+          const geminiAttempts = [];
+
+          const pushGeminiDiag = (phase, genResult) => {
+            const d = getGeminiResponseDiagnosticsFromResult(genResult, phase);
+            geminiAttempts.push(d);
+            logGeminiAttemptIfNoteworthy(d);
+          };
+
+          const result = await model.generateContent(JSON.stringify(geminiDynamicInput));
+          pushGeminiDiag("primary", result);
+          let raw = safeGeminiResponseText(result);
           let formatIssue = detectFormatIssue(raw);
           if (formatIssue) {
             formatRetryUsed = true;
             formatRetryReason = formatIssue;
+            firstAttemptRaw = raw;
             const retryInput = {
-              ...dynamicInput,
+              ...geminiDynamicInput,
               formatRetryInstruction: buildFormatRetryInstruction(formatIssue, raw),
             };
             const retryResult = await model.generateContent(JSON.stringify(retryInput));
-            raw = retryResult.response.text();
+            pushGeminiDiag("format_retry", retryResult);
+            raw = safeGeminiResponseText(retryResult);
+            formatIssue = detectFormatIssue(raw);
+          }
+          if (formatIssue) {
+            formatEmergencyUsed = true;
+            try {
+              const emergResult = await runGeminiNarratorEmergencyRepair(genAI, {
+                useCache: true,
+                cacheName: cache.name,
+                systemInstruction: null,
+                userMessage: geminiDynamicInput.playerMessage,
+                engineEvent,
+                previousRaw: raw,
+              });
+              pushGeminiDiag("emergency_repair", emergResult);
+              raw = safeGeminiResponseText(emergResult);
+            } catch (emergErr) {
+              console.error("[/api/chat] Narrateur emergency (cache) échouée :", emergErr);
+              geminiAttempts.push({
+                phase: "emergency_repair",
+                error: String(emergErr?.message ?? emergErr),
+              });
+            }
           }
 
-          const parsed = parseResponse(raw, entities);
-          await logInteraction("GM", "gemini-cache", dynamicInput, staticSystemRules, raw, parsed);
+          const clientPack = buildNarratorClientResponse(raw);
+          const parsed = clientPack.response;
+          const narratorFallback = clientPack.narratorFallback;
+          if (narratorFallback) {
+            console.warn("[/api/chat] Narrateur: message de secours (JSON irrécupérable).");
+          }
+
+          await logInteraction("GM", "gemini-cache", geminiDynamicInput, staticSystemRules, raw, parsed, {
+            formatRetryUsed,
+            formatRetryReason,
+            firstAttemptRaw,
+            formatEmergencyUsed,
+            narratorFallback,
+            geminiGeneration: { attempts: geminiAttempts },
+          });
           return NextResponse.json({
             ...parsed,
             formatRetryUsed,
             formatRetryReason,
+            formatEmergencyUsed,
+            narratorFallback,
             debugPrompt: {
               provider: "gemini",
               cacheMode: "active",
               cachedContent: cache.name,
               staticRulesPreview: truncateText(staticSystemRules, 1200),
-              dynamicInputPreview: truncateText(JSON.stringify(dynamicInput), 2500),
+              dynamicInputPreview: truncateText(JSON.stringify(geminiDynamicInput), 2500),
             },
           });
         } catch (cacheErr) {
@@ -716,56 +869,94 @@ export async function POST(request) {
         }
       }
 
-      // Fallback dev / prompt-engineering : mode Gemini standard sans cache.
+      // Mode Gemini standard sans cache :
+      // on envoie EXACTEMENT la même charge dynamique qu'en mode cache,
+      // seule la source des règles statiques change (cachedContent vs systemInstruction).
       const model = genAI.getGenerativeModel({
         model: GEMINI_MODEL,
-        systemInstruction,
-        generationConfig: { responseMimeType: "application/json" },
+        systemInstruction: staticSystemRules,
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        },
       });
-      const { history, userMessage } = formatHistoryForGemini(limitedMessages);
-      const chat = model.startChat({ history });
       let formatRetryUsed = false;
       let formatRetryReason = null;
-      const result = await chat.sendMessage(userMessage);
-      let raw = result.response.text();
-      const formatIssue = detectFormatIssue(raw);
+      let firstAttemptRaw = null;
+      let formatEmergencyUsed = false;
+      const geminiAttempts = [];
+
+      const pushGeminiDiag = (phase, genResult) => {
+        const d = getGeminiResponseDiagnosticsFromResult(genResult, phase);
+        geminiAttempts.push(d);
+        logGeminiAttemptIfNoteworthy(d);
+      };
+
+      const result = await model.generateContent(JSON.stringify(geminiDynamicInput));
+      pushGeminiDiag("primary_no_cache", result);
+      let raw = safeGeminiResponseText(result);
+      let formatIssue = detectFormatIssue(raw);
       if (formatIssue) {
         formatRetryUsed = true;
         formatRetryReason = formatIssue;
-        const retryMessage = buildFormatRetryInstruction(formatIssue, raw);
-        const retryResult = await chat.sendMessage(retryMessage);
-        raw = retryResult.response.text();
+        firstAttemptRaw = raw;
+        const retryInput = {
+          ...geminiDynamicInput,
+          formatRetryInstruction: buildFormatRetryInstruction(formatIssue, raw),
+        };
+        const retryResult = await model.generateContent(JSON.stringify(retryInput));
+        pushGeminiDiag("format_retry_no_cache", retryResult);
+        raw = safeGeminiResponseText(retryResult);
+        formatIssue = detectFormatIssue(raw);
+      }
+      if (formatIssue) {
+        formatEmergencyUsed = true;
+        try {
+          const emergResult = await runGeminiNarratorEmergencyRepair(genAI, {
+            useCache: false,
+            cacheName: null,
+            systemInstruction: staticSystemRules,
+            userMessage: geminiDynamicInput.playerMessage,
+            engineEvent,
+            previousRaw: raw,
+          });
+          pushGeminiDiag("emergency_repair_no_cache", emergResult);
+          raw = safeGeminiResponseText(emergResult);
+        } catch (emergErr) {
+          console.error("[/api/chat] Narrateur emergency (sans cache) échouée :", emergErr);
+          geminiAttempts.push({
+            phase: "emergency_repair_no_cache",
+            error: String(emergErr?.message ?? emergErr),
+          });
+        }
       }
 
-      const parsed = parseResponse(raw, entities);
-      const dynamicInputNoCache = {
-        mode: "gemini-no-cache",
-        dynamicContext,
-        messagesOrdered: limitedMessages,
-        gameContext: {
-          player,
-          currentScene: sceneStr,
-          currentRoomId: roomId || null,
-          entities,
-          gameMode,
-          engineEvent,
-          campaignContext,
-        },
-        userMessage,
-        history,
-        systemInstruction,
-      };
-      await logInteraction("GM", "gemini", dynamicInputNoCache, staticSystemRules, raw, parsed);
+      const clientPack = buildNarratorClientResponse(raw);
+      const parsed = clientPack.response;
+      const narratorFallback = clientPack.narratorFallback;
+      if (narratorFallback) {
+        console.warn("[/api/chat] Narrateur: message de secours (JSON irrécupérable, mode sans cache).");
+      }
+
+      await logInteraction("GM", "gemini", geminiDynamicInput, staticSystemRules, raw, parsed, {
+        formatRetryUsed,
+        formatRetryReason,
+        firstAttemptRaw,
+        formatEmergencyUsed,
+        narratorFallback,
+        geminiGeneration: { attempts: geminiAttempts },
+      });
       return NextResponse.json({
         ...parsed,
         formatRetryUsed,
         formatRetryReason,
+        formatEmergencyUsed,
+        narratorFallback,
         debugPrompt: {
           provider: "gemini",
           cacheMode: "inactive",
-          systemInstruction,
-          historyPreview: history?.slice?.(-10) ?? [],
-          userMessagePreview: truncateText(userMessage, 2000),
+          staticRulesPreview: truncateText(staticSystemRules, 1200),
+          dynamicInputPreview: truncateText(JSON.stringify(geminiDynamicInput), 2500),
         },
       });
     }
@@ -806,12 +997,14 @@ export async function POST(request) {
 
     let formatRetryUsed = false;
     let formatRetryReason = null;
+    let firstAttemptRaw = null;
     const data = await res.json();
     let raw  = data.choices?.[0]?.message?.content ?? "";
     const formatIssue = detectFormatIssue(raw);
     if (formatIssue) {
       formatRetryUsed = true;
       formatRetryReason = formatIssue;
+      firstAttemptRaw = raw;
       const retryMessages = [
         ...openRouterMessages,
         { role: "assistant", content: raw },
@@ -845,7 +1038,11 @@ export async function POST(request) {
       messagesOrdered: limitedMessages,
       messages: openRouterMessages,
     };
-    await logInteraction("GM", "openrouter", dynamicInputOpenRouter, staticSystemRules, raw, safe);
+    await logInteraction("GM", "openrouter", dynamicInputOpenRouter, staticSystemRules, raw, safe, {
+      formatRetryUsed,
+      formatRetryReason,
+      firstAttemptRaw,
+    });
     return NextResponse.json({
       ...safe,
       formatRetryUsed,

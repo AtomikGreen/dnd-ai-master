@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useGame } from "@/context/GameContext";
 import { playBip } from "@/lib/sounds";
 import { ARMORS, SPELLS, WEAPONS, ROGUE_SNEAK_ATTACK_DICE_BY_LEVEL } from "@/data/srd5";
@@ -316,11 +316,11 @@ function computeWeaponAttackParts(player, weaponName) {
 }
 
 function effectivePlayerArmorClass(player) {
-  const base = Number(player?.armorClass ?? 10) || 10;
+  const base = Number(player?.ac ?? 10) || 10;
   const style = player?.fighter?.fightingStyle ?? null;
   if (style !== "Défense") return base;
   // Défense : +1 CA si on porte une armure. On approxime en détectant une armure dans l'inventaire.
-  const inv = Array.isArray(player?.inventaire) ? player.inventaire : [];
+  const inv = Array.isArray(player?.inventory) ? player.inventory : [];
   const hasArmor = inv.some((item) => {
     const armor = ARMORS?.[item];
     if (!armor) return false;
@@ -437,6 +437,7 @@ function applyUpdatesLocally(entities, updates) {
           ...(upd.lootItems !== undefined && { lootItems: upd.lootItems }),
           ...(upd.looted !== undefined && { looted: upd.looted }),
           ...(upd.surprised !== undefined && { surprised: !!upd.surprised }),
+          ...(upd.awareOfPlayer !== undefined && { awareOfPlayer: !!upd.awareOfPlayer }),
         };
         if (upd.hp !== undefined) {
           merged.hp = normalizeHpShape(upd.hp, e.hp ?? null);
@@ -479,6 +480,7 @@ function applyUpdatesLocally(entities, updates) {
                 ...(upd.lootItems !== undefined && { lootItems: upd.lootItems }),
                 ...(upd.looted !== undefined && { looted: upd.looted }),
                 ...(upd.surprised !== undefined && { surprised: !!upd.surprised }),
+                ...(upd.awareOfPlayer !== undefined && { awareOfPlayer: !!upd.awareOfPlayer }),
                 ...(upd.hp !== undefined && { hp: normalizeHpShape(upd.hp, ent.hp ?? null) }),
                 type: nt,
                 name: upd.name ?? e.name,
@@ -510,12 +512,29 @@ function applyUpdatesLocally(entities, updates) {
               : null,
           looted: upd.looted ?? false,
           surprised: upd.surprised ?? false,
+          awareOfPlayer:
+            typeof upd.awareOfPlayer === "boolean"
+              ? upd.awareOfPlayer
+              : nt === "hostile",
         };
         current = [...current, newE];
       }
     }
   }
   return current;
+}
+
+function isPlayerEntityUpdate(update) {
+  return typeof update?.id === "string" && update.id.trim() === "player";
+}
+
+function playerEntityUpdatesTouchHp(updates) {
+  if (!Array.isArray(updates)) return false;
+  return updates.some((update) => {
+    if (!isPlayerEntityUpdate(update)) return false;
+    if (update?.action === "kill" || update?.action === "remove") return true;
+    return (update?.action === "update" || update?.action === "spawn") && update?.hp !== undefined;
+  });
 }
 
 /** Remplace **texte** par <strong> dans un message. */
@@ -857,24 +876,34 @@ function computeCheckBonus({ player, stat, skill }) {
   return base + (proficient ? prof : 0);
 }
 
-function computeSpellAttackBonus(player) {
-  const prof = proficiencyBonusFromLevel(player?.level);
-  const classe = String(player?.classe ?? "").toLowerCase();
+function getCombatantKnownSpells(combatant) {
+  return Array.isArray(combatant?.selectedSpells) ? combatant.selectedSpells.filter(Boolean) : [];
+}
+
+function computeSpellAttackBonus(combatant) {
+  if (typeof combatant?.spellAttackBonus === "number" && Number.isFinite(combatant.spellAttackBonus)) {
+    return combatant.spellAttackBonus;
+  }
+  const prof = proficiencyBonusFromLevel(combatant?.level);
+  const classe = String(combatant?.entityClass ?? "").toLowerCase();
   let key = "CHA";
   if (classe.includes("magicien")) key = "INT";
   else if (classe.includes("clerc") || classe.includes("druide") || classe.includes("paladin") || classe.includes("rôdeur") || classe.includes("rodeur")) key = "SAG";
   // bardes / ensorceleurs / occultistes restent basés sur CHA
-  const base = abilityMod(player?.stats?.[key]);
+  const base = abilityMod(combatant?.stats?.[key]);
   return base + prof;
 }
 
-function computeSpellSaveDC(player) {
-  const prof = proficiencyBonusFromLevel(player?.level);
-  const classe = String(player?.classe ?? "").toLowerCase();
+function computeSpellSaveDC(combatant) {
+  if (typeof combatant?.spellSaveDc === "number" && Number.isFinite(combatant.spellSaveDc)) {
+    return combatant.spellSaveDc;
+  }
+  const prof = proficiencyBonusFromLevel(combatant?.level);
+  const classe = String(combatant?.entityClass ?? "").toLowerCase();
   let key = "CHA";
   if (classe.includes("magicien")) key = "INT";
   else if (classe.includes("clerc") || classe.includes("druide") || classe.includes("paladin") || classe.includes("rôdeur") || classe.includes("rodeur")) key = "SAG";
-  const base = abilityMod(player?.stats?.[key]);
+  const base = abilityMod(combatant?.stats?.[key]);
   return 8 + prof + base;
 }
 
@@ -969,24 +998,28 @@ function normalizeClientActionIntent(raw) {
   return { type: String(type), targetId, itemName };
 }
 
-function playerCanLaunchSpell(player, spellCanon) {
+function combatantCanLaunchSpell(combatant, spellCanon) {
   if (!spellCanon || !SPELLS?.[spellCanon]) return false;
   const raw = normalizeFr(spellCanon);
-  if (player?.classe === "Magicien") {
-    const prep = player?.selectedSpells ?? [];
+  if (combatant?.entityClass === "Magicien") {
+    const prep = getCombatantKnownSpells(combatant);
     return prep.some((s) => normalizeFr(s) === raw);
   }
-  if (player?.classe === "Clerc") {
-    const launch = player?.selectedSpells ?? [];
-    const domain = player?.cleric?.domainSpells ?? [];
-    const prep = player?.cleric?.preparedSpells ?? [];
+  if (combatant?.entityClass === "Clerc") {
+    const launch = getCombatantKnownSpells(combatant);
+    const domain = combatant?.cleric?.domainSpells ?? [];
+    const prep = combatant?.cleric?.preparedSpells ?? [];
     if (launch.some((s) => normalizeFr(s) === raw)) return true;
     if (domain.some((s) => normalizeFr(s) === raw)) return true;
     if (prep.some((s) => normalizeFr(s) === raw)) return true;
     return false;
   }
-  const known = player?.selectedSpells ?? [];
+  const known = getCombatantKnownSpells(combatant);
   return known.some((s) => normalizeFr(s) === raw);
+}
+
+function playerCanLaunchSpell(player, spellCanon) {
+  return combatantCanLaunchSpell(player, spellCanon);
 }
 
 /**
@@ -1027,12 +1060,12 @@ function validateNamedWeaponOrSpellFromParser(apiIntent, player) {
  * Résout arme ou sort pour une intention de combat (moteur client).
  * @returns {{ kind: "weapon", weapon: object } | { kind: "spell", spellName: string } | { kind: "error", message: string }}
  */
-function resolveCombatItemForIntent(intentType, itemName, player, userContent) {
+function resolveCombatItemForIntent(intentType, itemName, combatant, userContent) {
   if (intentType === "spell" && !String(itemName ?? "").trim()) {
     return { kind: "error", message: "Action impossible : précisez le nom du sort (itemName)." };
   }
-  const knownSpells = Array.isArray(player?.selectedSpells) ? player.selectedSpells : [];
-  let spellCanon = itemName ? canonicalizeSpellNameAgainstPlayer(player, itemName) : null;
+  const knownSpells = getCombatantKnownSpells(combatant);
+  let spellCanon = itemName ? canonicalizeSpellNameAgainstCombatant(combatant, itemName) : null;
   if (!spellCanon && itemName && knownSpells.length) {
     const raw = normalizeFr(itemName);
     for (const s of knownSpells) {
@@ -1054,7 +1087,7 @@ function resolveCombatItemForIntent(intentType, itemName, player, userContent) {
     if (!finalName || !SPELLS?.[finalName]) {
       return { kind: "error", message: "Action impossible : sort inconnu." };
     }
-    if (!playerCanLaunchSpell(player, finalName)) {
+    if (!combatantCanLaunchSpell(combatant, finalName)) {
       return {
         kind: "error",
         message: `Action impossible : **${finalName}** n'est pas parmi vos sorts lançables.`,
@@ -1073,19 +1106,19 @@ function resolveCombatItemForIntent(intentType, itemName, player, userContent) {
   let weapon = null;
   if (itemTrim) {
     weapon =
-      player?.weapons?.find((w) => normalizeFr(w.name) === normalizeFr(itemName)) ?? null;
+      combatant?.weapons?.find((w) => normalizeFr(w.name) === normalizeFr(itemName)) ?? null;
     if (!weapon) {
-      const c = canonicalizeWeaponNameAgainstPlayer(player, itemName);
+      const c = canonicalizeWeaponNameAgainstCombatant(combatant, itemName);
       if (c) {
-        weapon = player?.weapons?.find((w) => normalizeFr(w.name) === normalizeFr(c)) ?? null;
+        weapon = combatant?.weapons?.find((w) => normalizeFr(w.name) === normalizeFr(c)) ?? null;
       }
     }
   }
   if (!weapon && allowUnarmed) {
-    weapon = buildUnarmedWeapon(player, itemTrim ? itemName : userContent);
+    weapon = buildUnarmedWeapon(combatant, itemTrim ? itemName : userContent);
   }
   if (!weapon) {
-    const list = (player?.weapons ?? []).map((w) => w.name).join(", ");
+    const list = (combatant?.weapons ?? []).map((w) => w.name).join(", ");
     return {
       kind: "error",
       message: list
@@ -1147,7 +1180,7 @@ function executeCombatActionIntent(intent, ctx) {
     if (!turnResources?.bonus) {
       return fail("Action impossible : vous n'avez pas la possibilité de faire ca.");
     }
-    if (player?.classe !== "Guerrier") {
+    if (player?.entityClass !== "Guerrier") {
       return fail("Action impossible : vous n'avez pas la possibilité de faire ca.");
     }
     const remaining = player?.fighter?.resources?.secondWind?.remaining ?? 0;
@@ -1231,8 +1264,8 @@ function executeCombatActionIntent(intent, ctx) {
       return fail("Action impossible : rien à récupérer sur ce corps.");
     }
 
-    const currentInv = Array.isArray(player?.inventaire) ? player.inventaire : [];
-    updatePlayer?.({ inventaire: [...currentInv, ...finalLoot] });
+    const currentInv = Array.isArray(player?.inventory) ? player.inventory : [];
+    updatePlayer?.({ inventory: [...currentInv, ...finalLoot] });
     applyEntityUpdates?.([{ action: "update", id: corpse.id, looted: true, lootItems: [] }]);
     addMessage(
       "ai",
@@ -1416,7 +1449,7 @@ function executeCombatActionIntent(intent, ctx) {
       }
       consumeMovementResource(setTurnResources);
       addMeleeMutual("player", targetId);
-      const pjName = player?.nom ?? "Votre personnage";
+      const pjName = player?.name ?? "Votre personnage";
       addMessage(
         "ai",
         `${pjName} se déplace au corps à corps de ${targetEnt.name}.`,
@@ -1461,10 +1494,10 @@ function resourceForCastingTime(castingTime) {
   return "action";
 }
 
-function canonicalizeSpellNameAgainstPlayer(player, spellName) {
+function canonicalizeSpellNameAgainstCombatant(combatant, spellName) {
   const raw = normalizeFr(spellName);
   if (!raw) return null;
-  const known = player?.selectedSpells ?? [];
+  const known = getCombatantKnownSpells(combatant);
   // match exact normalisé
   for (const s of known) {
     if (normalizeFr(s) === raw) return s;
@@ -1472,6 +1505,10 @@ function canonicalizeSpellNameAgainstPlayer(player, spellName) {
   // match fuzzy (tolère petites fautes: "fraccas" -> "Fracas")
   const fuzzy = bestFuzzyMatch(raw, known);
   return fuzzy ?? null;
+}
+
+function canonicalizeSpellNameAgainstPlayer(player, spellName) {
+  return canonicalizeSpellNameAgainstCombatant(player, spellName);
 }
 
 function findKnownSpellInText(text, knownSpells) {
@@ -1524,10 +1561,10 @@ function detectMentionedWeaponName(text) {
   return null;
 }
 
-function canonicalizeWeaponNameAgainstPlayer(player, weaponName) {
+function canonicalizeWeaponNameAgainstCombatant(combatant, weaponName) {
   const raw = normalizeFr(weaponName);
   if (!raw) return null;
-  const ownedNames = (player?.weapons ?? []).map((w) => w?.name).filter(Boolean);
+  const ownedNames = (combatant?.weapons ?? []).map((w) => w?.name).filter(Boolean);
   // match exact normalisé
   for (const name of ownedNames) {
     if (normalizeFr(name) === raw) return name;
@@ -1535,6 +1572,10 @@ function canonicalizeWeaponNameAgainstPlayer(player, weaponName) {
   // match fuzzy (ex: "repiere" -> "Rapière")
   const fuzzy = bestFuzzyMatch(raw, ownedNames);
   return fuzzy ?? null;
+}
+
+function canonicalizeWeaponNameAgainstPlayer(player, weaponName) {
+  return canonicalizeWeaponNameAgainstCombatant(player, weaponName);
 }
 
 async function resolveSpellCastNow({
@@ -1557,10 +1598,10 @@ async function resolveSpellCastNow({
 }) {
   const prepared = Array.isArray(player?.selectedSpells) ? player.selectedSpells : [];
   const spellbook =
-    player?.classe === "Magicien" && Array.isArray(player?.wizard?.spellbook)
+    player?.entityClass === "Magicien" && Array.isArray(player?.wizard?.spellbook)
       ? player.wizard.spellbook
       : null;
-  const isCleric = player?.classe === "Clerc";
+  const isCleric = player?.entityClass === "Clerc";
   const allClericSpells = isCleric
     ? Object.entries(SPELLS ?? {})
         .filter(([, s]) => Array.isArray(s?.classes) && s.classes.includes("Clerc"))
@@ -1575,7 +1616,7 @@ async function resolveSpellCastNow({
   const spellName = spellFromPrepared ?? spellFromBook ?? spellFromAnyCleric;
   if (!spellName) return false;
 
-  if (player?.classe === "Magicien" && spellbook && spellFromBook && !spellFromPrepared) {
+  if (player?.entityClass === "Magicien" && spellbook && spellFromBook && !spellFromPrepared) {
     // Afficher le message du joueur tel quel
     addMessage("user", text, undefined, makeMsgId());
     addMessage(
@@ -1668,6 +1709,7 @@ async function resolveSpellCastNow({
       }
     }
 
+    myUpdates = markSceneHostilesAware(entities, myUpdates);
     const nextEntities = myUpdates.length ? applyUpdatesLocally(entities, myUpdates) : entities;
     if (myUpdates.length) applyEntityUpdates(myUpdates);
     ensureCombatState(nextEntities);
@@ -1765,6 +1807,7 @@ export default function ChatInterface() {
     getMeleeWith, addMeleeMutual, clearMeleeFor, setReactionFor, hasReaction, initCombatReactions,
     aiProvider, setAiProvider,
     autoPlayerEnabled, setAutoPlayerEnabled,
+    autoRollEnabled, setAutoRollEnabled,
     restartAdventure,
     debugMode, setDebugMode,
     setCurrentSceneName, setCurrentSceneImage,
@@ -1782,6 +1825,7 @@ export default function ChatInterface() {
   const [movementGate, setMovementGate] = useState(null); // { text: string, hostileIds: string[] }
   const [showActionsHelp, setShowActionsHelp] = useState(false);
   const [fullImageUrl, setFullImageUrl] = useState(null);
+  const [sceneImageTrigger, setSceneImageTrigger] = useState(null);
   const [arcaneRecoveryOpen, setArcaneRecoveryOpen] = useState(false);
   const [arcaneRecoveryPick, setArcaneRecoveryPick] = useState({}); // { [spellLevel]: number }
   const [latencyAvgMs, setLatencyAvgMs] = useState(null);
@@ -1824,9 +1868,35 @@ export default function ChatInterface() {
     },
     [setTurnResources]
   );
+  const grantPlayerTurnResources = useCallback(() => {
+    setReactionFor("player", true);
+    setTurnResourcesSynced({
+      action: true,
+      bonus: true,
+      reaction: true,
+      movement: true,
+    });
+  }, [setReactionFor, setTurnResourcesSynced]);
+  const lockPlayerTurnResourcesForSurprise = useCallback(() => {
+    setReactionFor("player", false);
+    setTurnResourcesSynced({
+      action: false,
+      bonus: false,
+      reaction: false,
+      movement: false,
+    });
+  }, [setReactionFor, setTurnResourcesSynced]);
+  const clearPlayerSurprisedState = useCallback(() => {
+    if (player?.surprised !== true) return false;
+    updatePlayer({ surprised: false });
+    grantPlayerTurnResources();
+    return true;
+  }, [grantPlayerTurnResources, player?.surprised, updatePlayer]);
   // Ref pour suivre l'état courant du mode auto-joueur même Ã  l'intérieur des callbacks/timeout
   const autoPlayerEnabledRef = useRef(autoPlayerEnabled);
   useEffect(() => { autoPlayerEnabledRef.current = autoPlayerEnabled; }, [autoPlayerEnabled]);
+  const autoRollEnabledRef = useRef(autoRollEnabled);
+  useEffect(() => { autoRollEnabledRef.current = autoRollEnabled; }, [autoRollEnabled]);
   const flowBlockedRef = useRef(flowBlocked);
   useEffect(() => { flowBlockedRef.current = flowBlocked; }, [flowBlocked]);
   const failedRequestPayloadRef = useRef(failedRequestPayload);
@@ -1847,6 +1917,16 @@ export default function ChatInterface() {
     if (arr.length > 30) arr.splice(0, arr.length - 30);
   }
 
+  function shouldHidePendingRollReason(roll) {
+    return !!roll && roll.kind === "check" && roll.returnToArbiter === true;
+  }
+
+  function getPublicPendingRollTitle(roll) {
+    if (!roll) return "Jet requis";
+    const label = roll.skill ? `Jet de ${roll.skill}` : `Jet de ${roll.stat}`;
+    return shouldHidePendingRollReason(roll) ? label : `${label} (${roll.raison})`;
+  }
+
   const awaitingPlayerInitiativeRef = useRef(awaitingPlayerInitiative);
   useEffect(() => {
     awaitingPlayerInitiativeRef.current = awaitingPlayerInitiative;
@@ -1857,14 +1937,28 @@ export default function ChatInterface() {
   useEffect(() => {
     pendingRollRef.current = pendingRoll;
   }, [pendingRoll]);
+  useEffect(() => {
+    if (gameMode === "combat") return;
+    grantPlayerTurnResources();
+    if (player?.surprised === true) {
+      updatePlayer({ surprised: false });
+    }
+  }, [gameMode, grantPlayerTurnResources, player?.surprised, updatePlayer]);
+
+  // Verrou : quand on résout un jet (et sa chaîne scène-arbitre / narration),
+  // on évite que l'auto-joueur injecte une nouvelle intention au milieu.
+  const rollResolutionInProgressRef = useRef(false);
 
   // Anti-boucle : mémoriser la dernière intention exacte envoyée au MJ
   const lastAutoPlayerIntentRef = useRef(null);
 
-  // IMPORTANT : éviter les closures stales. Le setTimeout lance l'auto-joueur
-  // avant que `messages` soit complètement synchronisé côté state React.
+  // IMPORTANT : même source que `messages` pour l'auto-joueur / callApi, mais à jour
+  // dès le commit (useLayoutEffect), pas après peinture — sinon setTimeout(0) peut
+  // lancer runAutoPlayerTurn avec un historique sans la dernière narration MJ.
   const messagesRef = useRef(messages);
-  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useLayoutEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // Anti-répétition "pattern" (schéma similaire, pas forcément texte identique)
   const lastAutoRepeatPatternRef = useRef(null);
@@ -1889,6 +1983,154 @@ export default function ChatInterface() {
     debugMode,
   };
 
+  const queueSceneImageTrigger = useCallback((trigger) => {
+    if (!trigger || typeof trigger !== "object") return;
+    const key = String(trigger.key ?? "").trim();
+    if (!key) return;
+    setSceneImageTrigger((prev) => {
+      if (prev?.key === key) return prev;
+      return { ...trigger, key };
+    });
+  }, []);
+
+  const triggerSceneImageFromNarratorDecision = useCallback(
+    (imageDecision, context = {}) => {
+      if (!imageDecision || typeof imageDecision !== "object") return;
+      if (imageDecision.shouldGenerate !== true) return;
+      const reason = String(imageDecision.reason ?? "").trim() || "Moment visuellement marquant";
+      const focus = String(imageDecision.focus ?? "").trim() || reason;
+      const roomKey =
+        String(context.roomId ?? gameStateRef.current?.currentRoomId ?? currentRoomId ?? "").trim() ||
+        "scene";
+      const sceneKey =
+        String(context.sceneName ?? gameStateRef.current?.currentSceneName ?? currentSceneName ?? "").trim() ||
+        "scene";
+      queueSceneImageTrigger({
+        key: `narrator:${roomKey}:${sceneKey}:${reason}:${focus}:${imageModel}`,
+        kind: "narrator_decision",
+        title: sceneKey,
+        reason,
+        focus,
+        engineEvent: context.engineEvent ?? null,
+      });
+    },
+    [currentRoomId, currentSceneName, imageModel, queueSceneImageTrigger]
+  );
+
+  const getRuntimeCombatant = useCallback(
+    (combatantId, entitiesOverride = null) => {
+      if (!combatantId) return null;
+      if (combatantId === "player") {
+        return player
+          ? {
+              ...player,
+              id: "player",
+              isAlive: (playerHpRef.current ?? player.hp?.current ?? 0) > 0,
+              hp: player.hp
+                ? {
+                    ...player.hp,
+                    current: playerHpRef.current ?? player.hp.current,
+                  }
+                : player.hp,
+            }
+          : null;
+      }
+      const pool = Array.isArray(entitiesOverride) ? entitiesOverride : entities;
+      return pool.find((entity) => entity?.id === combatantId) ?? null;
+    },
+    [entities, player]
+  );
+
+  const getCombatantArmorClass = useCallback(
+    (combatant) => {
+      if (!combatant) return 10;
+      if (combatant.id === "player") return effectivePlayerArmorClass(player);
+      return Number(combatant?.ac ?? 10) || 10;
+    },
+    [player]
+  );
+
+  const getCombatantCurrentHp = useCallback((combatant) => {
+    if (!combatant?.hp) return null;
+    if (combatant.id === "player") {
+      return playerHpRef.current ?? combatant.hp.current ?? null;
+    }
+    return combatant.hp.current ?? null;
+  }, []);
+
+  const updateCombatantSpellSlots = useCallback(
+    (combatantId, updater) => {
+      const combatant = getRuntimeCombatant(combatantId);
+      if (!combatant) return null;
+      const currentSlots = combatant?.spellSlots ?? null;
+      const nextSlots = typeof updater === "function" ? updater(currentSlots) : updater;
+      if (!nextSlots) return null;
+      if (combatantId === "player") {
+        updatePlayer({ spellSlots: nextSlots });
+      } else {
+        applyEntityUpdates([{ id: combatantId, action: "update", spellSlots: nextSlots }]);
+      }
+      return nextSlots;
+    },
+    [applyEntityUpdates, getRuntimeCombatant, updatePlayer]
+  );
+
+  const spendSpellSlotForCombatant = useCallback(
+    (combatantId, spellLevel) => {
+      const combatant = getRuntimeCombatant(combatantId);
+      if (!combatant || !combatant.spellSlots || spellLevel <= 0) {
+        return { ok: true, usedLevel: null };
+      }
+      const slots = combatant.spellSlots;
+      const levels = Object.keys(slots)
+        .map((lvl) => parseInt(lvl, 10))
+        .filter((lvl) => !Number.isNaN(lvl))
+        .sort((a, b) => a - b);
+      const useLevel = levels.find((lvl) => {
+        if (lvl < spellLevel) return false;
+        const row = slots[lvl];
+        const remaining = typeof row?.remaining === "number" ? row.remaining : row?.max ?? 0;
+        return remaining > 0;
+      });
+      if (useLevel == null) return { ok: false, usedLevel: null };
+      const row = slots[useLevel];
+      const remaining = typeof row?.remaining === "number" ? row.remaining : row?.max ?? 0;
+      updateCombatantSpellSlots(combatantId, {
+        ...slots,
+        [useLevel]: {
+          ...row,
+          remaining: Math.max(0, remaining - 1),
+        },
+      });
+      return { ok: true, usedLevel: useLevel };
+    },
+    [getRuntimeCombatant, updateCombatantSpellSlots]
+  );
+
+  const applyHpToCombatant = useCallback(
+    (combatant, nextHp) => {
+      if (!combatant?.hp) return { hpAfter: null, maxHp: null };
+      const maxHp = combatant.hp.max;
+      const hpAfter = Math.max(0, Math.min(nextHp, maxHp));
+      if (combatant.id === "player") {
+        setHp(hpAfter);
+        playerHpRef.current = hpAfter;
+      } else if (hpAfter <= 0) {
+        applyEntityUpdates([{ id: combatant.id, action: "kill" }]);
+      } else {
+        applyEntityUpdates([
+          {
+            id: combatant.id,
+            action: "update",
+            hp: { current: hpAfter, max: maxHp },
+          },
+        ]);
+      }
+      return { hpAfter, maxHp };
+    },
+    [applyEntityUpdates, setHp]
+  );
+
   /**
    * Index de tour combat : mis à jour au rendu ET de façon synchrone via commitCombatTurnIndex.
    * Évite la course où await parse-intent reprend avant le re-render après setCombatTurnIndex
@@ -1900,6 +2142,59 @@ export default function ChatInterface() {
   function commitCombatTurnIndex(next) {
     combatTurnIndexLiveRef.current = next;
     setCombatTurnIndex(next);
+  }
+
+  function insertSpawnedCombatantsIntoInitiative(spawnedEntities, options = {}) {
+    const arrivals = (Array.isArray(spawnedEntities) ? spawnedEntities : []).filter((ent) =>
+      isHostileReadyForCombat(ent)
+    );
+    if (arrivals.length === 0) return null;
+
+    const currentOrder = Array.isArray(gameStateRef.current?.combatOrder)
+      ? gameStateRef.current.combatOrder
+      : combatOrder;
+    if (!Array.isArray(currentOrder) || currentOrder.length === 0) return null;
+
+    const existingIds = new Set(currentOrder.map((entry) => entry?.id).filter(Boolean));
+    const newEntries = arrivals
+      .filter((ent) => !existingIds.has(ent.id))
+      .map((ent) => ({
+        id: ent.id,
+        name: ent.name,
+        initiative: rollInitiativeD20() + dexModFromStats(ent.stats),
+      }));
+
+    if (newEntries.length === 0) return null;
+
+    const merged = [...currentOrder, ...newEntries].sort((a, b) => b.initiative - a.initiative);
+    const anchorId =
+      typeof options.anchorActorId === "string" && options.anchorActorId.trim()
+        ? options.anchorActorId.trim()
+        : currentOrder[combatTurnIndexLiveRef.current]?.id ?? null;
+    const anchorIndex = anchorId ? merged.findIndex((entry) => entry?.id === anchorId) : -1;
+
+    setCombatOrder(merged);
+    if (anchorIndex >= 0) {
+      commitCombatTurnIndex(anchorIndex);
+    }
+    for (const entry of newEntries) {
+      setReactionFor(entry.id, true);
+    }
+
+    const lines = newEntries.map((entry) => `[${entry.initiative}] ${entry.name}`);
+    addMessage(
+      "ai",
+      `🎲 Renforts dans l'initiative\n${lines.join("\n")}`,
+      "dice",
+      makeMsgId()
+    );
+
+    gameStateRef.current = {
+      ...gameStateRef.current,
+      combatOrder: merged,
+      combatTurnIndex: anchorIndex >= 0 ? anchorIndex : combatTurnIndexLiveRef.current,
+    };
+    return merged;
   }
 
   /**
@@ -1914,6 +2209,24 @@ export default function ChatInterface() {
    * on bloque l'auto-joueur jusqu'à la fin complète du traitement [SceneEntered].
    */
   const sceneEnteredPipelineDepthRef = useRef(0);
+
+  async function fetchJsonWithTimeout(url, init, timeoutMs, label) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 60000));
+    try {
+      const res = await fetch(url, { ...(init ?? {}), signal: controller.signal });
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    } catch (e) {
+      const name = String(e?.name ?? "");
+      if (name === "AbortError") {
+        throw new Error(`Timeout ${label ? `(${label})` : ""}`.trim());
+      }
+      throw e;
+    } finally {
+      clearTimeout(t);
+    }
+  }
 
   function markFlowFailure(message, retryPayload = null) {
     const msg = String(message || "Échec réseau/API.");
@@ -1943,18 +2256,16 @@ export default function ChatInterface() {
   }, [messages, isTyping, isAutoPlayerThinking, pendingRoll]);
 
   // ---------------------------------------------------------------------------
-  // Génération d'image de scène (1 fois par scène + modèle)
+  // Génération d'image de scène (décision du narrateur)
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (gameMode !== "exploration") return;
     if (imageModel === "disabled") {
-      // Evite tout appel API et permet de régénérer si on réactive plus tard.
       lastImageGenKeyRef.current = null;
       return;
     }
-    if (!currentSceneName) return;
+    if (!sceneImageTrigger?.key) return;
 
-    const key = `${currentSceneName}::${imageModel}`;
+    const key = sceneImageTrigger.key;
     if (lastImageGenKeyRef.current === key) return;
     lastImageGenKeyRef.current = key;
 
@@ -1972,10 +2283,24 @@ export default function ChatInterface() {
     const lastAiNarration =
       [...messages].reverse().find((m) => m.role === "ai" && !m.type)?.content ?? "";
 
+    const sourceEngineEvent =
+      sceneImageTrigger?.engineEvent && typeof sceneImageTrigger.engineEvent === "object"
+        ? sceneImageTrigger.engineEvent
+        : null;
+    const eventFocusEntity =
+      sourceEngineEvent && Array.isArray(entities)
+        ? entities.find(
+            (e) =>
+              e &&
+              ((sourceEngineEvent.targetId && e.id === sourceEngineEvent.targetId) ||
+                (sourceEngineEvent.targetName && e.name === sourceEngineEvent.targetName))
+          ) ?? null
+        : null;
+
     const weaponNames = Array.isArray(player?.weapons)
       ? player.weapons.map((w) => w?.name).filter(Boolean)
       : [];
-    const invItems = Array.isArray(player?.inventaire) ? player.inventaire.filter(Boolean) : [];
+    const invItems = Array.isArray(player?.inventory) ? player.inventory.filter(Boolean) : [];
     const dedupeStringsPreserveOrder = (items) => {
       const seen = new Set();
       const out = [];
@@ -2011,19 +2336,70 @@ export default function ChatInterface() {
     const visualContext = {
       sceneName: currentSceneName || null,
       location: locationDesc,
-      narrativeFocus: String(lastAiNarration || "").trim() || null,
+      narrativeFocus:
+        String(sceneImageTrigger?.reason ?? "").trim() ||
+        String(lastAiNarration || "").trim() ||
+        null,
+      gmNarration:
+        typeof lastAiNarration === "string" && lastAiNarration.trim() ? lastAiNarration.trim() : null,
       /** Aide le serveur / les traces : priorité décor = location ; pas de PNJ inventés si liste vide. */
       sceneForImage: {
         onlyPlayerCharacterInFrame: presentNPCs.length === 0,
         listedNPCCount: presentNPCs.length,
       },
+      imageTrigger: {
+        kind: sceneImageTrigger?.kind ?? "scene",
+        title: sceneImageTrigger?.title ?? currentSceneName ?? null,
+        reason: sceneImageTrigger?.reason ?? null,
+        focus: sceneImageTrigger?.focus ?? null,
+        engineEvent:
+          sourceEngineEvent
+            ? {
+                kind: sourceEngineEvent.kind ?? null,
+                reason: sourceEngineEvent.reason ?? null,
+                details: sourceEngineEvent.details ?? null,
+                targetId: sourceEngineEvent.targetId ?? null,
+                targetName: sourceEngineEvent.targetName ?? null,
+                spellName: sourceEngineEvent.spellName ?? null,
+                damage: sourceEngineEvent.damage ?? null,
+                hit: sourceEngineEvent.hit ?? null,
+                crit: sourceEngineEvent.crit ?? null,
+                targetHpAfter: sourceEngineEvent.targetHpAfter ?? null,
+                targetHpMax: sourceEngineEvent.targetHpMax ?? null,
+                targetIsAlive: sourceEngineEvent.targetIsAlive ?? null,
+              }
+            : null,
+      },
+      eventFocusTarget:
+        sourceEngineEvent?.targetName || eventFocusEntity
+          ? {
+              name: sourceEngineEvent?.targetName ?? eventFocusEntity?.name ?? null,
+              appearance:
+                typeof eventFocusEntity?.description === "string" && eventFocusEntity.description.trim()
+                  ? eventFocusEntity.description.trim()
+                  : null,
+              type: eventFocusEntity?.type ?? null,
+              isAlive:
+                typeof sourceEngineEvent?.targetIsAlive === "boolean"
+                  ? sourceEngineEvent.targetIsAlive
+                  : eventFocusEntity?.isAlive ?? null,
+              hpAfter:
+                typeof sourceEngineEvent?.targetHpAfter === "number"
+                  ? sourceEngineEvent.targetHpAfter
+                  : eventFocusEntity?.hp?.current ?? null,
+              hpMax:
+                typeof sourceEngineEvent?.targetHpMax === "number"
+                  ? sourceEngineEvent.targetHpMax
+                  : eventFocusEntity?.hp?.max ?? null,
+            }
+          : null,
       playerInfo: {
         characterName:
-          typeof player?.nom === "string" && player.nom.trim() ? player.nom.trim() : null,
+          typeof player?.name === "string" && player.name.trim() ? player.name.trim() : null,
         race: typeof player?.race === "string" && player.race.trim() ? player.race.trim() : null,
         characterClass:
-          typeof player?.classe === "string" && player.classe.trim()
-            ? player.classe.trim()
+          typeof player?.entityClass === "string" && player.entityClass.trim()
+            ? player.entityClass.trim()
             : null,
         level: typeof player?.level === "number" && Number.isFinite(player.level) ? player.level : null,
         description:
@@ -2035,7 +2411,8 @@ export default function ChatInterface() {
       presentNPCs,
     };
 
-    const pendingLabel = `Illustration de la scène « ${currentSceneName} » — génération en cours…`;
+    const pendingLabel =
+      `Illustration décidée par le narrateur pour « ${currentSceneName || "la scène"} » — génération en cours…`;
     const debugBlock =
       `[DEBUG] Contexte visuel envoyé à /api/scene-image (synthèse serveur → prompt image) :\n` +
       safeJson(visualContext);
@@ -2043,12 +2420,16 @@ export default function ChatInterface() {
 
     (async () => {
       try {
-        const res = await fetch("/api/scene-image", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ visualContext, model: imageModel }),
-        });
-        const data = await res.json().catch(() => null);
+        const { res, data } = await fetchJsonWithTimeout(
+          "/api/scene-image",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ visualContext, model: imageModel }),
+          },
+          120000,
+          "scene-image"
+        );
         if (!res.ok) {
           const msg = data?.details
             ? `${data.error || "Erreur API"} (${data.status || res.status}): ${data.details}`
@@ -2076,72 +2457,160 @@ export default function ChatInterface() {
             "debug",
             makeMsgId()
           );
+          markFlowFailure(String(e?.message ?? e), {
+            kind: "scene-image",
+            visualContext,
+            model: imageModel,
+          });
         } else {
           removeMessagesByIds([pendingId]);
         }
       }
     })();
-  }, [gameMode, currentSceneName, imageModel]);
+  }, [sceneImageTrigger, currentRoomId, currentSceneName, currentScene, imageModel, messages, entities, player, removeMessagesByIds, updateMessage, addMessage, appendSceneImagePendingSlot, setCurrentSceneImage]);
 
   // ---------------------------------------------------------------------------
   // Tours ennemis simulés côté client
   // ---------------------------------------------------------------------------
   async function generateEnemyTurn(enemy, context = {}) {
     try {
-      const res = await fetch("/api/enemy-tactics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: aiProvider,
-          enemy: {
-            id: enemy.id,
-            name: enemy.name,
-            type: enemy.type,
-            surprised: !!enemy.surprised,
-            hp: enemy.hp,
-            ac: enemy.ac ?? null,
-            stats: enemy.stats ?? null,
-            attackBonus: enemy.attackBonus ?? null,
-            damageDice: enemy.damageDice ?? null,
-            damageBonus: enemy.damageBonus ?? null,
-            weapons: Array.isArray(enemy.weapons) ? enemy.weapons : [],
-            features: Array.isArray(enemy.features) ? enemy.features : [],
-            description: enemy.description ?? "",
-            visible: enemy.visible,
-            isAlive: enemy.isAlive,
+      const enemyWeapons = Array.isArray(enemy.weapons) ? enemy.weapons : [];
+      const enemyFeaturesText = (Array.isArray(enemy.features) ? enemy.features : [])
+        .map((f) => String(f ?? "").toLowerCase())
+        .join(" | ");
+      const hasCunningEscape =
+        enemyFeaturesText.includes("fuite agile") ||
+        enemyFeaturesText.includes("nimble escape");
+      const body = {
+        provider: aiProvider,
+        enemy: {
+          id: enemy.id,
+          name: enemy.name,
+          type: enemy.type,
+          entityClass: enemy.entityClass ?? "",
+          surprised: !!enemy.surprised,
+          hp: enemy.hp,
+          ac: enemy.ac ?? null,
+          stats: enemy.stats ?? null,
+          attackBonus: enemy.attackBonus ?? null,
+          damageDice: enemy.damageDice ?? null,
+          damageBonus: enemy.damageBonus ?? null,
+          weapons: enemyWeapons,
+          selectedSpells: getCombatantKnownSpells(enemy),
+          spellAttackBonus: computeSpellAttackBonus(enemy),
+          spellSaveDc: computeSpellSaveDC(enemy),
+          features: Array.isArray(enemy.features) ? enemy.features : [],
+          description: enemy.description ?? "",
+          visible: enemy.visible,
+          isAlive: enemy.isAlive,
+        },
+        players: [
+          {
+            id: "player",
+            hp: { current: playerHpRef.current, max: player.hp.max },
+            ac: effectivePlayerArmorClass(player),
+            position: context?.playerPosition ?? "theater_of_mind",
+            distance: context?.distance ?? "unknown",
           },
-          players: [
-            {
-              id: "player",
-              hp: { current: playerHpRef.current, max: player.hp.max },
-              ac: effectivePlayerArmorClass(player),
-              position: context?.playerPosition ?? "theater_of_mind",
-              distance: context?.distance ?? "unknown",
-            },
-          ],
-          battleState: {
-            gameMode,
-            engagedWith: getMeleeWith(enemy.id),
-            inMelee: getMeleeWith(enemy.id).includes("player"),
-            playerCanOpportunityAttack:
-              hasReaction("player") && !!turnResourcesRef.current?.reaction,
-            resources: {
-              action: true,
-              bonus_action: true,
-              movement: !!context?.movementOk,
-              reaction: true,
-            },
-            roundContext: context?.roundContext ?? null,
+        ],
+        battleState: {
+          gameMode,
+          engagedWith: getMeleeWith(enemy.id),
+          inMelee: getMeleeWith(enemy.id).includes("player"),
+          playerCanOpportunityAttack:
+            hasReaction("player") && !!turnResourcesRef.current?.reaction,
+          resources: {
+            action: true,
+            bonus_action: true,
+            movement: !!context?.movementOk,
+            reaction: true,
           },
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
+          actionCatalog: {
+            mainActionOptions: [
+              {
+                key: "attack_weapon",
+                label: "Attaquer (arme)",
+                cost: { action: 1 },
+                available: true,
+                weaponNames: enemyWeapons
+                  .map((w) => String(w?.name ?? "").trim())
+                  .filter(Boolean),
+              },
+              {
+                key: "dash",
+                label: "Foncer (Dash)",
+                cost: { action: 1 },
+                available: true,
+              },
+              {
+                key: "disengage",
+                label: "Se désengager (Disengage)",
+                cost: { action: 1 },
+                available: true,
+              },
+              {
+                key: "dodge",
+                label: "Esquiver (Dodge)",
+                cost: { action: 1 },
+                available: true,
+              },
+              {
+                key: "hide",
+                label: "Se cacher (Hide)",
+                cost: { action: 1 },
+                available: true,
+              },
+            ],
+            bonusActionOptions: [
+              {
+                key: "bonus_disengage",
+                label: "Se désengager (bonus)",
+                cost: { bonus_action: 1 },
+                available: hasCunningEscape,
+                source: hasCunningEscape ? "Fuite agile / Nimble Escape" : null,
+              },
+              {
+                key: "bonus_hide",
+                label: "Se cacher (bonus)",
+                cost: { bonus_action: 1 },
+                available: hasCunningEscape,
+                source: hasCunningEscape ? "Fuite agile / Nimble Escape" : null,
+              },
+            ],
+            movementOptions: [
+              {
+                key: "move_approach",
+                label: "S'approcher",
+                cost: { movement: 1 },
+                available: !!context?.movementOk,
+              },
+              {
+                key: "move_away",
+                label: "S'éloigner / Fuir",
+                cost: { movement: 1 },
+                available: !!context?.movementOk,
+              },
+            ],
+          },
+          roundContext: context?.roundContext ?? null,
+        },
+      };
+      const { res, data } = await fetchJsonWithTimeout(
+        "/api/enemy-tactics",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        60000,
+        "enemy-tactics"
+      );
       if (!res.ok) throw new Error(data?.details ?? data?.error ?? `Enemy tactics failed (${res.status})`);
       return data;
     } catch (err) {
       markFlowFailure(
         `Enemy tactics indisponible: ${String(err?.message ?? err)}`,
-        { kind: "nextTurn" }
+        { kind: "enemy-tactics", enemyId: enemy?.id ?? null }
       );
       throw err;
     }
@@ -2203,32 +2672,31 @@ export default function ChatInterface() {
   }
 
   /**
-   * Résout une attaque d'arme ennemie contre le joueur (mécanique + narration optionnelle).
-   * @param tactical — réponse tactique complète (thought_process) ou null (ex. AoO mouvement)
-   * @param tacticalAction — entrée d'action correspondante pour les logs debug
+   * Bloc mécanique lisible pour une attaque automatique résolue côté moteur.
    */
-  function buildEnemyAttackCombatDetail({
-    enemy,
+  function buildAutoAttackCombatDetail({
+    attacker,
+    target,
     chosenWeapon,
     labelSuffix,
     nat,
     atkBonus,
     atkTotal,
-    playerAc,
+    targetAc,
     dice,
     lastDmgRoll,
     lastDmgTotal,
     currentHp,
     maxHp,
   }) {
-    const lines = [`**${enemy.name}** · ${chosenWeapon.name}${labelSuffix || ""}`];
+    const lines = [`**${attacker.name}** · ${chosenWeapon.name}${labelSuffix || ""} → **${target.name}**`];
     if (nat === 1) {
       lines.push(`Jet d'attaque : **échec automatique** (naturel 1 — fumble).`);
       return lines.join("\n");
     }
     if (nat === 20) {
       lines.push(`Jet d'attaque : **coup critique** (naturel 20).`);
-      lines.push(`Total au toucher : **${atkTotal}** (contre CA ${playerAc}).`);
+      lines.push(`Total au toucher : **${atkTotal}** (contre CA ${targetAc}).`);
       if (lastDmgTotal > 0 && lastDmgRoll?.crit) {
         lines.push(
           formatDmgRoll(
@@ -2239,45 +2707,46 @@ export default function ChatInterface() {
             lastDmgRoll.rolls2
           )
         );
-        lines.push(`Vos PV après le coup : **${currentHp}** / ${maxHp}.`);
+        lines.push(`PV de ${target.name} après le coup : **${currentHp}** / ${maxHp}.`);
       }
       return lines.join("\n");
     }
     lines.push(
-      `Jet d'attaque : ${nat} ${fmtMod(atkBonus)} = **${atkTotal}** vs CA **${playerAc}** — ${
-        atkTotal >= playerAc ? "**touche**" : "**raté**"
+      `Jet d'attaque : ${nat} ${fmtMod(atkBonus)} = **${atkTotal}** vs CA **${targetAc}** — ${
+        atkTotal >= targetAc ? "**touche**" : "**raté**"
       }.`
     );
-    if (atkTotal >= playerAc && lastDmgTotal > 0 && lastDmgRoll && !lastDmgRoll.crit) {
+    if (atkTotal >= targetAc && lastDmgTotal > 0 && lastDmgRoll && !lastDmgRoll.crit) {
       lines.push(formatDmgRoll(dice, lastDmgRoll.rolls, chosenWeapon.damageBonus ?? 0));
-      lines.push(`Vos PV après le coup : **${currentHp}** / ${maxHp}.`);
+      lines.push(`PV de ${target.name} après le coup : **${currentHp}** / ${maxHp}.`);
     }
     return lines.join("\n");
   }
 
-  async function resolveEnemyWeaponAttackOnPlayer(
-    enemy,
+  async function resolveCombatantWeaponAttack(
+    attacker,
+    target,
     chosenWeapon,
     labelSuffix,
     tactical,
     tacticalAction = null
   ) {
-    if (!chosenWeapon) return false;
+    if (!attacker || !target || !chosenWeapon) return false;
 
-    let currentHp = playerHpRef.current;
+    let currentHp = getCombatantCurrentHp(target);
     const nat = Math.floor(Math.random() * 20) + 1;
     const atkBonus = chosenWeapon.attackBonus ?? 0;
     const atkTotal = nat + atkBonus;
     const dmgBonus = chosenWeapon.damageBonus ?? 0;
     const dice = chosenWeapon.damageDice ?? "1d4";
-    const playerAc = effectivePlayerArmorClass(player);
+    const targetAc = getCombatantArmorClass(target);
     let lastDmgRoll = null;
     let lastDmgTotal = 0;
 
     let narrativeOutcome = "miss";
     if (nat === 1) narrativeOutcome = "fumble";
     else if (nat === 20) narrativeOutcome = "critical_hit";
-    else if (atkTotal >= playerAc) narrativeOutcome = "hit";
+    else if (atkTotal >= targetAc) narrativeOutcome = "hit";
 
     if (nat === 20) {
       const r1 = rollDiceDetailed(dice);
@@ -2285,80 +2754,95 @@ export default function ChatInterface() {
       const dmg = Math.max(1, r1.total + r2.total + dmgBonus);
       lastDmgRoll = { crit: true, rolls1: r1.rolls, rolls2: r2.rolls };
       lastDmgTotal = dmg;
-      currentHp = Math.max(0, currentHp - dmg);
-      setHp(currentHp);
-    } else if (atkTotal >= playerAc) {
+      currentHp = Math.max(0, (currentHp ?? 0) - dmg);
+      applyHpToCombatant(target, currentHp);
+    } else if (atkTotal >= targetAc) {
       const r = rollDiceDetailed(dice);
       const dmg = Math.max(1, r.total + dmgBonus);
       lastDmgRoll = { crit: false, rolls: r.rolls };
       lastDmgTotal = dmg;
-      currentHp = Math.max(0, currentHp - dmg);
-      setHp(currentHp);
+      currentHp = Math.max(0, (currentHp ?? 0) - dmg);
+      applyHpToCombatant(target, currentHp);
     }
 
-    const combatDetailBlock = buildEnemyAttackCombatDetail({
-      enemy,
+    const combatDetailBlock = buildAutoAttackCombatDetail({
+      attacker,
+      target,
       chosenWeapon,
       labelSuffix,
       nat,
       atkBonus,
       atkTotal,
-      playerAc,
+      targetAc,
       dice,
       lastDmgRoll,
       lastDmgTotal,
       currentHp,
-      maxHp: player.hp.max,
+      maxHp: target?.hp?.max ?? null,
     });
 
     let narrativeText = "";
-    try {
-      const res = await fetch("/api/chat-combat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: aiProvider,
-          thoughtProcess: tactical?.thought_process ?? "",
-          enemyName: enemy.name,
-          narrationContext: {
-            enemyName: enemy.name,
-            weaponName: chosenWeapon.name,
-            outcome: narrativeOutcome,
-          },
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data?.details ?? data?.error ?? `chat-combat failed (${res.status})`);
+    if (target.id === "player") {
+      try {
+        const res = await fetch("/api/chat-combat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: aiProvider,
+            thoughtProcess: tactical?.thought_process ?? "",
+            enemyName: attacker.name,
+            narrationContext: {
+              enemyName: attacker.name,
+              weaponName: chosenWeapon.name,
+              outcome: narrativeOutcome,
+            },
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data?.details ?? data?.error ?? `chat-combat failed (${res.status})`);
+        }
+        if (res.ok && typeof data?.narrative === "string" && data.narrative.trim()) {
+          narrativeText = data.narrative.trim();
+        }
+      } catch (err) {
+        markFlowFailure(
+          `Narration combat indisponible: ${String(err?.message ?? err)}`,
+          { kind: "nextTurn" }
+        );
+        throw err;
       }
-      if (res.ok && typeof data?.narrative === "string" && data.narrative.trim()) {
-        narrativeText = data.narrative.trim();
+      if (!narrativeText) {
+        markFlowFailure(
+          "Narration combat vide: impossible de poursuivre proprement.",
+          { kind: "nextTurn" }
+        );
+        throw new Error("Narration combat vide");
       }
-    } catch (err) {
-      markFlowFailure(
-        `Narration combat indisponible: ${String(err?.message ?? err)}`,
-        { kind: "nextTurn" }
-      );
-      throw err;
-    }
-    if (!narrativeText) {
-      markFlowFailure(
-        "Narration combat vide: impossible de poursuivre proprement.",
-        { kind: "nextTurn" }
-      );
-      throw new Error("Narration combat vide");
     }
 
-    /** Narration publique : même présentation que le MJ (pas de bulle « ennemi » rouge). */
-    addMessage("ai", narrativeText, undefined, makeMsgId());
-    /** Détail mécanique : orange, pour le joueur ciblé (solo = vous). */
+    if (narrativeText) {
+      addMessage("ai", narrativeText, undefined, makeMsgId());
+    } else {
+      const shortOutcome =
+        narrativeOutcome === "critical_hit"
+          ? `critique sur ${target.name}`
+          : narrativeOutcome === "hit"
+            ? `touche ${target.name}`
+            : narrativeOutcome === "fumble"
+              ? "commet un fumble"
+              : `manque ${target.name}`;
+      addMessage("ai", `⚔️ ${attacker.name} ${shortOutcome} avec ${chosenWeapon.name}.`, "enemy-turn", makeMsgId());
+    }
     addMessage("ai", combatDetailBlock, "combat-detail", makeMsgId());
     addMessage(
       "ai",
-      `[DEBUG] Résolution attaque ennemie (moteur)\n` +
+      `[DEBUG] Résolution attaque auto (moteur)\n` +
         safeJson({
-          enemyId: enemy.id,
-          enemyName: enemy.name,
+          attackerId: attacker.id,
+          attackerName: attacker.name,
+          targetId: target.id,
+          targetName: target.name,
           tacticalThought: tactical?.thought_process ?? "",
           tacticalAction,
           weaponUsed: {
@@ -2370,7 +2854,7 @@ export default function ChatInterface() {
           nat,
           atkBonus,
           atkTotal,
-          targetAc: playerAc,
+          targetAc,
           damageDice: dice,
           damageBonus: dmgBonus,
           damageRoll: lastDmgRoll,
@@ -2380,26 +2864,137 @@ export default function ChatInterface() {
       "debug",
       makeMsgId()
     );
-    playerHpRef.current = currentHp;
     return true;
+  }
+
+  async function resolveCombatantSpellAgainstTarget(
+    attacker,
+    target,
+    spellName,
+    labelSuffix,
+    tactical,
+    tacticalAction = null
+  ) {
+    const canonicalSpellName = canonicalizeSpellNameAgainstCombatant(attacker, spellName) ?? spellName;
+    const spell = SPELLS?.[canonicalSpellName];
+    if (!attacker || !target || !spell) return false;
+
+    const slotResult = spendSpellSlotForCombatant(attacker.id, spell.level ?? 0);
+    if (!slotResult.ok) return false;
+
+    if (spell.save) {
+      const dc = computeSpellSaveDC(attacker);
+      if (target.id === "player") {
+        const incomingPlayerSaveRoll = {
+          kind: "save",
+          stat: spell.save,
+          totalBonus: computeCheckBonus({ player, stat: spell.save, skill: null }),
+          raison: `Sauvegarde contre ${canonicalSpellName} (${attacker.name})`,
+          dc,
+          targetId: "player",
+          weaponName: canonicalSpellName,
+          engineContext: {
+            kind: "incoming_spell_save",
+            attackerId: attacker.id,
+            attackerName: attacker.name,
+            spellName: canonicalSpellName,
+            damageNotation: String(spell.damage ?? "1d6"),
+            damageType: spell.damageType ?? null,
+            slotLevelUsed: slotResult.usedLevel,
+            tacticalThought: tactical?.thought_process ?? "",
+            tacticalAction,
+          },
+        };
+        addMessage(
+          "ai",
+          `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${target.name}.`,
+          "enemy-turn",
+          makeMsgId()
+        );
+        pendingRollRef.current = incomingPlayerSaveRoll;
+        setPendingRoll(incomingPlayerSaveRoll);
+        return true;
+      }
+      const nat = Math.floor(Math.random() * 20) + 1;
+      const saveBonus = computeEntitySaveBonus(target, spell.save);
+      const total = nat + saveBonus;
+      const succeeded = nat === 20 ? true : nat === 1 ? false : total >= dc;
+      const r = rollDiceDetailed(String(spell.damage ?? "1d6"));
+      const baseDmg = Math.max(0, r.total);
+      const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
+      const hpBefore = getCombatantCurrentHp(target);
+      const hpAfter =
+        hpBefore == null || finalDmg <= 0 ? hpBefore : applyHpToCombatant(target, hpBefore - finalDmg).hpAfter;
+
+      addMessage(
+        "ai",
+        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${target.name}.`,
+        "enemy-turn",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `Sauvegarde ${spell.save} : nat ${nat} ${fmtMod(saveBonus)} = **${total}** vs DD **${dc}** — ${
+          succeeded ? "réussite" : "échec"
+        }. ${finalDmg > 0 ? `${finalDmg} dégâts ${spell.damageType ?? ""}.` : "Aucun dégât."}`,
+        "combat-detail",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `[DEBUG] Résolution sort auto (save)\n` +
+          safeJson({
+            attackerId: attacker.id,
+            attackerName: attacker.name,
+            targetId: target.id,
+            targetName: target.name,
+            spellName: canonicalSpellName,
+            tacticalThought: tactical?.thought_process ?? "",
+            tacticalAction,
+            nat,
+            saveBonus,
+            total,
+            dc,
+            succeeded,
+            damage: finalDmg,
+            hpBefore,
+            hpAfter,
+            slotLevelUsed: slotResult.usedLevel,
+          }),
+        "debug",
+        makeMsgId()
+      );
+      return true;
+    }
+
+    const spellWeapon = {
+      name: canonicalSpellName,
+      attackBonus: computeSpellAttackBonus(attacker),
+      damageDice: String(spell.damage ?? "1d6"),
+      damageBonus: 0,
+      kind: /corps a corps|corps à corps/i.test(String(spell.attack ?? "")) ? "melee" : "ranged",
+    };
+    return resolveCombatantWeaponAttack(attacker, target, spellWeapon, labelSuffix, tactical, {
+      ...(tacticalAction ?? {}),
+      kind: "spell",
+      name: canonicalSpellName,
+    });
   }
 
   async function simulateSingleEnemyTurn(enemy, opts = null) {
     await new Promise((r) => setTimeout(r, 400));
 
     const label = opts?.label ? ` (${opts.label})` : "";
+    const playerTarget = getRuntimeCombatant("player");
 
     // Surpris: l'ennemi perd ce tour, puis l'état est consommé.
     if (enemy?.surprised === true) {
       addMessage(
         "ai",
         `${enemy.name} est surpris et reste figé un instant${label}.`,
-        undefined,
+        "enemy-turn",
         makeMsgId()
       );
-      applyEntityUpdates([
-        { id: enemy.id, action: "update", surprised: false }
-      ]);
       return;
     }
 
@@ -2409,9 +3004,10 @@ export default function ChatInterface() {
       const isRangedWeapon = (w) => w?.kind === "ranged" || isRangedWeaponName(w?.name ?? "");
       let chosenWeapon =
         enemyWeapons.find((w) => !isRangedWeapon(w)) ?? enemyWeapons[0] ?? null;
-      if (chosenWeapon) {
-        await resolveEnemyWeaponAttackOnPlayer(
+      if (chosenWeapon && playerTarget) {
+        await resolveCombatantWeaponAttack(
           enemy,
+          playerTarget,
           chosenWeapon,
           label,
           null,
@@ -2451,7 +3047,11 @@ export default function ChatInterface() {
      */
     let effectiveInMeleeWithPlayer = getMeleeWith(enemy.id).includes("player");
 
-    const pickWeaponForAction = (act) => {
+    const pickOffensiveOptionForAction = (act) => {
+      const spellName = canonicalizeSpellNameAgainstCombatant(enemy, act?.name ?? "");
+      if (spellName && SPELLS?.[spellName]) {
+        return { kind: "spell", spellName, canAttack: !!playerTarget };
+      }
       let chosenWeapon = null;
       if (act?.name) {
         const wanted = normalizeFr(String(act.name));
@@ -2465,11 +3065,11 @@ export default function ChatInterface() {
       if (chosenWeapon && inMelee && isRangedWeapon(chosenWeapon)) {
         chosenWeapon = enemyWeapons.find((w) => !isRangedWeapon(w)) ?? chosenWeapon;
       }
-      let canAttack = !!chosenWeapon;
+      let canAttack = !!chosenWeapon && !!playerTarget;
       if (chosenWeapon && !inMelee && !isRangedWeapon(chosenWeapon)) {
         canAttack = false;
       }
-      return { chosenWeapon, canAttack };
+      return { kind: "weapon", chosenWeapon, canAttack };
     };
 
     for (const act of actions) {
@@ -2509,17 +3109,28 @@ export default function ChatInterface() {
         !isFleeNameStr(n) &&
         !isApproachNameStr(n)
       ) {
-        const { chosenWeapon, canAttack } = pickWeaponForAction(act);
-        if (canAttack && chosenWeapon) {
-          const ok = await resolveEnemyWeaponAttackOnPlayer(
+        const picked = pickOffensiveOptionForAction(act);
+        let ok = false;
+        if (picked?.kind === "spell" && picked.spellName && playerTarget) {
+          ok = await resolveCombatantSpellAgainstTarget(
             enemy,
-            chosenWeapon,
+            playerTarget,
+            picked.spellName,
             label,
             tactical,
             act
           );
-          if (ok) attackPerformed = true;
+        } else if (picked?.canAttack && picked?.chosenWeapon && playerTarget) {
+          ok = await resolveCombatantWeaponAttack(
+            enemy,
+            playerTarget,
+            picked.chosenWeapon,
+            label,
+            tactical,
+            act
+          );
         }
+        if (ok) attackPerformed = true;
         await pauseEnemyTacticalStep();
         continue;
       }
@@ -2573,10 +3184,10 @@ export default function ChatInterface() {
       await pauseEnemyTacticalStep();
     }
 
-    if (enemyWeapons.length === 0) {
+    if (enemyWeapons.length === 0 && getCombatantKnownSpells(enemy).length === 0) {
       addMessage(
         "ai",
-        `[DEBUG] Tour ennemi : aucune arme pour ${enemy.name} (pas d'attaque résolue).`,
+        `[DEBUG] Tour ennemi : aucune arme ou sort structuré pour ${enemy.name} (pas d'attaque résolue).`,
         "debug",
         makeMsgId()
       );
@@ -2585,15 +3196,16 @@ export default function ChatInterface() {
     if (!attackPerformed && !hasDisengaged) {
       const inMelee = effectiveInMeleeWithPlayer;
       const fleeInPlan = actions.some((a) => typeOf(a) === "movement" && isFleeNameStr(nameOf(a)));
-      if (inMelee && enemyWeapons.length > 0 && !fleeInPlan) {
+      if (inMelee && enemyWeapons.length > 0 && !fleeInPlan && playerTarget) {
         let chosenWeapon = enemyWeapons[0];
         if (isRangedWeapon(chosenWeapon)) {
           chosenWeapon = enemyWeapons.find((w) => !isRangedWeapon(w)) ?? chosenWeapon;
         }
         const canAttack = !(!inMelee && !isRangedWeapon(chosenWeapon));
         if (canAttack && chosenWeapon) {
-          await resolveEnemyWeaponAttackOnPlayer(
+          await resolveCombatantWeaponAttack(
             enemy,
+            playerTarget,
             chosenWeapon,
             label,
             tactical,
@@ -2633,8 +3245,43 @@ export default function ChatInterface() {
     });
   }, [gameMode, combatOrder, combatTurnIndex, player.speed]);
 
+  function isHostileReadyForCombat(entity) {
+    return !!entity && entity.type === "hostile" && entity.isAlive && entity.awareOfPlayer !== false;
+  }
+
   function hasAnyHostileAlive(currentEntities) {
     return currentEntities.some((e) => e.type === "hostile" && e.isAlive);
+  }
+
+  function hasAnyCombatReadyHostile(currentEntities) {
+    return currentEntities.some((e) => isHostileReadyForCombat(e));
+  }
+
+  function markSceneHostilesAware(baseEntities, updates = [], options = {}) {
+    const visibleOnly = options.visibleOnly !== false;
+    const onlyIds = Array.isArray(options.onlyIds)
+      ? new Set(options.onlyIds.map((id) => String(id ?? "").trim()).filter(Boolean))
+      : null;
+    const nextUpdates = Array.isArray(updates) ? [...updates] : [];
+    const pendingById = new Map();
+    for (const upd of nextUpdates) {
+      if (!upd || typeof upd !== "object") continue;
+      const id = typeof upd.id === "string" ? upd.id.trim() : "";
+      if (!id) continue;
+      pendingById.set(id, upd);
+    }
+    for (const ent of Array.isArray(baseEntities) ? baseEntities : []) {
+      if (!isHostileReadyForCombat({ ...ent, awareOfPlayer: true })) continue;
+      if (visibleOnly && ent.visible === false) continue;
+      if (onlyIds && !onlyIds.has(ent.id)) continue;
+      const existing = pendingById.get(ent.id);
+      if (existing && existing.action === "update") {
+        existing.awareOfPlayer = true;
+        continue;
+      }
+      nextUpdates.push({ id: ent.id, action: "update", awareOfPlayer: true });
+    }
+    return nextUpdates;
   }
 
   function dexModFromStats(stats) {
@@ -2644,10 +3291,10 @@ export default function ChatInterface() {
   }
 
   function ensureCombatState(currentEntities, maybeOrder = null) {
-    const anyHostile = hasAnyHostileAlive(currentEntities);
-    if (!anyHostile) {
+    const anyCombatReadyHostile = hasAnyCombatReadyHostile(currentEntities);
+    if (!anyCombatReadyHostile) {
       if (gameMode === "combat") {
-        addMessage("ai", "[DEBUG] Fin de combat (plus aucun hostile vivant) â†’ exploration", "debug", makeMsgId());
+        addMessage("ai", "[DEBUG] Fin de combat (plus aucun hostile engagé) â†’ exploration", "debug", makeMsgId());
       }
       setGameMode("exploration", currentEntities);
       setCombatOrder([]);
@@ -2655,9 +3302,10 @@ export default function ChatInterface() {
       return;
     }
 
-    // Hostiles présents (même invisibles) â†’ combat
+    // Hostiles conscients du joueur (ou déjà engagés) â†’ combat
     if (gameMode !== "combat") {
-      addMessage("ai", "[DEBUG] Hostiles détectés â†’ passage en COMBAT", "debug", makeMsgId());
+      if (!anyCombatReadyHostile) return;
+      addMessage("ai", "[DEBUG] Hostiles engagés â†’ passage en COMBAT", "debug", makeMsgId());
       setGameMode("combat");
       // En entrant en combat, on active Bonus/Réaction (disponibles par défaut),
       // sans "rendre" une Action déjÃ  dépensée ce tour (ex: attaque qui déclenche le combat).
@@ -2674,7 +3322,7 @@ export default function ChatInterface() {
   }
 
   function isCombatOver(currentEntities) {
-    return !currentEntities.some((e) => e.type === "hostile" && e.isAlive);
+    return !currentEntities.some((e) => isHostileReadyForCombat(e));
   }
 
   function nextAliveTurnIndex(order, idx, currentEntities) {
@@ -2698,7 +3346,7 @@ export default function ChatInterface() {
    * @param {boolean} [options.skipInitialAdvance] — true : le combattant à startIndex agit en premier (début de round / post-initiative). false : on avance d'abord comme après « Fin de tour ».
    */
   async function runEnemyTurnsUntilPlayer(options = {}) {
-    const order = options.order ?? combatOrder;
+    let order = options.order ?? combatOrder;
     let idx =
       options.startIndex !== undefined && options.startIndex !== null
         ? options.startIndex
@@ -2727,28 +3375,38 @@ export default function ChatInterface() {
     // Tant que ce n'est pas au joueur, faire agir le combattant courant et avancer
     for (let guard = 0; guard < 50; guard++) {
       currentEntities = gameStateRef.current?.entities ?? entities;
+      order = gameStateRef.current?.combatOrder ?? order;
       const entry = order[idx];
       if (!entry) break;
 
       if (entry.id === "player") {
         commitCombatTurnIndex(idx);
-        setReactionFor("player", true);
         setHasDisengagedThisTurn(false);
         setSneakAttackArmed(false);
         setSneakAttackUsedThisTurn(false);
-        setTurnResources({
-          action: true,
-          bonus: true,
-          reaction: true,
-          movement: true,
-        });
+        if (player?.surprised === true) {
+          lockPlayerTurnResourcesForSurprise();
+          addMessage(
+            "ai",
+            `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
+            "turn-end",
+            makeMsgId()
+          );
+          return;
+        }
+        grantPlayerTurnResources();
         return;
       }
 
       const ent = currentEntities.find((e) => e.id === entry.id);
       if (ent && ent.isAlive && ent.type === "hostile") {
-        setReactionFor(ent.id, true);
+        const enemyStartsSurprised = ent.surprised === true;
+        setReactionFor(ent.id, !enemyStartsSurprised);
         await simulateSingleEnemyTurn(ent);
+        if (enemyStartsSurprised) {
+          applyEntityUpdates([{ id: ent.id, action: "update", surprised: false }]);
+          setReactionFor(ent.id, true);
+        }
       }
       if (ent && ent.isAlive && entry.id !== "player") {
         addMessage(
@@ -2757,9 +3415,20 @@ export default function ChatInterface() {
           "turn-end",
           makeMsgId()
         );
+        addMessage("ai", "", "turn-divider", makeMsgId());
+        const arbiterAfterEnemyTurn = await runCombatTurnEndArbiter({
+          actorId: ent.id,
+          actorName: ent.name,
+          actorType: ent.type ?? null,
+        });
+        if (arbiterAfterEnemyTurn?.awaitingPlayerRoll === true) {
+          return;
+        }
       }
 
       currentEntities = gameStateRef.current?.entities ?? entities;
+      order = gameStateRef.current?.combatOrder ?? order;
+      idx = combatTurnIndexLiveRef.current;
       // fin de tour → next
       idx = nextAliveTurnIndex(order, idx, currentEntities);
 
@@ -2792,7 +3461,7 @@ export default function ChatInterface() {
     const orderText = merged
       .map(
         (entry, idx) =>
-          `[${rankLabel(idx)}] ${resolveCombatantDisplayName(entry, entities, player?.nom)} (${entry.initiative})`
+          `[${rankLabel(idx)}] ${resolveCombatantDisplayName(entry, entities, player?.name)} (${entry.initiative})`
       )
       .join("\n");
     addMessage(
@@ -2802,7 +3471,34 @@ export default function ChatInterface() {
       makeMsgId()
     );
 
+    const playerStartsSurprised = player?.surprised === true;
+    if (playerStartsSurprised) {
+      setReactionFor("player", false);
+    }
+    for (const entry of merged) {
+      if (!entry?.id || entry.id === "player") continue;
+      const combatant = entities.find((entity) => entity.id === entry.id);
+      if (combatant?.surprised === true) {
+        setReactionFor(entry.id, false);
+      }
+    }
     const first = merged[0];
+    if (first?.id === "player") {
+      setHasDisengagedThisTurn(false);
+      setSneakAttackArmed(false);
+      setSneakAttackUsedThisTurn(false);
+      if (playerStartsSurprised) {
+        lockPlayerTurnResourcesForSurprise();
+        addMessage(
+          "ai",
+          `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
+          "turn-end",
+          makeMsgId()
+        );
+      } else {
+        grantPlayerTurnResources();
+      }
+    }
     if (first && first.id !== "player") {
       setIsTyping(true);
       queueMicrotask(() => {
@@ -2945,6 +3641,7 @@ export default function ChatInterface() {
       }
     }
 
+    myUpdates = markSceneHostilesAware(postEntities, myUpdates);
     const nextEntities = myUpdates.length
       ? applyUpdatesLocally(postEntities, myUpdates)
       : postEntities;
@@ -3104,12 +3801,22 @@ export default function ChatInterface() {
     }
 
     if (intentResult.endTurnRequested) {
+      clearPlayerSurprisedState();
       addMessage(
         "ai",
-        `**${player?.nom ?? "Vous"}** met fin à son tour.`,
+        `**${player?.name ?? "Vous"}** met fin à son tour.`,
         "turn-end",
         makeMsgId()
       );
+      addMessage("ai", "", "turn-divider", makeMsgId());
+      const arbiterAfterPlayerTurn = await runCombatTurnEndArbiter({
+        actorId: "player",
+        actorName: player?.name ?? "Vous",
+        actorType: "player",
+      });
+      if (arbiterAfterPlayerTurn?.awaitingPlayerRoll === true) {
+        return;
+      }
       await nextTurn();
       return;
     }
@@ -3139,9 +3846,13 @@ export default function ChatInterface() {
 
     const resolution = String(apiDecision.resolution ?? "").trim();
     if (resolution === "unclear_input") {
+      const reason =
+        typeof apiDecision.reason === "string" && apiDecision.reason.trim()
+          ? apiDecision.reason.trim()
+          : null;
       addMessage(
         "ai",
-        "Vous balbutiez des propos incohérents... et tout le monde vous regarde.",
+        reason ?? "Vous balbutiez des propos incohérents... et tout le monde vous regarde.",
         undefined,
         makeMsgId()
       );
@@ -3165,89 +3876,82 @@ export default function ChatInterface() {
         const r = rollDiceDetailed(rollNotation);
         addMessage(
           "ai",
-          `[DEBUG] Arbiter → gm_secret (${rr.raison ?? "Jet secret"}) — ${rollNotation} [${r.rolls.join("+")}] = **${r.total}**`,
+          `[DEBUG] Intent → gm_secret (${rr.raison ?? "Jet secret"}) — ${rollNotation} [${r.rolls.join("+")}] = **${r.total}** → arbitre de scène`,
           "debug",
           makeMsgId()
         );
-
-        let nextEntities = baseEntities;
-        let nextRoomId = baseRoomId;
-        let nextScene = baseScene;
-        let nextSceneName = currentSceneName;
-        let nextGameMode = gameStateRef.current?.gameMode ?? baseGameModeForResolve;
-        let spawnedHostileIds = null;
-        let ambushTriggered = null;
-
-        if (baseRoomId === "scene_journey" && /embuscade/i.test(String(rr.raison ?? "")) && rollNotation === "1d100") {
-          ambushTriggered = r.total <= 80;
-          if (ambushTriggered) {
-            const spawnCount = Math.random() <= 0.8 ? 3 : 2;
-            const myUpdates = [];
-            const spawnedIds = [];
-            for (let i = 0; i < spawnCount; i += 1) {
-              const sid = `goblin_ambush_${i + 1}`;
-              spawnedIds.push(sid);
-              myUpdates.push({
-                id: sid,
-                action: "spawn",
-                templateId: "goblin",
-                type: "hostile",
-                visible: true,
-                surprised: false,
-                lootItems: ["18 pa"],
-              });
-            }
-            nextEntities = applyUpdatesLocally(baseEntities, myUpdates);
-            applyEntityUpdates(myUpdates);
-            ensureCombatState(nextEntities);
-            nextGameMode = "combat";
-            spawnedHostileIds = spawnedIds;
-          } else {
-            const targetRoomId = "room_intro";
-            const room = GOBLIN_CAVE?.[targetRoomId] ?? null;
-            if (room) {
-              rememberRoomEntitiesSnapshot(baseRoomId, nextEntities);
-              nextRoomId = targetRoomId;
-              nextScene = room.description ?? baseScene;
-              nextSceneName = room.title ?? currentSceneName;
-              nextEntities = takeEntitiesForRoom(targetRoomId);
-              setCurrentRoomId(nextRoomId);
-              if (nextSceneName) setCurrentSceneName(nextSceneName);
-              if (nextScene) setCurrentScene(nextScene);
-              replaceEntities(nextEntities);
-              ensureCombatState(nextEntities);
-              nextGameMode = "exploration";
-            }
-          }
-        }
-
-        await callApi(
-          `[Jet secret résolu] ${rollNotation} = ${r.total}`,
-          "dice",
-          false,
-          {
-            hideUserMessage: true,
-            bypassIntentParser: true,
-            skipAutoPlayerTurn: true,
-            skipGmContinue: true,
-            entities: nextEntities,
-            currentRoomId: nextRoomId,
-            currentScene: nextScene,
-            currentSceneName: nextSceneName,
-            gameMode: nextGameMode,
-            engineEvent: {
-              kind: "gm_secret_resolution",
-              roll: rollNotation,
-              total: r.total,
-              rolls: r.rolls,
-              reason: rr.raison ?? "Jet secret MJ",
-              ambushTriggered,
-              spawnedHostileIds,
-              sceneTransitionTargetRoomId:
-                ambushTriggered === false && baseRoomId === "scene_journey" ? "room_intro" : null,
+        try {
+          const resolved = await runSceneEntryGmArbiter({
+            roomId: baseRoomId,
+            scene: baseScene,
+            sceneName: currentSceneName,
+            entitiesAtEntry: baseEntities,
+            sourceAction: userTextForResolve,
+            baseGameMode: baseGameModeForResolve,
+            rollResultOverride: { notation: rollNotation, total: r.total, rolls: r.rolls },
+            intentDecision: {
+              resolution: apiDecision.resolution,
+              reason: apiDecision.reason ?? null,
+              rollRequestSummary: { kind: "gm_secret", roll: rollNotation },
             },
-          }
-        );
+          });
+          if (resolved?.awaitingPlayerRoll === true) return;
+          await callApi(
+            `[Jet secret résolu] ${rollNotation} = ${r.total}`,
+            "dice",
+            false,
+            {
+              hideUserMessage: true,
+              bypassIntentParser: true,
+              skipAutoPlayerTurn: true,
+              skipGmContinue: true,
+              entities: resolved?.nextEntities ?? baseEntities,
+              currentRoomId: resolved?.nextRoomId ?? baseRoomId,
+              currentScene: resolved?.nextScene ?? baseScene,
+              currentSceneName: resolved?.nextSceneName ?? currentSceneName,
+              gameMode: resolved?.nextGameMode ?? baseGameModeForResolve,
+              engineEvent: resolved?.engineEvent ?? {
+                kind: "gm_secret_resolution",
+                roll: rollNotation,
+                total: r.total,
+                rolls: r.rolls,
+                reason: rr.raison ?? "Jet secret MJ",
+              },
+            }
+          );
+        } catch (e) {
+          addMessage(
+            "ai",
+            `[DEBUG] Erreur GM Arbitre (après jet secret intent): ${String(e?.message ?? e)}`,
+            "debug",
+            makeMsgId()
+          );
+          markFlowFailure(String(e?.message ?? e), {
+            kind: "sceneArbiterAfterGmSecret",
+            roomId: baseRoomId,
+            scene: baseScene,
+            sceneName: currentSceneName,
+            entitiesAtEntry: baseEntities,
+            sourceAction: userTextForResolve,
+            baseGameMode: baseGameModeForResolve,
+            rollResultOverride: { notation: rollNotation, total: r.total, rolls: r.rolls },
+            intentDecision: {
+              resolution: apiDecision.resolution,
+              reason: apiDecision.reason ?? null,
+              rollRequestSummary: { kind: "gm_secret", roll: rollNotation },
+            },
+            diceFollowup: {
+              userContent: `[Jet secret résolu] ${rollNotation} = ${r.total}`,
+              engineEvent: {
+                kind: "gm_secret_resolution",
+                roll: rollNotation,
+                total: r.total,
+                rolls: r.rolls,
+                reason: rr.raison ?? "Jet secret MJ",
+              },
+            },
+          });
+        }
         return;
       }
       if (!rr.stat) {
@@ -3257,6 +3961,28 @@ export default function ChatInterface() {
       const skill = rr.skill ?? null;
       const computed = computeCheckBonus({ player, stat: rr.stat, skill });
       const normalizedRoll = { ...rr, skill: skill ?? undefined, totalBonus: computed };
+      // En exploration, après le d20 le moteur doit enchaîner avec l’arbitre de scène
+      // (secrets du lieu : dégâts de piège, 1d6 de chute, etc.) — voir parse-intent « ne pas gérer les règles du lieu ».
+      if (baseGameModeForResolve === "exploration") {
+        normalizedRoll.returnToArbiter = true;
+        normalizedRoll.sceneArbiterContext = {
+          roomId: baseRoomId,
+          scene: baseScene,
+          sceneName: currentSceneName,
+          sourceAction: userTextForResolve,
+          baseGameMode: baseGameModeForResolve,
+          intentDecision: {
+            resolution,
+            reason: apiDecision.reason ?? null,
+            rollRequestSummary: {
+              stat: rr.stat,
+              skill: skill ?? null,
+              dc: rr.dc ?? null,
+              raison: rr.raison ?? null,
+            },
+          },
+        };
+      }
       pendingRollRef.current = normalizedRoll;
       setPendingRoll(normalizedRoll);
       addMessage(
@@ -3312,8 +4038,8 @@ export default function ChatInterface() {
         nextEntities = applyUpdatesLocally(nextEntities, lootEntityUpdates);
       }
       if (invGains.length > 0) {
-        const currentInv = Array.isArray(player?.inventaire) ? player.inventaire : [];
-        updatePlayer({ inventaire: [...currentInv, ...invGains] });
+        const currentInv = Array.isArray(player?.inventory) ? player.inventory : [];
+        updatePlayer({ inventory: [...currentInv, ...invGains] });
       }
 
       engineEvent = {
@@ -3326,12 +4052,10 @@ export default function ChatInterface() {
     }
 
     const sceneUpdate = apiDecision.sceneUpdate;
-    let sceneChanged = false;
     if (sceneUpdate?.hasChanged && typeof sceneUpdate?.targetRoomId === "string") {
       const tid = sceneUpdate.targetRoomId.trim();
       const room = tid && GOBLIN_CAVE[tid] ? GOBLIN_CAVE[tid] : null;
       if (room) {
-        sceneChanged = true;
         rememberRoomEntitiesSnapshot(baseRoomId, nextEntities);
         nextRoomId = tid;
         nextScene = room.description ?? baseScene;
@@ -3358,7 +4082,10 @@ export default function ChatInterface() {
       }
     }
 
-    if (sceneChanged) {
+    const explorationAfterIntent =
+      (gameStateRef.current?.gameMode ?? baseGameModeForResolve) === "exploration";
+
+    if (explorationAfterIntent) {
       try {
         const resolved = await runSceneEntryGmArbiter({
           roomId: nextRoomId,
@@ -3367,6 +4094,11 @@ export default function ChatInterface() {
           entitiesAtEntry: nextEntities,
           sourceAction: userTextForResolve,
           baseGameMode: gameStateRef.current?.gameMode ?? baseGameModeForResolve,
+          intentDecision: {
+            resolution: apiDecision.resolution,
+            reason: apiDecision.reason ?? null,
+            sceneUpdate: sceneUpdate ?? null,
+          },
         });
         nextEntities = resolved?.nextEntities ?? nextEntities;
         nextRoomId = resolved?.nextRoomId ?? nextRoomId;
@@ -3379,7 +4111,7 @@ export default function ChatInterface() {
       } catch (e) {
         addMessage(
           "ai",
-          `[DEBUG] Erreur GM Arbitre de scène (transition parse-intent): ${String(e?.message ?? e)}`,
+          `[DEBUG] Erreur GM Arbitre de scène (après parse-intent): ${String(e?.message ?? e)}`,
           "debug",
           makeMsgId()
         );
@@ -3400,6 +4132,116 @@ export default function ChatInterface() {
     });
   }
 
+  function buildLazyCampaignWorldContext({
+    roomId,
+    currentEntitiesSnapshot,
+    trigger = null,
+    scope = "full_campaign",
+  }) {
+    const effectiveRoomId = typeof roomId === "string" ? roomId.trim() : "";
+
+    const allRooms = Object.entries(GOBLIN_CAVE ?? {}).map(([id, room]) => ({
+      id,
+      title: room?.title ?? "",
+      description: room?.description ?? "",
+      secrets: room?.secrets ?? "",
+      exits: Array.isArray(room?.exits) ? room.exits : [],
+      encounterEntities: Array.isArray(room?.encounterEntities) ? room.encounterEntities : [],
+    }));
+
+    let worldRooms = allRooms;
+
+    if (scope === "connected_rooms" && effectiveRoomId && GOBLIN_CAVE?.[effectiveRoomId]) {
+      const toExitId = (exitDef) => {
+        if (typeof exitDef === "string") return exitDef;
+        return String(exitDef?.id ?? "").trim();
+      };
+
+      const connectedIds = new Set([effectiveRoomId]);
+      const currentRoomDef = GOBLIN_CAVE?.[effectiveRoomId];
+      const outgoing = Array.isArray(currentRoomDef?.exits) ? currentRoomDef.exits : [];
+      for (const ex of outgoing) {
+        const id = toExitId(ex);
+        if (id) connectedIds.add(id);
+      }
+
+      // Entrantes : toute salle qui a une sortie vers effectiveRoomId.
+      for (const [rid, rdef] of Object.entries(GOBLIN_CAVE ?? {})) {
+        const exits = Array.isArray(rdef?.exits) ? rdef.exits : [];
+        if (exits.some((ex) => toExitId(ex) === effectiveRoomId)) {
+          connectedIds.add(rid);
+        }
+      }
+
+      worldRooms = allRooms.filter((r) => connectedIds.has(r.id));
+    }
+
+    const roomStates = {};
+    for (const { id } of worldRooms) {
+      const entitiesForRoom =
+        id === "scene_journey"
+          ? []
+          : id === effectiveRoomId
+            ? Array.isArray(currentEntitiesSnapshot)
+              ? currentEntitiesSnapshot
+              : []
+            : takeEntitiesForRoom(id);
+      roomStates[id] = {
+        roomMemory: getRoomMemory(id),
+        entities: Array.isArray(entitiesForRoom) ? entitiesForRoom : [],
+      };
+    }
+
+    return {
+      requestedFromRoomId: effectiveRoomId || null,
+      scope,
+      trigger,
+      rooms: worldRooms,
+      roomStates,
+    };
+  }
+
+  function applyCrossRoomConsequences({
+    activeRoomId,
+    activeEntities,
+    crossRoomEntityUpdates,
+    crossRoomMemoryAppend,
+  }) {
+    let nextActiveEntities = Array.isArray(activeEntities) ? activeEntities : [];
+
+    if (Array.isArray(crossRoomEntityUpdates)) {
+      for (const entry of crossRoomEntityUpdates) {
+        if (!entry || typeof entry !== "object") continue;
+        const targetRoomId = String(entry.roomId ?? "").trim();
+        const roomUpdates = Array.isArray(entry.updates) ? entry.updates : [];
+        if (!targetRoomId || roomUpdates.length === 0) continue;
+
+        if (targetRoomId === activeRoomId) {
+          nextActiveEntities = applyUpdatesLocally(nextActiveEntities, roomUpdates);
+          applyEntityUpdates(roomUpdates);
+          continue;
+        }
+
+        const existingSnapshot =
+          targetRoomId === "scene_journey" ? [] : takeEntitiesForRoom(targetRoomId);
+        const nextSnapshot = applyUpdatesLocally(existingSnapshot, roomUpdates);
+        rememberRoomEntitiesSnapshot(targetRoomId, nextSnapshot);
+      }
+    }
+
+    if (Array.isArray(crossRoomMemoryAppend)) {
+      for (const entry of crossRoomMemoryAppend) {
+        if (!entry || typeof entry !== "object") continue;
+        const targetRoomId = String(entry.roomId ?? "").trim();
+        const line = String(entry.line ?? "").trim();
+        if (!targetRoomId || !line) continue;
+        appendRoomMemory(targetRoomId, line);
+      }
+    }
+
+    return nextActiveEntities;
+  }
+
   async function runSceneEntryGmArbiter({
     roomId,
     scene,
@@ -3408,29 +4250,42 @@ export default function ChatInterface() {
     sourceAction,
     baseGameMode,
     rollResultOverride = null,
+    intentDecision = null,
+    arbiterTrigger = null,
+    reentryDepth = 0,
   }) {
     const room = roomId && GOBLIN_CAVE[roomId] ? GOBLIN_CAVE[roomId] : null;
     const provider = gameStateRef.current?.aiProvider === "gemini" ? "gemini" : "openrouter";
-    const postArbiter = async (rollResult = null) => {
-      const res = await fetch("/api/gm-arbiter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider,
-          currentRoomId: roomId,
-          currentRoomTitle: room?.title ?? "",
-          currentScene: scene ?? "",
-          currentRoomSecrets: room?.secrets ?? "",
-          roomMemory: getRoomMemory(roomId),
-          allowedExits: Array.isArray(room?.exits) ? room.exits : [],
-          entities: Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [],
-          player: player ?? null,
-          messages: [...messagesRef.current],
-          rollResult,
-          sourceAction: sourceAction ?? "",
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
+    let campaignWorldContext = null;
+    let campaignContextScope = null;
+    const postArbiter = async (rollResult = null, worldContextOverride = null) => {
+      const body = {
+        provider,
+        currentRoomId: roomId,
+        currentRoomTitle: room?.title ?? "",
+        currentScene: scene ?? "",
+        currentRoomSecrets: room?.secrets ?? "",
+        roomMemory: getRoomMemory(roomId),
+        allowedExits: Array.isArray(room?.exits) ? room.exits : [],
+        entities: Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [],
+        player: player ?? null,
+        messages: [...messagesRef.current],
+        rollResult,
+        sourceAction: sourceAction ?? "",
+        intentDecision: intentDecision ?? null,
+        arbiterTrigger: arbiterTrigger ?? null,
+        campaignWorldContext: worldContextOverride ?? null,
+      };
+      const { res, data } = await fetchJsonWithTimeout(
+        "/api/gm-arbiter",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        60000,
+        "gm-arbiter"
+      );
       addMessage(
         "ai",
         `[DEBUG][ENGINE_RX] JSON reçu de /api/gm-arbiter\n` +
@@ -3443,6 +4298,12 @@ export default function ChatInterface() {
             hasRollRequest: !!data?.rollRequest,
             hasSceneUpdate: !!data?.sceneUpdate,
             hasEntityUpdates: Array.isArray(data?.entityUpdates) && data.entityUpdates.length > 0,
+            requestedCampaignContext: data?.resolution === "needs_campaign_context",
+            hasCrossRoomEntityUpdates:
+              Array.isArray(data?.crossRoomEntityUpdates) && data.crossRoomEntityUpdates.length > 0,
+            hasCrossRoomMemoryAppend:
+              Array.isArray(data?.crossRoomMemoryAppend) && data.crossRoomMemoryAppend.length > 0,
+            arbiterTrigger: arbiterTrigger ?? null,
             rollResultSent: rollResult ?? null,
             roomMemoryAppend: data?.roomMemoryAppend ?? null,
           }),
@@ -3453,12 +4314,51 @@ export default function ChatInterface() {
       return data;
     };
 
-    const first = await postArbiter(rollResultOverride);
-    let finalDecision = first;
+    let finalDecision = await postArbiter(rollResultOverride, campaignWorldContext);
     let rollOutcome = rollResultOverride;
 
-    if (first?.resolution === "request_roll" && first?.rollRequest) {
-      const rr = first.rollRequest;
+    for (let step = 0; step < 3; step++) {
+      if (finalDecision?.resolution === "needs_campaign_context") {
+        const requestedScope =
+          finalDecision?.campaignContextRequest?.scope === "connected_rooms"
+            ? "connected_rooms"
+            : "full_campaign";
+
+        if (!campaignWorldContext || campaignContextScope !== requestedScope) {
+          campaignContextScope = requestedScope;
+          campaignWorldContext = buildLazyCampaignWorldContext({
+            roomId,
+            currentEntitiesSnapshot: entitiesAtEntry,
+            trigger: arbiterTrigger ?? null,
+            scope: requestedScope,
+          });
+          addMessage(
+            "ai",
+            `[DEBUG] GM Arbitre → escalade contexte campagne (${requestedScope})\n` +
+              safeJson({
+                roomId,
+                reason:
+                  finalDecision?.campaignContextRequest?.reason ??
+                  finalDecision?.reason ??
+                  null,
+                trigger: arbiterTrigger ?? null,
+                roomsCount: Array.isArray(campaignWorldContext.rooms)
+                  ? campaignWorldContext.rooms.length
+                  : 0,
+              }),
+            "debug",
+            makeMsgId()
+          );
+        }
+        finalDecision = await postArbiter(rollOutcome, campaignWorldContext);
+        continue;
+      }
+
+      if (finalDecision?.resolution !== "request_roll" || !finalDecision?.rollRequest) {
+        break;
+      }
+
+      const rr = finalDecision.rollRequest;
 
       if (rr.kind === "player_check") {
         const stat = String(rr?.stat ?? "SAG").trim().toUpperCase();
@@ -3485,6 +4385,9 @@ export default function ChatInterface() {
             sceneName,
             sourceAction,
             baseGameMode,
+            intentDecision: intentDecision ?? null,
+            arbiterTrigger: arbiterTrigger ?? null,
+            narrateAfterResolution: arbiterTrigger == null,
           },
         };
         pendingRollRef.current = pendingFromSceneArbiter;
@@ -3514,17 +4417,17 @@ export default function ChatInterface() {
           "debug",
           makeMsgId()
         );
-      } else {
-        const dice = rollDiceDetailed(notation);
-        rollOutcome = { notation, total: dice.total, rolls: dice.rolls };
-        addMessage(
-          "ai",
-          `[DEBUG] GM Arbitre (scène) → jet secret ${notation} [${dice.rolls.join("+")}] = **${dice.total}**`,
-          "debug",
-          makeMsgId()
-        );
-        finalDecision = await postArbiter(rollOutcome);
+        break;
       }
+      const dice = rollDiceDetailed(notation);
+      rollOutcome = { notation, total: dice.total, rolls: dice.rolls };
+      addMessage(
+        "ai",
+        `[DEBUG] GM Arbitre (scène) → jet secret ${notation} [${dice.rolls.join("+")}] = **${dice.total}**`,
+        "debug",
+        makeMsgId()
+      );
+      finalDecision = await postArbiter(rollOutcome, campaignWorldContext);
     }
 
     let nextEntities = Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [];
@@ -3534,28 +4437,52 @@ export default function ChatInterface() {
     let nextGameMode = baseGameMode;
 
     const plannedUpdates = Array.isArray(finalDecision?.entityUpdates) ? finalDecision.entityUpdates : [];
+    const plannedEntitiesAfterLocalUpdates = plannedUpdates.length
+      ? applyUpdatesLocally(nextEntities, plannedUpdates)
+      : nextEntities;
     const willSpawnHostile = plannedUpdates.some((u) => {
       if (!u || typeof u !== "object") return false;
       if (u.action !== "spawn") return false;
       const t = String(u.type ?? "").trim().toLowerCase();
       return t === "hostile";
     });
-    const willSwitchToCombat = finalDecision?.gameMode === "combat";
+    const willHaveCombatReadyHostiles = hasAnyCombatReadyHostile(plannedEntitiesAfterLocalUpdates);
+    const willSwitchToCombat = finalDecision?.gameMode === "combat" && willHaveCombatReadyHostiles;
     // Ordre strict demandé :
     // narration d'abord, puis bannière/jet d'initiative.
     // On verrouille donc l'initiative AVANT d'appliquer les conséquences de scène qui ouvrent le combat.
-    if ((willSwitchToCombat || willSpawnHostile) && (combatOrder?.length ?? 0) === 0) {
+    if ((willSwitchToCombat || (willSpawnHostile && willHaveCombatReadyHostiles)) && (combatOrder?.length ?? 0) === 0) {
       waitForGmNarrationForInitiativeLiveRef.current = true;
       setWaitForGmNarrationForInitiative(true);
     }
 
     const updates = plannedUpdates;
     if (updates.length) {
-      nextEntities = applyUpdatesLocally(nextEntities, updates);
+      nextEntities = plannedEntitiesAfterLocalUpdates;
       applyEntityUpdates(updates);
+      if ((nextGameMode === "combat" || gameStateRef.current?.gameMode === "combat") && combatOrder.length > 0) {
+        const spawnedIds = updates
+          .filter((u) => u && typeof u === "object" && u.action === "spawn")
+          .map((u) => String(u.id ?? "").trim())
+          .filter(Boolean);
+        if (spawnedIds.length > 0) {
+          const spawnedEntities = nextEntities.filter((ent) => spawnedIds.includes(ent.id));
+          insertSpawnedCombatantsIntoInitiative(spawnedEntities, {
+            anchorActorId: arbiterTrigger?.actorId ?? null,
+          });
+        }
+      }
     }
 
+    nextEntities = applyCrossRoomConsequences({
+      activeRoomId: nextRoomId,
+      activeEntities: nextEntities,
+      crossRoomEntityUpdates: finalDecision?.crossRoomEntityUpdates ?? null,
+      crossRoomMemoryAppend: finalDecision?.crossRoomMemoryAppend ?? null,
+    });
+
     const sUp = finalDecision?.sceneUpdate;
+    const roomBeforeSceneUpdate = nextRoomId;
     if (sUp?.hasChanged && typeof sUp?.targetRoomId === "string") {
       const tid = sUp.targetRoomId.trim();
       const tRoom = tid && GOBLIN_CAVE[tid] ? GOBLIN_CAVE[tid] : null;
@@ -3584,8 +4511,42 @@ export default function ChatInterface() {
       }
     }
 
+    // IMPORTANT: après un sceneUpdate (changement de salle), rappeler immédiatement l'arbitre
+    // sur la NOUVELLE salle avant narration, afin qu'il puisse spawner/appliquer les règles
+    // de la pièce d'arrivée (en se basant sur description+secrets+mémoires).
+    if (
+      reentryDepth < 1 &&
+      nextRoomId &&
+      roomBeforeSceneUpdate &&
+      nextRoomId !== roomBeforeSceneUpdate
+    ) {
+      return await runSceneEntryGmArbiter({
+        roomId: nextRoomId,
+        scene: nextScene,
+        sceneName: nextSceneName,
+        entitiesAtEntry: nextEntities,
+        sourceAction: `[SceneEntered] ${nextRoomId}`,
+        baseGameMode: nextGameMode,
+        rollResultOverride: null,
+        intentDecision: {
+          resolution: "trivial_success",
+          reason: `Entrée dans ${nextRoomId}`,
+          sceneUpdate: null,
+        },
+        arbiterTrigger: {
+          phase: "scene_entered",
+          fromRoomId: roomBeforeSceneUpdate,
+          toRoomId: nextRoomId,
+        },
+        reentryDepth: reentryDepth + 1,
+      });
+    }
+
     if (finalDecision?.gameMode === "combat" || finalDecision?.gameMode === "exploration") {
-      nextGameMode = finalDecision.gameMode;
+      nextGameMode =
+        finalDecision.gameMode === "combat" && !hasAnyCombatReadyHostile(nextEntities)
+          ? "exploration"
+          : finalDecision.gameMode;
       setGameMode(nextGameMode);
     }
     ensureCombatState(nextEntities);
@@ -3599,6 +4560,13 @@ export default function ChatInterface() {
       gameMode: nextGameMode,
     };
 
+    const resOut = String(finalDecision?.resolution ?? "").trim();
+    const explicitRoomMemory =
+      typeof finalDecision?.roomMemoryAppend === "string"
+        ? finalDecision.roomMemoryAppend.trim()
+        : "";
+    const arbiterDetails = explicitRoomMemory ? explicitRoomMemory.slice(0, 400) : "";
+
     const engineEvent =
       finalDecision?.engineEvent && typeof finalDecision.engineEvent === "object"
         ? {
@@ -3606,26 +4574,24 @@ export default function ChatInterface() {
             kind: finalDecision.engineEvent.kind ?? "scene_rule_resolution",
             roomId: nextRoomId,
             reason: finalDecision?.reason ?? null,
+            details:
+              typeof finalDecision.engineEvent.details === "string" &&
+              finalDecision.engineEvent.details.trim()
+                ? finalDecision.engineEvent.details.trim()
+                : arbiterDetails || null,
             rollResult: rollOutcome,
+          arbiterTrigger: arbiterTrigger ?? null,
           }
         : {
             kind: "scene_rule_resolution",
             roomId: nextRoomId,
             reason: finalDecision?.reason ?? null,
+            details: arbiterDetails || null,
             rollResult: rollOutcome,
+          arbiterTrigger: arbiterTrigger ?? null,
           };
-
-    const resOut = String(finalDecision?.resolution ?? "").trim();
     if (resOut === "apply_consequences" || resOut === "no_roll_needed") {
-      const explicit =
-        typeof finalDecision?.roomMemoryAppend === "string"
-          ? finalDecision.roomMemoryAppend.trim()
-          : "";
-      let memLine = explicit ? explicit.slice(0, 400) : "";
-      if (!memLine && resOut === "apply_consequences") {
-        const r = String(finalDecision?.reason ?? "").trim();
-        if (r) memLine = r.slice(0, 250);
-      }
+      const memLine = explicitRoomMemory ? explicitRoomMemory.slice(0, 400) : "";
       if (memLine) appendRoomMemory(roomId, memLine);
     }
 
@@ -3638,6 +4604,80 @@ export default function ChatInterface() {
       engineEvent,
       awaitingPlayerRoll: false,
     };
+  }
+
+  async function runCombatTurnEndArbiter({
+    actorId,
+    actorName,
+    actorType = null,
+  }) {
+    const latest = gameStateRef.current ?? {};
+    const activeRoomId = latest.currentRoomId ?? currentRoomId;
+    if (!activeRoomId || activeRoomId === "scene_journey") {
+      return { awaitingPlayerRoll: false };
+    }
+
+    const activeScene = latest.currentScene ?? currentScene;
+    const activeSceneName = latest.currentSceneName ?? currentSceneName;
+    const activeEntities = Array.isArray(latest.entities) ? latest.entities : entities;
+    const trigger = {
+      phase: "combat_turn_end",
+      actorId: actorId ?? null,
+      actorName: actorName ?? null,
+      actorType: actorType ?? null,
+      turnIndex: combatTurnIndexLiveRef.current,
+    };
+    const sourceAction = `[COMBAT_TURN_END] ${actorName ?? actorId ?? "unknown"} (${actorId ?? "unknown"})`;
+
+    try {
+      const resolved = await runSceneEntryGmArbiter({
+        roomId: activeRoomId,
+        scene: activeScene,
+        sceneName: activeSceneName,
+        entitiesAtEntry: activeEntities,
+        sourceAction,
+        baseGameMode: "combat",
+        intentDecision: {
+          resolution: "combat_turn_end",
+          reason: `Fin de tour de ${actorName ?? actorId ?? "inconnu"}`,
+        },
+        arbiterTrigger: trigger,
+      });
+      if (resolved?.awaitingPlayerRoll === true) {
+        return resolved;
+      }
+      const eventDetails =
+        typeof resolved?.engineEvent?.details === "string" ? resolved.engineEvent.details.trim() : "";
+      const eventReason =
+        typeof resolved?.engineEvent?.reason === "string" ? resolved.engineEvent.reason.trim() : "";
+      if (eventDetails || eventReason) {
+        await callApi("", "meta", false, {
+          hideUserMessage: true,
+          bypassIntentParser: true,
+          skipAutoPlayerTurn: true,
+          skipGmContinue: true,
+          entities: resolved?.nextEntities ?? activeEntities,
+          currentRoomId: resolved?.nextRoomId ?? activeRoomId,
+          currentScene: resolved?.nextScene ?? activeScene,
+          currentSceneName: resolved?.nextSceneName ?? activeSceneName,
+          gameMode: resolved?.nextGameMode ?? "combat",
+          engineEvent: resolved?.engineEvent ?? null,
+        });
+      }
+      const visibleReason = String(resolved?.engineEvent?.reason ?? resolved?.reason ?? "").trim();
+      if (debugMode && visibleReason) {
+        addMessage("ai", visibleReason, "meta-reply", makeMsgId());
+      }
+      return resolved;
+    } catch (e) {
+      addMessage(
+        "ai",
+        `[DEBUG] Erreur arbitre fin de tour combat : ${String(e?.message ?? e)}`,
+        "debug",
+        makeMsgId()
+      );
+      return { awaitingPlayerRoll: false };
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -3724,56 +4764,61 @@ export default function ChatInterface() {
           return typeof e.id === "string" && !!e.id.trim();
         });
         const parserRoom = baseRoomId && GOBLIN_CAVE[baseRoomId] ? GOBLIN_CAVE[baseRoomId] : null;
-        const res = await fetch("/api/parse-intent", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: userContent,
-            messages: updatedMessages,
-            gameMode: gameModeForParser,
-            currentScene: baseScene,
-            currentRoomId: baseRoomId,
-            currentRoomSecrets: parserRoom?.secrets ?? "",
-            allowedExits: Array.isArray(parserRoom?.exits)
-              ? parserRoom.exits
-                  .map((exitDef) => {
-                    const exitId =
-                      typeof exitDef === "string"
-                        ? exitDef
-                        : String(exitDef?.id ?? "").trim();
-                    const exitDesc =
-                      exitDef && typeof exitDef === "object"
-                        ? String(exitDef.description ?? "").trim()
-                        : "";
-                    const exitDirection =
-                      exitDef && typeof exitDef === "object"
-                        ? String(exitDef.direction ?? "").trim()
-                        : "";
-                    const room = GOBLIN_CAVE[exitId];
-                    return room
-                      ? {
-                          id: room.id,
-                          title: room.title ?? room.id,
-                          description: exitDesc || (room.description ?? ""),
-                          direction: exitDirection,
-                        }
-                      : null;
-                  })
-                  .filter(Boolean)
-              : [],
-            entities: parserEntities,
-            playerWeapons: snap.player?.weapons ?? [],
-            playerMeleeTargets: getMeleeWith("player"),
-            turnResources: {
-              action: !!turnResourcesRef.current?.action,
-              bonus: !!turnResourcesRef.current?.bonus,
-              reaction: !!turnResourcesRef.current?.reaction,
-              movement: !!turnResourcesRef.current?.movement,
-            },
-            provider: parseProvider,
-          }),
-        });
-        const data = await res.json().catch(() => ({}));
+        const parseBody = {
+          text: userContent,
+          messages: updatedMessages,
+          gameMode: gameModeForParser,
+          currentScene: baseScene,
+          currentRoomId: baseRoomId,
+          currentRoomSecrets: parserRoom?.secrets ?? "",
+          allowedExits: Array.isArray(parserRoom?.exits)
+            ? parserRoom.exits
+                .map((exitDef) => {
+                  const exitId =
+                    typeof exitDef === "string"
+                      ? exitDef
+                      : String(exitDef?.id ?? "").trim();
+                  const exitDesc =
+                    exitDef && typeof exitDef === "object"
+                      ? String(exitDef.description ?? "").trim()
+                      : "";
+                  const exitDirection =
+                    exitDef && typeof exitDef === "object"
+                      ? String(exitDef.direction ?? "").trim()
+                      : "";
+                  const room = GOBLIN_CAVE[exitId];
+                  return room
+                    ? {
+                        id: room.id,
+                        title: room.title ?? room.id,
+                        description: exitDesc || (room.description ?? ""),
+                        direction: exitDirection,
+                      }
+                    : null;
+                })
+                .filter(Boolean)
+            : [],
+          entities: parserEntities,
+          playerWeapons: snap.player?.weapons ?? [],
+          playerMeleeTargets: getMeleeWith("player"),
+          turnResources: {
+            action: !!turnResourcesRef.current?.action,
+            bonus: !!turnResourcesRef.current?.bonus,
+            reaction: !!turnResourcesRef.current?.reaction,
+            movement: !!turnResourcesRef.current?.movement,
+          },
+          provider: parseProvider,
+        };
+        const { res, data } = await fetchJsonWithTimeout(
+          "/api/parse-intent",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(parseBody),
+          },
+          60000,
+          "parse-intent"
+        );
         addMessage(
           "ai",
           `[DEBUG][ENGINE_RX] JSON reçu de /api/parse-intent\n` +
@@ -3828,6 +4873,7 @@ export default function ChatInterface() {
         markFlowFailure(
           `Erreur parse-intent: ${String(e?.message ?? e)}`,
           {
+            kind: "callApi",
             userContent,
             msgType,
             isDebug,
@@ -3875,23 +4921,30 @@ export default function ChatInterface() {
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           const latest = gameStateRef.current;
+          const effectiveRoomId =
+            overrides?.currentRoomId ?? latest.currentRoomId ?? baseRoomId;
           const bodyToSend = {
             ...requestBody,
             player: latest.player,
             currentScene: overrides?.currentScene ?? latest.currentScene,
-            currentRoomId: overrides?.currentRoomId ?? latest.currentRoomId,
+            currentRoomId: effectiveRoomId,
             entities: overrides?.entities ?? latest.entities,
             gameMode: overrides?.gameMode ?? latest.gameMode,
             provider: latest.aiProvider,
             debugMode: latest.debugMode,
+            roomMemory: getRoomMemory(effectiveRoomId),
             messages: limitedMessages,
             engineEvent,
           };
+          const controller = new AbortController();
+          const timeoutMs = 60000;
+          const t = setTimeout(() => controller.abort(), timeoutMs);
           const res = await fetch("/api/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(bodyToSend),
-          });
+            signal: controller.signal,
+          }).finally(() => clearTimeout(t));
 
           const data = await res.json().catch(() => ({}));
           addMessage(
@@ -3902,6 +4955,7 @@ export default function ChatInterface() {
                 status: res.status,
                 valid: data?.valid ?? null,
                 hasReply: typeof data?.reply === "string" && data.reply.trim().length > 0,
+                imageDecision: data?.imageDecision ?? null,
                 hasRollRequest: !!data?.rollRequest,
                 hasSceneUpdate: !!data?.sceneUpdate,
                 hasEntityUpdates: Array.isArray(data?.entityUpdates) && data.entityUpdates.length > 0,
@@ -3960,6 +5014,7 @@ export default function ChatInterface() {
       const {
         valid,
         reply,
+        imageDecision,
         rollRequest,
         actionIntent,
         gameMode: newGameMode,
@@ -3971,6 +5026,8 @@ export default function ChatInterface() {
         gmContinue,
         formatRetryUsed,
         formatRetryReason,
+        formatEmergencyUsed,
+        narratorFallback,
       } = responseData;
       const effectiveGameMode = newGameMode ?? baseGameMode;
       let actionIntentSafe = actionIntent;
@@ -4063,7 +5120,8 @@ export default function ChatInterface() {
         msgType === "dice" &&
         /^(?:🎲|ðŸŽ²)\s*Attaque/i.test(String(userContent ?? ""));
       const safeEntityUpdates = isEngineResolvedAttack ? null : entityUpdates;
-      const safePlayerHpUpdate = isEngineResolvedAttack ? null : playerHpUpdate;
+      const safePlayerHpUpdate =
+        isEngineResolvedAttack || playerEntityUpdatesTouchHp(safeEntityUpdates) ? null : playerHpUpdate;
       let safeSceneUpdate = sceneUpdate;
 
       if (isEngineResolvedAttack) {
@@ -4216,8 +5274,8 @@ export default function ChatInterface() {
           normalizedEntityUpdates = [...(normalizedEntityUpdates ?? []), ...lootEntityUpdates];
         }
         if (invGains.length) {
-          const currentInv = Array.isArray(player?.inventaire) ? player.inventaire : [];
-          updatePlayer({ inventaire: [...currentInv, ...invGains] });
+          const currentInv = Array.isArray(player?.inventory) ? player.inventory : [];
+          updatePlayer({ inventory: [...currentInv, ...invGains] });
         }
       }
 
@@ -4245,14 +5303,30 @@ export default function ChatInterface() {
         },
       });
 
-      if (formatRetryUsed === true) {
+      // Avertissement joueur seulement si la narration n’a pas pu être récupérée ; sinon bruit inutile
+      // (les traces serveur gardent geminiGeneration / finishReason).
+      if (formatRetryUsed === true && narratorFallback === true) {
         const reason = typeof formatRetryReason === "string" && formatRetryReason.trim()
           ? ` (${formatRetryReason.trim()})`
           : "";
         addMessage(
           "ai",
-          `⚠ Réponse IA au format invalide détectée${reason}. Une correction automatique a été demandée puis appliquée.`,
+          `⚠ Réponse IA au format invalide détectée${reason}. La correction automatique n'a pas produit de JSON valide : un message de secours remplace le fragment illisible. Consulte les traces geminiGeneration (finishReason).`,
           "meta",
+          makeMsgId()
+        );
+      } else if (formatRetryUsed === true && gameStateRef.current?.debugMode) {
+        const reason = typeof formatRetryReason === "string" && formatRetryReason.trim()
+          ? ` (${formatRetryReason.trim()})`
+          : "";
+        const detail =
+          formatEmergencyUsed === true
+            ? "Récupération OK après essai d'urgence (prompt minimal)."
+            : "Récupération OK après retry format.";
+        addMessage(
+          "ai",
+          `[DEBUG] Narrateur : 1er jet JSON invalide${reason}. ${detail}`,
+          "debug",
           makeMsgId()
         );
       }
@@ -4436,7 +5510,7 @@ export default function ChatInterface() {
           }
 
           // Magicien : blocage strict si sort non préparé (prepared-only)
-          if (player?.classe === "Magicien" && effectiveRollRequest.weaponName) {
+          if (player?.entityClass === "Magicien" && effectiveRollRequest.weaponName) {
             const canonName = canonicalizeSpellNameAgainstPlayer(player, effectiveRollRequest.weaponName);
             const candidate = canonName ?? effectiveRollRequest.weaponName;
             const isSpell = !!SPELLS?.[candidate];
@@ -4707,6 +5781,7 @@ export default function ChatInterface() {
                     }
                   }
 
+                  myUpdates = markSceneHostilesAware(baseEntities, myUpdates);
                   const nextEntities = myUpdates.length ? applyUpdatesLocally(baseEntities, myUpdates) : baseEntities;
                   if (myUpdates.length) applyEntityUpdates(myUpdates);
                   ensureCombatState(nextEntities);
@@ -4837,11 +5912,11 @@ export default function ChatInterface() {
         }
 
         // Plus d'auto-simulation des ennemis ici : les ennemis jouent via le bouton "Fin de tour".
-        // Mode combat piloté par le moteur : combat si au moins 1 hostile vivant (même invisible), sinon exploration
+        // Mode combat piloté par le moteur : combat si au moins 1 hostile a repéré le joueur.
         ensureCombatState(postEntities, newCombatOrder ?? null);
 
         {
-          const hasHostileAfter = hasAnyHostileAlive(postEntities);
+          const hasHostileAfter = hasAnyCombatReadyHostile(postEntities);
           let effCombatOrder = hasHostileAfter
             ? (Array.isArray(newCombatOrder) ? newCombatOrder : baseCombatOrder)
             : [];
@@ -4856,7 +5931,7 @@ export default function ChatInterface() {
           }
           combatAwaitingInitiativeAfterResponse =
             effGameMode === "combat" &&
-            hasAnyHostileAlive(postEntities) &&
+            hasAnyCombatReadyHostile(postEntities) &&
             (!effCombatOrder || effCombatOrder.length === 0);
           if (combatAwaitingInitiativeAfterResponse) {
             // Attendre une vraie narration GM (pas juste un message vide/fallback)
@@ -5010,6 +6085,15 @@ export default function ChatInterface() {
                       "debug",
                       makeMsgId()
                     );
+                    markFlowFailure(String(e?.message ?? e), {
+                      kind: "sceneEntered",
+                      roomId: tid,
+                      scene: finalDesc,
+                      sceneName: finalName,
+                      entitiesAtEntry: finalEntities,
+                      sourceAction: userContent,
+                      baseGameMode: gameStateRef.current?.gameMode ?? baseGameMode,
+                    });
                   })
               ).finally(() => {
                 sceneEnteredPipelineDepthRef.current = Math.max(
@@ -5079,6 +6163,12 @@ export default function ChatInterface() {
         addMessage("ai", displayReply, isDebug ? "meta-reply" : undefined, makeMsgId());
       }
 
+      triggerSceneImageFromNarratorDecision(imageDecision, {
+        roomId: baseRoomId,
+        sceneName: overrides?.currentSceneName ?? snap.currentSceneName ?? currentSceneName,
+        engineEvent,
+      });
+
       // Respect ordre souhaité par le moteur : narration d'abord (chat),
       // puis exécution des instructions (spawns / kills / updates).
       if (pendingEntityUpdatesForNarrationOrder?.length) {
@@ -5138,6 +6228,7 @@ export default function ChatInterface() {
       } else if (
         effectiveGmContinue &&
         !pendingRollRef.current &&
+        !rollResolutionInProgressRef.current &&
         !flowBlockedRef.current
       ) {
         const overrides = autoPlayerOverrides ?? {
@@ -5154,15 +6245,26 @@ export default function ChatInterface() {
         }, 0);
       } else if (
         !pendingRollRef.current &&
+        !rollResolutionInProgressRef.current &&
         autoPlayerEnabledRef.current &&
         !combatAwaitingInitiativeAfterResponse &&
         !flowBlockedRef.current
       ) {
         const overrides = autoPlayerOverrides;
-        setTimeout(() => {
+        // Anti-race: éviter que l'auto-joueur parte avant que la dernière narration GM
+        // soit "commit" dans `messagesRef.current` (useLayoutEffect).
+        const scheduleAutoPlayerTurn = (cb) => {
+          if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(() => cb());
+            return;
+          }
+          // Fallback : une frame "typique" (si requestAnimationFrame indisponible)
+          setTimeout(() => cb(), 16);
+        };
+        scheduleAutoPlayerTurn(() => {
           if (!autoPlayerEnabledRef.current) return;
           runAutoPlayerTurn(overrides);
-        }, 0);
+        });
       }
     } catch (err) {
       // Latence même en cas d'échec (utile pour diagnostiquer)
@@ -5185,6 +6287,7 @@ export default function ChatInterface() {
       );
       const details = err?.message ?? "Une erreur inattendue s'est produite.";
       markFlowFailure(details, {
+        kind: "callApi",
         userContent,
         msgType,
         isDebug,
@@ -5210,13 +6313,136 @@ export default function ChatInterface() {
     if (!failedRequestPayload || isTyping || isRetryingFailedRequest) return;
     setIsRetryingFailedRequest(true);
     try {
-      if (failedRequestPayload.kind === "nextTurn") {
+      const k = failedRequestPayload.kind ?? "callApi";
+      if (k === "nextTurn") {
         await nextTurn();
         setFlowBlocked(false);
         setError(null);
         setFailedRequestPayload(null);
         return;
       }
+      if (k === "enemy-tactics") {
+        const id = String(failedRequestPayload.enemyId ?? "").trim();
+        const ent = (gameStateRef.current?.entities ?? entities ?? []).find((e) => e?.id === id);
+        if (ent) {
+          await simulateSingleEnemyTurn(ent);
+        }
+        setFlowBlocked(false);
+        setError(null);
+        setFailedRequestPayload(null);
+        return;
+      }
+      if (k === "sceneEntered") {
+        const resolved = await runSceneEntryGmArbiter({
+          roomId: failedRequestPayload.roomId,
+          scene: failedRequestPayload.scene,
+          sceneName: failedRequestPayload.sceneName,
+          entitiesAtEntry: failedRequestPayload.entitiesAtEntry,
+          sourceAction: failedRequestPayload.sourceAction,
+          baseGameMode: failedRequestPayload.baseGameMode,
+          arbiterTrigger: { phase: "scene_entered_retry" },
+        });
+        if (resolved?.awaitingPlayerRoll !== true) {
+          await callApi("[SceneRulesResolved]", "meta", false, {
+            hideUserMessage: true,
+            bypassIntentParser: true,
+            skipAutoPlayerTurn: true,
+            skipGmContinue: true,
+            entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
+            currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
+            currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
+            currentSceneName: resolved?.nextSceneName ?? failedRequestPayload.sceneName,
+            gameMode: resolved?.nextGameMode ?? failedRequestPayload.baseGameMode,
+            engineEvent: resolved?.engineEvent ?? {
+              kind: "scene_rule_resolution",
+              roomId: failedRequestPayload.roomId,
+              reason: "Entrée dans le lieu.",
+            },
+            bypassFailureLock: true,
+          });
+        }
+        setFlowBlocked(false);
+        setError(null);
+        setFailedRequestPayload(null);
+        return;
+      }
+      if (k === "scene-image") {
+        const vc = failedRequestPayload.visualContext ?? null;
+        const mdl = failedRequestPayload.model ?? imageModel;
+        if (vc && typeof vc === "object") {
+          // Rejoue la génération d'image avec le même contexte.
+          const pendingId = makeMsgId();
+          const pendingLabel =
+            `Illustration décidée par le narrateur pour « ${currentSceneName || "la scène"} » — génération en cours…`;
+          const debugBlock =
+            `[DEBUG] Retry image → /api/scene-image\n` + safeJson({ model: mdl });
+          appendSceneImagePendingSlot(pendingId, pendingLabel, debugBlock);
+          try {
+            const { res, data } = await fetchJsonWithTimeout(
+              "/api/scene-image",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ visualContext: vc, model: mdl }),
+              },
+              120000,
+              "scene-image"
+            );
+            if (!res.ok) {
+              const msg = data?.details
+                ? `${data.error || "Erreur API"} (${data.status || res.status}): ${data.details}`
+                : data?.error || `Erreur API interne: ${res.status}`;
+              throw new Error(msg);
+            }
+            if (!data?.url) throw new Error("Réponse invalide du serveur d'images.");
+            updateMessage(pendingId, { content: data.url, type: "scene-image" });
+            setCurrentSceneImage(data.url);
+          } finally {
+            // En cas de succès, updateMessage remplace le pending slot ; sinon il reste (debug) et l'erreur générale s'affiche.
+          }
+        }
+        setFlowBlocked(false);
+        setError(null);
+        setFailedRequestPayload(null);
+        return;
+      }
+      if (k === "sceneArbiterAfterGmSecret") {
+        const resolved = await runSceneEntryGmArbiter({
+          roomId: failedRequestPayload.roomId,
+          scene: failedRequestPayload.scene,
+          sceneName: failedRequestPayload.sceneName,
+          entitiesAtEntry: failedRequestPayload.entitiesAtEntry,
+          sourceAction: failedRequestPayload.sourceAction,
+          baseGameMode: failedRequestPayload.baseGameMode,
+          rollResultOverride: failedRequestPayload.rollResultOverride ?? null,
+          intentDecision: failedRequestPayload.intentDecision ?? null,
+        });
+        if (resolved?.awaitingPlayerRoll !== true) {
+          await callApi(
+            failedRequestPayload?.diceFollowup?.userContent ?? "[Jet secret résolu]",
+            "dice",
+            false,
+            {
+              hideUserMessage: true,
+              bypassIntentParser: true,
+              skipAutoPlayerTurn: true,
+              skipGmContinue: true,
+              entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
+              currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
+              currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
+              currentSceneName: resolved?.nextSceneName ?? failedRequestPayload.sceneName,
+              gameMode: resolved?.nextGameMode ?? failedRequestPayload.baseGameMode,
+              engineEvent: resolved?.engineEvent ?? failedRequestPayload?.diceFollowup?.engineEvent ?? null,
+              bypassFailureLock: true,
+            }
+          );
+        }
+        setFlowBlocked(false);
+        setError(null);
+        setFailedRequestPayload(null);
+        return;
+      }
+      // Par défaut : rejouer le dernier callApi connu
       const { userContent, msgType: retryMsgType, isDebug: retryIsDebug, overrides } = failedRequestPayload;
       await callApi(userContent, retryMsgType, !!retryIsDebug, {
         ...(overrides ?? {}),
@@ -5252,6 +6478,69 @@ export default function ChatInterface() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- callApi stable pour cet usage ponctuel
   }, [player?.hp?.current, setGameMode, setCombatOrder, setCombatTurnIndex]);
 
+  const handleCheatReviveAfterGameOver = useCallback(() => {
+    deathNarrationSentRef.current = false;
+    setIsGameOver(false);
+
+    if (player?.hp?.max) {
+      setHp(player.hp.max);
+      playerHpRef.current = player.hp.max;
+    }
+
+    const survivingNonHostiles = (Array.isArray(entities) ? entities : []).filter(
+      (entity) => entity && entity.type !== "hostile"
+    );
+    replaceEntities(survivingNonHostiles);
+    if (currentRoomId) {
+      rememberRoomEntitiesSnapshot(currentRoomId, survivingNonHostiles);
+    }
+
+    clearMeleeFor("player");
+    setHasDisengagedThisTurn(false);
+    grantPlayerTurnResources();
+    setGameMode("exploration", survivingNonHostiles, { force: true });
+    setCombatOrder([]);
+    commitCombatTurnIndex(0);
+    setPendingRoll(null);
+    setMovementGate(null);
+    setWaitForGmNarrationForInitiative(false);
+    waitForGmNarrationForInitiativeLiveRef.current = false;
+    setFlowBlocked(false);
+    setFailedRequestPayload(null);
+    setError(null);
+    setIsTyping(false);
+    setIsAutoPlayerThinking(false);
+    flowBlockedRef.current = false;
+    failedRequestPayloadRef.current = null;
+    awaitingPlayerInitiativeRef.current = false;
+    pendingRollRef.current = null;
+    apiProcessingDepthRef.current = 0;
+    sceneEnteredPipelineDepthRef.current = 0;
+    rollResolutionInProgressRef.current = false;
+    autoTurnInProgressRef.current = false;
+
+    addMessage(
+      "ai",
+      "Un second souffle improbable vous arrache aux ténèbres. Le combat est brisé et le silence retombe autour de vous.",
+      "meta",
+      makeMsgId()
+    );
+  }, [
+    addMessage,
+    clearMeleeFor,
+    currentRoomId,
+    entities,
+    grantPlayerTurnResources,
+    rememberRoomEntitiesSnapshot,
+    replaceEntities,
+    setCombatOrder,
+    setError,
+    setGameMode,
+    setHasDisengagedThisTurn,
+    setHp,
+    setPendingRoll,
+  ]);
+
   // ---------------------------------------------------------------------------
   // Mode auto-joueur : génération d'un message joueur via l'IA
   // ---------------------------------------------------------------------------
@@ -5266,6 +6555,7 @@ export default function ChatInterface() {
     if (flowBlockedRef.current) return;
     if (!autoPlayerEnabledRef.current) return;
     if (autoTurnInProgressRef.current) return;
+    if (rollResolutionInProgressRef.current) return;
     if (isGameOverRef.current) return;
     if ((gameStateRef.current?.player?.hp?.current ?? 1) <= 0) return;
 
@@ -5274,15 +6564,19 @@ export default function ChatInterface() {
     const inCombatNoOrder =
       snapEarly?.gameMode === "combat" &&
       (!snapEarly.combatOrder || snapEarly.combatOrder.length === 0) &&
-      hasAnyHostileAlive(snapEarly?.entities ?? []);
+      hasAnyCombatReadyHostile(snapEarly?.entities ?? []);
     if (inCombatNoOrder) {
       if (awaitingPlayerInitiativeRef.current) {
-        handleCommitInitiative();
+        // Le jet d'initiative du PJ est un "jet joueur" : ne jamais le lancer via auto-joueur.
+        // Il ne peut être auto-résolu QUE si Auto Roll est ON.
+        if (autoRollEnabledRef.current) handleCommitInitiative();
       }
       return;
     }
     if (pendingRollRef.current) {
-      void handleRoll();
+      if (autoRollEnabledRef.current) {
+        void handleRoll();
+      }
       return;
     }
 
@@ -5300,6 +6594,12 @@ export default function ChatInterface() {
     const effRoomId = overrides?.currentRoomId ?? snap0.currentRoomId;
     const effScene = overrides?.currentScene ?? snap0.currentScene;
     const overridesForAutoCall = { ...(overrides ?? {}), skipAutoPlayerTurn: true };
+    /** Historique API auto-joueur uniquement : consigne anti-boucle, pas un message joueur in-game. */
+    const autoPlayerNudge = (content) => ({
+      role: "user",
+      type: "auto-player-nudge",
+      content: String(content ?? "").trim(),
+    });
     let intentErrorRetries = 0;
 
     const trSnap0 = turnResourcesRef.current ?? turnResources;
@@ -5395,6 +6695,122 @@ export default function ChatInterface() {
         const trSnap = turnResourcesRef.current ?? turnResources;
         const secondWindRemaining = snap.player?.fighter?.resources?.secondWind?.remaining ?? 0;
         const secondWindAvailable = secondWindRemaining > 0;
+        const playerWeaponNames = Array.isArray(snap.player?.weapons)
+          ? snap.player.weapons
+              .map((w) => String(w?.name ?? "").trim())
+              .filter(Boolean)
+          : [];
+        const actionCatalog =
+          gMode === "combat"
+            ? {
+                mainActionOptions: [
+                  {
+                    key: "attack",
+                    label: "Attaquer",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                    note:
+                      playerWeaponNames.length > 0
+                        ? `Utiliser un nom exact d'arme: ${playerWeaponNames.join(", ")}`
+                        : "Nommer une arme réellement possédée.",
+                  },
+                  {
+                    key: "cast_spell_action",
+                    label: "Lancer un sort (1 action)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "dash",
+                    label: "Foncer (Dash)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "disengage",
+                    label: "Se désengager (Disengage)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "dodge",
+                    label: "Esquiver (Dodge)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "help",
+                    label: "Aider (Help)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "hide",
+                    label: "Se cacher (Hide)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "ready",
+                    label: "Se tenir prêt (Ready)",
+                    cost: { action: 1, reaction_later: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "search",
+                    label: "Chercher (Search)",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                  {
+                    key: "use_object",
+                    label: "Utiliser un objet",
+                    cost: { action: 1 },
+                    available: !!trSnap?.action,
+                  },
+                ],
+                movementOptions: [
+                  {
+                    key: "move",
+                    label: "Se déplacer",
+                    cost: { movement: 1 },
+                    available: !!trSnap?.movement,
+                  },
+                  {
+                    key: "stand_up",
+                    label: "Se relever",
+                    cost: { movement: 0.5 },
+                    available: !!trSnap?.movement,
+                  },
+                  {
+                    key: "drop_prone",
+                    label: "Se coucher à terre",
+                    cost: { movement: 0 },
+                    available: true,
+                  },
+                ],
+                bonusActionOptions: [
+                  {
+                    key: "second_wind",
+                    label: "Second souffle",
+                    cost: { bonus: 1 },
+                    available: !!trSnap?.bonus && secondWindAvailable,
+                  },
+                  {
+                    key: "off_hand_attack",
+                    label: "Attaque à deux armes (main secondaire)",
+                    cost: { bonus: 1 },
+                    available: !!trSnap?.bonus,
+                  },
+                  {
+                    key: "bonus_spell",
+                    label: "Sort en action bonus (si disponible)",
+                    cost: { bonus: 1 },
+                    available: !!trSnap?.bonus,
+                  },
+                ],
+              }
+            : null;
         return {
           gameMode: gMode,
           awaitingPlayerInitiative: !!awaitingPlayerInitiative,
@@ -5410,7 +6826,7 @@ export default function ChatInterface() {
                 })
                 .map((e) => ({
                   id: e.id,
-                  name: resolveCombatantDisplayName(e, ents, snap.player?.nom),
+                  name: resolveCombatantDisplayName(e, ents, snap.player?.name),
                 }))
             : [],
           activeCombatantId: activeEntry?.id ?? null,
@@ -5443,6 +6859,7 @@ export default function ChatInterface() {
             name: e.name ?? e.id,
             hpCurrent: e.hp?.current ?? 0,
           })),
+          actionCatalog,
         };
       };
       const battleSnapshot = buildBattleSnapshotForAutoPlayer();
@@ -5456,12 +6873,16 @@ export default function ChatInterface() {
         provider: apSnap().aiProvider,
         battleSnapshot,
       };
-      const res = await fetch("/api/auto-player", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
+      const { res, data } = await fetchJsonWithTimeout(
+        "/api/auto-player",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        60000,
+        "auto-player"
+      );
 
       if (!res.ok || !data?.content) {
         console.warn("[auto-joueur] Échec API:", data?.error ?? res.status);
@@ -5512,7 +6933,7 @@ export default function ChatInterface() {
 
         const retryHistory = [
           ...(Array.isArray(history) ? history : []),
-          { role: "user", content: retryUserNudge },
+          autoPlayerNudge(retryUserNudge),
         ];
 
         const res2 = await fetch("/api/auto-player", {
@@ -5565,7 +6986,7 @@ export default function ChatInterface() {
 
         const retryHistory = [
           ...(Array.isArray(history) ? history : []),
-          { role: "user", content: retryUserNudge },
+          autoPlayerNudge(retryUserNudge),
         ];
 
         const res2 = await fetch("/api/auto-player", {
@@ -5604,7 +7025,7 @@ export default function ChatInterface() {
           "Ne répète pas ton message précédent mot pour mot. Propose une action différente qui fait avancer l'histoire.";
         const retryHistory = [
           ...(Array.isArray(history) ? history : []),
-          { role: "user", content: retryUserNudge },
+          autoPlayerNudge(retryUserNudge),
         ];
 
         const res2 = await fetch("/api/auto-player", {
@@ -5662,7 +7083,7 @@ export default function ChatInterface() {
 
         const retryHistory = [
           ...(Array.isArray(history) ? history : []),
-          { role: "user", content: nudge },
+          autoPlayerNudge(nudge),
         ];
 
         const battleSnapshotRetry = buildBattleSnapshotForAutoPlayer();
@@ -5746,13 +7167,38 @@ export default function ChatInterface() {
     isAutoPlayerThinking,
   ]);
 
+  const lastAutoRollKeyRef = useRef(null);
+  useEffect(() => {
+    if (!autoRollEnabledRef.current) return;
+    if (flowBlockedRef.current) return;
+    if (rollResolutionInProgressRef.current) return;
+    if (isTyping || isAutoPlayerThinking) return;
+    if (isGameOverRef.current) return;
+
+    const pending = pendingRollRef.current;
+    if (!pending) {
+      lastAutoRollKeyRef.current = null;
+      return;
+    }
+
+    const autoKey = `${pending.kind ?? ""}:${pending.stat ?? pending.skill ?? ""}:${pending.weaponName ?? ""}:${pending.targetId ?? ""}:${pending.id ?? ""}:${pending.raison ?? ""}`;
+    if (autoKey === lastAutoRollKeyRef.current) return;
+    lastAutoRollKeyRef.current = autoKey;
+
+    queueMicrotask(() => {
+      if (!autoRollEnabledRef.current) return;
+      if (!pendingRollRef.current) return;
+      void handleRoll();
+    });
+  }, [pendingRoll, autoRollEnabled, autoPlayerEnabled, isTyping, isAutoPlayerThinking]);
+
   async function handleSend() {
     const trimmed = input.trim();
     if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
     // "Combat effectif" : parfois gameMode n'a pas encore été mis Ã  jour au moment
     // oÃ¹ le joueur enchaîne une action juste après une attaque qui a déclenché le combat.
     const effectiveInCombat =
-      gameMode === "combat" || hasAnyHostileAlive(entities) || (combatOrder?.length ?? 0) > 0;
+      gameMode === "combat" || hasAnyCombatReadyHostile(entities) || (combatOrder?.length ?? 0) > 0;
     const hasOrder = effectiveInCombat && combatOrder.length > 0;
     const activeEntry = hasOrder ? combatOrder[combatTurnIndex] : null;
     const isMyTurn =
@@ -5799,12 +7245,22 @@ export default function ChatInterface() {
 
     setIsTyping(true);
     try {
+      clearPlayerSurprisedState();
       addMessage(
         "ai",
-        `**${player?.nom ?? "Vous"}** met fin à son tour.`,
+        `**${player?.name ?? "Vous"}** met fin à son tour.`,
         "turn-end",
         makeMsgId()
       );
+      addMessage("ai", "", "turn-divider", makeMsgId());
+      const arbiterAfterPlayerTurn = await runCombatTurnEndArbiter({
+        actorId: "player",
+        actorName: player?.name ?? "Vous",
+        actorType: "player",
+      });
+      if (arbiterAfterPlayerTurn?.awaitingPlayerRoll === true) {
+        return;
+      }
       // Boucle tour par tour (enregistrée sur le contexte comme nextTurn)
       await nextTurn();
     } finally {
@@ -5817,7 +7273,7 @@ export default function ChatInterface() {
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
     if (!activeEntry || activeEntry.id !== "player") return;
-    if (player?.classe !== "Guerrier") return;
+    if (player?.entityClass !== "Guerrier") return;
 
     const remaining = player?.fighter?.resources?.secondWind?.remaining ?? 0;
     if (remaining <= 0) {
@@ -5881,7 +7337,7 @@ export default function ChatInterface() {
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
     if (!activeEntry || activeEntry.id !== "player") return;
-    if (player?.classe !== "Clerc") return;
+    if (player?.entityClass !== "Clerc") return;
 
     const cd = player?.cleric?.resources?.channelDivinity ?? null;
     const remaining = cd?.remaining ?? 0;
@@ -5942,7 +7398,7 @@ export default function ChatInterface() {
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
     if (!activeEntry || activeEntry.id !== "player") return;
-    if (player?.classe !== "Roublard" || (player?.level ?? 1) < 2) return;
+    if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     consumeResource(setTurnResources, "combat", "bonus");
     addMessage("ai", "ðŸƒ Ruse â€” vous foncez (Action bonus).", "meta-reply", makeMsgId());
@@ -5953,7 +7409,7 @@ export default function ChatInterface() {
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
     if (!activeEntry || activeEntry.id !== "player") return;
-    if (player?.classe !== "Roublard" || (player?.level ?? 1) < 2) return;
+    if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     consumeResource(setTurnResources, "combat", "bonus");
     addMessage("ai", "ðŸ«¥ Ruse â€” vous tentez de vous cacher (Action bonus).", "meta-reply", makeMsgId());
@@ -5967,7 +7423,7 @@ export default function ChatInterface() {
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
     if (!activeEntry || activeEntry.id !== "player") return;
-    if (player?.classe !== "Roublard" || (player?.level ?? 1) < 2) return;
+    if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     setHasDisengagedThisTurn(true);
     consumeResource(setTurnResources, "combat", "bonus");
@@ -5978,7 +7434,7 @@ export default function ChatInterface() {
   const arcaneRecoveryUsed = !!player?.wizard?.arcaneRecovery?.used;
 
   function applyArcaneRecovery() {
-    if (player?.classe !== "Magicien") return;
+    if (player?.entityClass !== "Magicien") return;
     if (!player?.spellSlots) return;
     if (arcaneRecoveryUsed) return;
 
@@ -6091,6 +7547,8 @@ export default function ChatInterface() {
     const roll = pendingRollRef.current != null ? pendingRollRef.current : pendingRoll;
     if (!roll || isTyping || retryCountdown > 0 || flowBlocked) return;
     if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
+    rollResolutionInProgressRef.current = true;
+    try {
     addMessage(
       "ai",
       `[DEBUG][ENGINE_RX] Roll à traiter\n` +
@@ -6205,6 +7663,7 @@ export default function ChatInterface() {
             }
           }
 
+          myUpdates = markSceneHostilesAware(entities, myUpdates);
           const nextEntities = myUpdates.length ? applyUpdatesLocally(entities, myUpdates) : entities;
           if (myUpdates.length) applyEntityUpdates(myUpdates);
           ensureCombatState(nextEntities);
@@ -6330,6 +7789,7 @@ export default function ChatInterface() {
           }
         }
 
+        myUpdates = markSceneHostilesAware(entities, myUpdates);
         const nextEntities = myUpdates.length ? applyUpdatesLocally(entities, myUpdates) : entities;
         if (myUpdates.length) applyEntityUpdates(myUpdates);
         ensureCombatState(nextEntities);
@@ -6407,12 +7867,13 @@ export default function ChatInterface() {
         const nat   = Math.floor(Math.random() * 20) + 1;
         const total = nat + roll.totalBonus;
         const bonus = fmtMod(roll.totalBonus);
+        const publicTitle = getPublicPendingRollTitle(roll);
         const content =
           nat === 20
-            ? `ðŸŽ² Jet de ${roll.stat} (${roll.raison}) â€” Nat **20** ðŸ’¥ COUP CRITIQUE !`
+            ? `ðŸŽ² ${publicTitle} â€” Nat **20** ðŸ’¥ COUP CRITIQUE !`
             : nat === 1
-            ? `ðŸŽ² Jet de ${roll.stat} (${roll.raison}) â€” Nat **1** ðŸ’€ FUMBLE CRITIQUE !`
-            : `ðŸŽ² Jet de ${roll.stat} (${roll.raison}) â€” Nat ${nat} ${bonus} = **${total}**`;
+            ? `ðŸŽ² ${publicTitle} â€” Nat **1** ðŸ’€ FUMBLE CRITIQUE !`
+            : `ðŸŽ² ${publicTitle} â€” Nat ${nat} ${bonus} = **${total}**`;
         pendingRollRef.current = null;
         setPendingRoll(null);
         await callApi(content, "dice");
@@ -6465,7 +7926,7 @@ export default function ChatInterface() {
         }
 
         // Attaque sournoise (Roublard) â€” déterministe via toggle (1/turn)
-        if (player?.classe === "Roublard" && sneakAttackArmed && !sneakAttackUsedThisTurn) {
+        if (player?.entityClass === "Roublard" && sneakAttackArmed && !sneakAttackUsedThisTurn) {
           const wdb = atkParts?.weaponDb ?? null;
           const props = Array.isArray(wdb?.properties) ? wdb.properties : [];
           const isRanged = props.some((p) => normalizeFr(p).includes("munitions"));
@@ -6508,6 +7969,7 @@ export default function ChatInterface() {
       }
 
       // Appliquer au state local + snapshot pour l'API (anti race condition)
+      myUpdates = markSceneHostilesAware(entities, myUpdates);
       const nextEntities = myUpdates.length ? applyUpdatesLocally(entities, myUpdates) : entities;
       if (myUpdates.length) applyEntityUpdates(myUpdates);
       // Assurer le mode combat côté moteur (hostiles présents => combat)
@@ -6618,15 +8080,66 @@ export default function ChatInterface() {
     const success = dc != null ? total >= dc : null;
 
     let content;
-    const label = roll.skill ? `${roll.skill}` : roll.stat;
+    const publicTitle = getPublicPendingRollTitle(roll);
     if (nat === 20) {
-      content = `ðŸŽ² Jet de ${label} (${roll.raison}) â€” Nat **20** ðŸ’¥ COUP CRITIQUE !`;
+      content = `ðŸŽ² ${publicTitle} â€” Nat **20** ðŸ’¥ COUP CRITIQUE !`;
     } else if (nat === 1) {
-      content = `ðŸŽ² Jet de ${label} (${roll.raison}) â€” Nat **1** ðŸ’€ FUMBLE CRITIQUE !`;
+      content = `ðŸŽ² ${publicTitle} â€” Nat **1** ðŸ’€ FUMBLE CRITIQUE !`;
     } else if (dc != null) {
-      content = `ðŸŽ² Jet de ${label} (${roll.raison}) â€” Nat ${nat} ${bonus} = **${total}** vs DD ${dc}`;
+      content = `ðŸŽ² ${publicTitle} â€” Nat ${nat} ${bonus} = **${total}** vs DD ${dc}`;
     } else {
-      content = `ðŸŽ² Jet de ${label} (${roll.raison}) â€” Nat ${nat} ${bonus} = **${total}**`;
+      content = `ðŸŽ² ${publicTitle} â€” Nat ${nat} ${bonus} = **${total}**`;
+    }
+
+    const engineContext = roll?.engineContext && typeof roll.engineContext === "object"
+      ? roll.engineContext
+      : null;
+    if (engineContext?.kind === "incoming_spell_save") {
+      const dmgNotation = String(engineContext.damageNotation ?? "1d6");
+      const r = rollDiceDetailed(dmgNotation);
+      const baseDmg = Math.max(0, r.total);
+      const finalDmg = success ? Math.floor(baseDmg / 2) : baseDmg;
+      const hpBefore = playerHpRef.current;
+      const hpAfter = finalDmg > 0 ? Math.max(0, hpBefore - finalDmg) : hpBefore;
+
+      if (finalDmg > 0) {
+        setHp(hpAfter);
+        playerHpRef.current = hpAfter;
+      }
+
+      pendingRollRef.current = null;
+      setPendingRoll(null);
+
+      addMessage(
+        "ai",
+        `${content}\n${
+          success ? "✔ Réussite — dégâts réduits." : "✖ Échec — dégâts complets."
+        } ${finalDmg > 0 ? `${dmgNotation} [${r.rolls.join("+")}] = **${finalDmg} dégâts ${engineContext.damageType ?? ""}**.` : "Aucun dégât."}`,
+        "combat-detail",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `[DEBUG] Résolution sauvegarde joueur (moteur)\n` +
+          safeJson({
+            attackerId: engineContext.attackerId ?? null,
+            attackerName: engineContext.attackerName ?? null,
+            spellName: engineContext.spellName ?? roll.weaponName ?? null,
+            nat,
+            total,
+            dc,
+            success,
+            damage: finalDmg,
+            hpBefore,
+            hpAfter,
+            slotLevelUsed: engineContext.slotLevelUsed ?? null,
+            tacticalThought: engineContext.tacticalThought ?? "",
+            tacticalAction: engineContext.tacticalAction ?? null,
+          }),
+        "debug",
+        makeMsgId()
+      );
+      return;
     }
 
     // Révélation côté moteur : par ex. Perception qui dépasse le stealthDc d'entités cachées
@@ -6747,45 +8260,55 @@ export default function ChatInterface() {
           sourceAction: ctx.sourceAction,
           baseGameMode: ctx.baseGameMode ?? gameMode,
           rollResultOverride: rollOutcome,
+          intentDecision: ctx.intentDecision ?? null,
+          arbiterTrigger: ctx.arbiterTrigger ?? null,
         });
         if (resolved?.awaitingPlayerRoll === true) {
           return;
         }
         const gmMode = gameStateRef.current?.gameMode ?? gameMode;
-        await callApi(ctx.sourceAction ?? "", "meta", false, {
-          hideUserMessage: true,
-          bypassIntentParser: true,
-          skipAutoPlayerTurn: true,
-          skipGmContinue: true,
-          entities: resolved.nextEntities,
-          currentRoomId: resolved.nextRoomId,
-          currentScene: resolved.nextScene,
-          currentSceneName: resolved.nextSceneName,
-          gameMode: resolved.nextGameMode ?? gmMode,
-          engineEvent:
-            resolved.engineEvent && typeof resolved.engineEvent === "object"
-              ? {
-                  ...resolved.engineEvent,
-                  playerSkillRoll: {
-                    skillLabel,
-                    nat,
-                    total,
-                    dc,
-                    success,
-                  },
-                }
-              : {
-                  kind: "scene_rule_resolution",
-                  reason: resolved?.reason ?? null,
-                  playerSkillRoll: {
-                    skillLabel,
-                    nat,
-                    total,
-                    dc,
-                    success,
-                  },
+        const enrichedEngineEvent =
+          resolved.engineEvent && typeof resolved.engineEvent === "object"
+            ? {
+                ...resolved.engineEvent,
+                playerSkillRoll: {
+                  skillLabel,
+                  nat,
+                  total,
+                  dc,
+                  success,
                 },
-        });
+              }
+            : {
+                kind: "scene_rule_resolution",
+                reason: resolved?.reason ?? null,
+                playerSkillRoll: {
+                  skillLabel,
+                  nat,
+                  total,
+                  dc,
+                  success,
+                },
+              };
+        if (ctx.narrateAfterResolution !== false) {
+          await callApi(ctx.sourceAction ?? "", "meta", false, {
+            hideUserMessage: true,
+            bypassIntentParser: true,
+            skipAutoPlayerTurn: true,
+            skipGmContinue: true,
+            entities: resolved.nextEntities,
+            currentRoomId: resolved.nextRoomId,
+            currentScene: resolved.nextScene,
+            currentSceneName: resolved.nextSceneName,
+            gameMode: resolved.nextGameMode ?? gmMode,
+            engineEvent: enrichedEngineEvent,
+          });
+        } else {
+          const visibleReason = String(enrichedEngineEvent?.reason ?? "").trim();
+          if (debugMode && visibleReason) {
+            addMessage("ai", visibleReason, "meta-reply", makeMsgId());
+          }
+        }
       } catch (e) {
         addMessage(
           "ai",
@@ -6825,6 +8348,9 @@ export default function ChatInterface() {
         sceneTransitionTargetRoomId: sceneTransitionTargetRoomId ?? null,
       },
     });
+    } finally {
+      rollResolutionInProgressRef.current = false;
+    }
   }
 
   async function handleDebugSend() {
@@ -6874,7 +8400,7 @@ export default function ChatInterface() {
     <div className="flex flex-col h-full">
 
       {/* Modal Repos court â€” Restauration arcanique */}
-      {arcaneRecoveryOpen && player?.classe === "Magicien" && (
+      {arcaneRecoveryOpen && player?.entityClass === "Magicien" && (
         <div
           className="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-4"
           onClick={() => setArcaneRecoveryOpen(false)}
@@ -7004,38 +8530,39 @@ export default function ChatInterface() {
             </button>
           </div>
 
-          {/* Toggle modèle image */}
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] uppercase tracking-widest text-slate-500">Image</span>
-            <div className="flex rounded-lg border border-slate-700 overflow-hidden text-xs">
-              <button
-                type="button"
-                onClick={() => setImageModel("gemini-3.1-flash-image-preview")}
-                className={
-                  "px-3 py-1.5 " +
-                  (imageModel === "gemini-3.1-flash-image-preview"
-                    ? "bg-indigo-600 text-white"
-                    : "bg-slate-900 text-slate-300 hover:bg-slate-800")
-                }
-                title="Génération d'image via Gemini (GEMINI_API_KEY)"
-              >
-                Gemini
-              </button>
-            <button
-              type="button"
-              onClick={() => setImageModel("disabled")}
-              className={
-                "px-3 py-1.5 border-l border-slate-700 " +
-                (imageModel === "disabled"
-                  ? "bg-slate-700 text-white"
-                  : "bg-slate-900 text-slate-300 hover:bg-slate-800")
-              }
-              title="Désactive la génération d'images de scène"
-            >
-              Désactivé
-            </button>
-            </div>
-          </div>
+          {/* Toggle génération d'image */}
+          <button
+            type="button"
+            onClick={() =>
+              setImageModel(
+                imageModel === "gemini-3.1-flash-image-preview"
+                  ? "disabled"
+                  : "gemini-3.1-flash-image-preview"
+              )
+            }
+            className={`flex items-center gap-1 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              imageModel === "gemini-3.1-flash-image-preview"
+                ? "border-indigo-500 bg-indigo-900/60 text-indigo-200 shadow"
+                : "border-slate-700 bg-slate-900/60 text-slate-400 hover:border-slate-500 hover:text-slate-100"
+            }`}
+            title="Active ou désactive la génération d'image de scène via Gemini."
+          >
+            <span>{imageModel === "gemini-3.1-flash-image-preview" ? "Image ON" : "Image OFF"}</span>
+          </button>
+
+          {/* Toggle auto roll */}
+          <button
+            type="button"
+            onClick={() => setAutoRollEnabled(!autoRollEnabled)}
+            className={`flex items-center gap-1 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              autoRollEnabled
+                ? "border-sky-500 bg-sky-900/60 text-sky-200 shadow"
+                : "border-slate-700 bg-slate-900/60 text-slate-400 hover:border-slate-500 hover:text-slate-100"
+            }`}
+            title="Quand ce mode est activé, tous les jets joueur en attente (attaque, sauvegarde, compétence, etc.) sont lancés et résolus automatiquement par le moteur."
+          >
+            <span>{autoRollEnabled ? "Auto roll ON" : "Auto roll OFF"}</span>
+          </button>
 
           {/* Toggle mode auto-joueur */}
           <button
@@ -7064,7 +8591,7 @@ export default function ChatInterface() {
         </div>
 
         {/* Repos court (Magicien) */}
-        {player?.classe === "Magicien" && (
+        {player?.entityClass === "Magicien" && (
           <button
             type="button"
             onClick={() => setArcaneRecoveryOpen(true)}
@@ -7129,7 +8656,7 @@ export default function ChatInterface() {
               <div key={msg.id} className="flex justify-center">
                 <div className="flex w-full max-w-[780px] flex-col items-center justify-center gap-3 rounded-xl border border-indigo-800/50 bg-gradient-to-b from-slate-900/90 to-slate-950/95 px-6 py-10 shadow-inner">
                   <div
-                    className="h-10 w-10 animate-pulse rounded-full border-2 border-indigo-400/40 border-t-indigo-300"
+                    className="h-10 w-10 animate-spin rounded-full border-2 border-indigo-400/40 border-t-indigo-200"
                     aria-hidden
                   />
                   <p className="text-center text-sm font-medium text-indigo-100/90">{msg.content}</p>
@@ -7283,7 +8810,7 @@ export default function ChatInterface() {
           // Fin de tour (moteur) — orange
           if (msg.type === "turn-end") {
             const repairedTurnEnd = repairMojibakeForDisplay(msg.content);
-            const isPlayerTurnEnd = !!player?.nom && String(repairedTurnEnd ?? "").includes(player.nom);
+            const isPlayerTurnEnd = !!player?.name && String(repairedTurnEnd ?? "").includes(player.name);
             const boxClass = isPlayerTurnEnd
               ? "rounded-xl border border-green-600/50 bg-green-950/60"
               : "rounded-xl border border-red-600/50 bg-red-950/60";
@@ -7296,6 +8823,15 @@ export default function ChatInterface() {
                     <BoldText text={repairMojibakeForDisplay(msg.content)} />
                   </p>
                 </div>
+              </div>
+            );
+          }
+
+          // Ligne de séparation entre tours — fine, neutre
+          if (msg.type === "turn-divider") {
+            return (
+              <div key={msg.id} className="flex justify-center">
+                <div className="w-full max-w-[780px] border-t border-slate-700/60 my-2" />
               </div>
             );
           }
@@ -7423,12 +8959,12 @@ export default function ChatInterface() {
         <div ref={bottomRef} />
       </div>
 
-      {/* Bandeau jet de dé */}
-      {pendingRoll && (
+      {/* Bandeau jet de dé (ne pas spoiler pendant la narration MJ) */}
+      {pendingRoll && !autoRollEnabled && !isTyping && !waitForGmNarrationForInitiative && (
         <div className="border-t border-yellow-600/40 bg-yellow-950/40 px-4 py-3 flex items-center justify-between gap-4 shrink-0">
           <div className="text-xs leading-relaxed text-yellow-200">
             <p className="font-semibold text-yellow-100">
-              {repairMojibakeForDisplay("ðŸŽ²")} Jet requis : {pendingRoll.raison}
+              {repairMojibakeForDisplay("ðŸŽ²")} Jet requis : {getPublicPendingRollTitle(pendingRoll).replace(/^Jet de\s+/i, "")}
             </p>
             <p className="text-yellow-400">
               D20 {fmtMod(pendingRoll.totalBonus)} ({pendingRoll.skill ?? pendingRoll.stat})
@@ -7593,7 +9129,7 @@ export default function ChatInterface() {
             <span className="tabular-nums text-slate-100">{turnResources.movement ? "Oui" : "Non"}</span>
           </div>
         </div>
-        {player?.classe === "Guerrier" && (
+        {player?.entityClass === "Guerrier" && (
           <button
             type="button"
             onClick={handleSecondWind}
@@ -7613,7 +9149,7 @@ export default function ChatInterface() {
             </span>
           </button>
         )}
-        {player?.classe === "Roublard" && (
+        {player?.entityClass === "Roublard" && (
           <>
             <button
               type="button"
@@ -7666,7 +9202,7 @@ export default function ChatInterface() {
             )}
           </>
         )}
-        {player?.classe === "Clerc" && (
+        {player?.entityClass === "Clerc" && (
           <button
             type="button"
             onClick={handleTurnUndead}
@@ -7745,7 +9281,7 @@ export default function ChatInterface() {
         </div>
       )}
 
-      {gameMode === "combat" && awaitingPlayerInitiative && (
+      {gameMode === "combat" && awaitingPlayerInitiative && !isTyping && !waitForGmNarrationForInitiative && (
         <div className="border-t border-amber-800/50 bg-amber-950/40 px-4 py-3 flex flex-wrap items-center gap-3 shrink-0">
           <div className="text-xs text-amber-100 flex-1 min-w-[200px]">
             <span className="font-semibold text-amber-200">Initiative</span>
@@ -7754,7 +9290,7 @@ export default function ChatInterface() {
             {npcInitiativeDraft.length > 0 && (
               <span className="block mt-1 text-slate-400 font-mono text-[11px]">
                 {npcInitiativeDraft
-                  .map((e) => `${resolveCombatantDisplayName(e, entities, player?.nom)}: ${e.initiative}`)
+                  .map((e) => `${resolveCombatantDisplayName(e, entities, player?.name)}: ${e.initiative}`)
                   .join(" · ")}
               </span>
             )}
@@ -7778,16 +9314,16 @@ export default function ChatInterface() {
           onKeyDown={handleKeyDown}
           placeholder={
             repairMojibakeForDisplay(
-              pendingRoll
-                ? "Lancez d'abord le dé demandé par le MJâ€¦"
-                : awaitingPlayerInitiative
-                  ? "Lancez d'abord votre initiative (bouton ci-dessus)â€¦"
-                : retryCountdown > 0
+              retryCountdown > 0
                   ? `Quota dépassé â€” réessayez dans ${retryCountdown}sâ€¦`
                   : isTyping
                     ? "Le Maître du Jeu réfléchitâ€¦"
                     : isAutoPlayerThinking
                       ? "L'IA joueur réfléchitâ€¦"
+                      : pendingRoll
+                        ? "Lancez d'abord le dé demandé par le MJâ€¦"
+                        : awaitingPlayerInitiative
+                          ? "Lancez d'abord votre initiative (bouton ci-dessus)â€¦"
                     : !isMyTurn
                       ? "Combat : ce n'est pas votre tour (attendez)..."
                       : "Décrivez votre actionâ€¦ (Entrée pour envoyer)"
@@ -7882,16 +9418,7 @@ export default function ChatInterface() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      // Triche : on remet les PV à leur maximum et on referme le modal.
-                      // On ne reset pas la progression (pas de restartAdventure()).
-                      deathNarrationSentRef.current = false;
-                      setIsGameOver(false);
-                      if (player?.hp?.max) {
-                        setHp(player.hp.max);
-                        playerHpRef.current = player.hp.max;
-                      }
-                    }}
+                    onClick={handleCheatReviveAfterGameOver}
                     className="w-full max-w-xs rounded-2xl border border-red-900/35 bg-red-950/20 px-8 py-3.5 text-base font-semibold text-red-100/90 shadow-[0_0_0_1px_rgba(127,29,29,0.2)] transition hover:bg-red-950/35 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                     title="Option triche : revive le personnage joueur (sans reset de progression)"
                   >

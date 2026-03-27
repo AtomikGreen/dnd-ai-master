@@ -9,20 +9,16 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { slimMessagesForArbiterPrompt } from "@/lib/slimMessagesForArbiterPrompt";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
 const GEMINI_MODEL = "gemini-3-flash-preview";
 
-const ARBITER_SYSTEM = `Tu es l'ARBITRE logique d'un jeu D&D 5e. Tu ne racontes rien. Tu ne produis QUE du JSON.
+const ARBITER_SYSTEM = `Arbitre logique D&D 5e : aucune narration, uniquement un objet JSON.
 
-MISSION :
-- En COMBAT : traduire le texte du joueur en intention tactique structurée.
-- En EXPLORATION : décider si l'action est triviale, impossible, ou nécessite un jet.
-- Tu ne renvoies JAMAIS de narration.
-
-FORMAT DE SORTIE UNIQUE :
+Sortie obligatoire :
 {
   "resolution": "combat_intent" | "requires_roll" | "trivial_success" | "impossible" | "unclear_input",
   "reason": "texte court",
@@ -31,55 +27,20 @@ FORMAT DE SORTIE UNIQUE :
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "..." }
 }
 
-IMPORTANT :
-- Tu ne décides JAMAIS du mode combat/exploration : c'est déjà déterminé par le moteur.
-- Tu utilises seulement MODE (fourni dans l'entrée) pour choisir les règles d'interprétation.
+MODE (entrée) = combat ou exploration : fixé par le moteur ; tu n’inventes pas le mode, tu appliques les règles du mode courant.
 
-RÈGLE SPÉCIALE — TEXTE INUTILISABLE :
-- Si le message du joueur est vide de sens en jeu, trop flou pour en déduire une action, incohérent avec la scène, manifestement hors personnage / hors cadre (métajeu abusif, spam, charabia, sujet réel hors aventure), ou absurde au point qu'aucune intention D&D raisonnable ne peut être extraite :
-  → resolution="unclear_input", intent=null, rollRequest=null, sceneUpdate=null.
-- Ne confonds pas avec une action risquée mais claire : dans ce cas utilise requires_roll ou impossible selon le cas.
-- Ne confonds pas avec une formulation maladroite mais compréhensible : dans ce cas interprète l'action.
+unclear_input : message vide de sens en jeu, spam/métajeu/hors cadre, incohérent, aucune intention D&D raisonnable. Sinon ne pas l’utiliser : action risquée mais claire → requires_roll ou impossible ; maladroite mais compréhensible → interpréter. Une courte relance de dialogue ou de clarification n'est PAS unclear_input si l'historique récent montre qu'un PNJ vient de parler juste avant (ex: "hein ?", "pardon ?", "comment ça ?", "si quoi ?", "de quoi tu parles ?", "qui ça ?").
 
-RÈGLES EXPLORATION :
-- Action triviale ou sans conséquence : resolution="trivial_success", rollRequest=null.
-- Action impossible : resolution="impossible", rollRequest=null.
-- Action incertaine AVEC conséquence : resolution="requires_roll" et rollRequest obligatoire.
-- Si l'action est incertaine SANS conséquence (pas de risque, pas de pression temporelle, simple répétition possible), utilise "trivial_success" (pas de jet).
-- Détermination du DC (échelle D&D 5e) :
-  - 5 très facile
-  - 10 facile
-  - 15 moyenne
-  - 20 difficile
-  - 25 très difficile
-  - 30 presque impossible
-- Tu dois determiner le DC en fonction de la difficulté de l'action et des informations fournies dans le contexte.
-- Si une regle du contexte indique un DC explicite pour une action, ce DC est prioritaire.
-- En exploration, intent DOIT être null, SAUF pour les capacités de classe explicitement déclarées par le joueur (ex: "Second souffle") : dans ce cas, renvoie resolution="combat_intent" avec intent.type="second_wind".
-- Si le joueur veut fouiller/piller des corps (loot), utilise "trivial_success" (sans jet, intent=null, sceneUpdate=null).
-- Si le joueur exprime explicitement un déplacement/entrée/transition vers un lieu autorisé, utilise resolution="trivial_success" et sceneUpdate avec targetRoomId.
-- Pour les déplacements, utilise en priorité "Sorties autorisées" (id, direction, description du chemin).
-- Si le joueur mentionne une direction (nord/sud/est/ouest...) correspondant à une sortie autorisée, fais sceneUpdate vers cette sortie.
-- Si le joueur décrit un chemin correspondant à la description d'une sortie autorisée, choisis cette sortie.
-- N'invente jamais une sortie non listée.
-- Cas spécial entrée de lieu ([SceneEntered] dans le texte) :
-  - Lis currentRoomSecrets et applique la règle du lieu.
-  - Si un jet caché MJ est requis (ex: d100 embuscade), utilise resolution="requires_roll" avec rollRequest.kind="gm_secret", rollRequest.roll (ex: "1d100"), raison explicite, et rollRequest.stat="SAG" (placeholder technique).
-  - Sinon, utilise "trivial_success".
+RÈGLE ANTI-CHAÎNE (1 SEULE action majeure par tour) :
+- Si le message du joueur décrit plusieurs actions distinctes/étapes (ex: “je fais X puis je part vers Y puis je frappe Z...”), traite UNIQUEMENT la PREMIÈRE action D&D clairement formulée dans l’ordre d’apparition.
+- Ignore le reste pour ce tour : ne renvoie qu’une seule résolution et un seul intent (ou sceneUpdate si c’est une navigation).
+- Si la première action correspond à une navigation (direction/entrée vers une sortie autorisée), privilégie la scèneUpdate associée et ignore les autres actions mentionnées après.
 
-RÈGLES COMBAT :
-- Types autorisés : move, attack, move_and_attack, disengage, spell, dodge, second_wind, end_turn, loot.
-- Utilise playerMeleeTargets pour distinguer attack vs move_and_attack.
-- Si le joueur attaque une cible déjà au contact avec une arme de mêlée : attack.
-- Si le joueur doit se rapprocher pour frapper au corps à corps : move_and_attack.
-- Pour disengage/dodge/end_turn/second_wind, targetId peut être "".
-- En combat, rollRequest doit être null et sceneUpdate doit être null.
+Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée ex. Second souffle → combat_intent + type second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason qui décrit ce que voit le joueur et liste brièvement les sorties disponibles. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
 
-RÈGLES DE FIABILITÉ :
-- actionIntent n'existe PAS : utilise intent.
-- N'utilise JAMAIS une string à la place d'un objet.
-- N'utilise JAMAIS les clés action, ability, difficultyClass à la place de type, stat, dc.
-- Réponds par un seul objet JSON valide, sans markdown, sans narration.`;
+Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind : targetId peut être "". rollRequest=null et sceneUpdate=null.
+
+Fiabilité : clé intent (pas actionIntent). Jamais de string à la place d’un objet. Utiliser type/stat/dc (pas action/ability/difficultyClass). JSON seul, sans markdown.`;
 
 function truncate(s, n = 800) {
   const str = typeof s === "string" ? s : String(s ?? "");
@@ -208,7 +169,7 @@ function buildUserContent({
     String(text ?? "").trim(),
     `"""`,
     ``,
-    `Historique chat ordonné (du plus ancien au plus récent) :`,
+    `Historique (ancien → récent, résumé si long) :`,
     historyBlock,
     ``,
     `Entités :`,
@@ -378,11 +339,6 @@ function buildDeterministicFallback({
   currentRoomSecrets,
   allowedExits,
 }) {
-  const normalizeLoose = (s) =>
-    String(s ?? "")
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
   const pickExitFromText = (rawText, exits) => {
     const t = normalizeLoose(rawText);
     if (!t || !Array.isArray(exits) || exits.length === 0) return null;
@@ -452,14 +408,37 @@ function buildDeterministicFallback({
   }
 
   if (/(entre|j['’]?entre|je\s+rentre|je\s+passe\s+la\s+porte|je\s+pénètre|je\s+vais\s+dans|je\s+vais\s+vers|je\s+me\s+dirige|je\s+prends|je\s+m['’]?engage|je\s+continue|je\s+pars\s+vers)/i.test(raw)) {
-    const selectedExit = pickExitFromText(raw, allowedExits) || allowedExits[0] || null;
-    if (selectedExit?.id) {
+    const selectedExit = pickExitFromText(raw, allowedExits);
+    if (!selectedExit && allowedExits.length > 1) {
+      const options = allowedExits
+        .map((e) => {
+          const dir = String(e?.direction ?? "").trim();
+          const desc = String(e?.description ?? "").trim();
+          if (dir && desc) return `${dir} (${desc})`;
+          return dir || desc || String(e?.id ?? "").trim();
+        })
+        .filter(Boolean)
+        .slice(0, 4);
+      return {
+        resolution: "unclear_input",
+        reason:
+          options.length > 0
+            ? `Plusieurs chemins sont possibles: ${options.join(" ; ")}. Lequel choisissez-vous ?`
+            : "Plusieurs chemins sont possibles. Lequel choisissez-vous ?",
+        intent: null,
+        rollRequest: null,
+        sceneUpdate: null,
+      };
+    }
+    const fallbackExit = !selectedExit && allowedExits.length === 1 ? allowedExits[0] : null;
+    const finalExit = selectedExit ?? fallbackExit;
+    if (finalExit?.id) {
       return {
         resolution: "trivial_success",
         reason: "Déplacement explicite vers une sortie autorisée",
         intent: null,
         rollRequest: null,
-        sceneUpdate: { hasChanged: true, targetRoomId: selectedExit.id },
+        sceneUpdate: { hasChanged: true, targetRoomId: finalExit.id },
       };
     }
   }
@@ -508,22 +487,6 @@ function buildDeterministicFallback({
     };
   }
 
-  if (/\[sceneentered\]/i.test(raw) && /embuscade/i.test(String(currentRoomSecrets ?? ""))) {
-    return {
-      resolution: "requires_roll",
-      reason: "Application des règles du lieu à l'entrée (jet secret d'embuscade).",
-      intent: null,
-      rollRequest: {
-        kind: "gm_secret",
-        stat: "SAG",
-        dc: 0,
-        roll: "1d100",
-        raison: "Règle d'embuscade du lieu",
-      },
-      sceneUpdate: null,
-    };
-  }
-
   return null;
 }
 
@@ -556,7 +519,14 @@ export async function POST(request) {
     const weaponNames = normalizeWeaponList(playerWeapons);
     const meleeIds = normalizeMeleeTargetIds(playerMeleeTargets);
     const exits = normalizeAllowedExits(allowedExits);
-    const normalizedMessages = normalizeMessagesForPrompt(messages);
+    // Parse-intent : on garde surtout le joueur + la narration GM (si présente),
+    // en limitant fortement l'historique pour éviter les prompts énormes.
+    const normalizedMessages = slimMessagesForArbiterPrompt(normalizeMessagesForPrompt(messages), {
+      maxTurns: 15,
+      maxCharsPerMessage: 900,
+      keepAssistantNull: true, // narration IA GM (type null)
+      keepAssistantTypes: ["dice"],
+    });
     const userContent = buildUserContent({
       text,
       gameMode,
@@ -635,26 +605,36 @@ export async function POST(request) {
     }
 
     const traceProvider = provider === "gemini" ? "gemini" : "openrouter";
-    const payload = {
-      text: String(text ?? ""),
-      gameMode,
-      currentScene: String(currentScene ?? ""),
-      currentRoomId,
-      currentRoomSecrets: String(currentRoomSecrets ?? ""),
-      allowedExits: exits,
-      entities: entList,
-      playerWeapons: weaponNames,
-      playerMeleeTargets: meleeIds,
-      turnResources: turnResources ?? null,
-      messages: normalizedMessages,
-      userContent,
-      systemInstruction: ARBITER_SYSTEM,
-    };
+    // Log uniquement ce que le provider voit réellement (entrée) :
+    // - Gemini: systemInstruction + userContent
+    // - OpenRouter: messages[] (system + user)
+    const requestForTrace =
+      traceProvider === "gemini"
+        ? {
+            kind: "gemini",
+            model: GEMINI_MODEL,
+            systemInstruction: ARBITER_SYSTEM,
+            userContent,
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.2,
+            },
+          }
+        : {
+            kind: "openrouter",
+            model: OPENROUTER_MODEL,
+            messages: [
+              { role: "system", content: ARBITER_SYSTEM },
+              { role: "user", content: userContent },
+            ],
+            temperature: 0.2,
+            response_format: { type: "json_object" },
+          };
     await logInteraction(
       "INTENT_PARSER",
       traceProvider,
-      payload,
-      ARBITER_SYSTEM,
+      requestForTrace,
+      "",
       rawOut,
       parsed.ok ? parsed.parsed : { error: parsed.error, raw: truncate(rawOut, 500) }
     );

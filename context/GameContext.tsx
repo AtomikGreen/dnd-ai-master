@@ -12,7 +12,6 @@ import {
 } from "react";
 import { CAMPAIGN_CONTEXT, GOBLIN_CAVE } from "@/data/campaign";
 import { BESTIARY } from "@/data/bestiary";
-import { assignSpawnAdjectiveName, isGenericOrColdSpawnName } from "@/lib/spawnDisplayNames";
 import { resolveCombatantDisplayName } from "@/lib/combatDisplayName";
 
 // ---------------------------------------------------------------------------
@@ -28,16 +27,53 @@ export interface PlayerStats {
   CHA: number;
 }
 
-export interface Weapon {
+export interface CombatWeapon {
   name: string;
   attackBonus: number;
   damageDice: string;
   damageBonus: number;
+  kind?: "melee" | "ranged";
+  reach?: string;
+  range?: string;
+}
+
+export type Weapon = CombatWeapon;
+
+export interface SpellSlotRow {
+  max: number;
+  remaining: number;
+}
+
+export type SpellSlotsMap = { [spellLevel: number]: SpellSlotRow };
+
+export interface CombatantBase {
+  id: string;
+  type: string;
+  name: string;
+  entityClass?: string;
+  race?: string;
+  level?: number;
+  visible: boolean;
+  isAlive: boolean;
+  hp: { current: number; max: number } | null;
+  ac: number | null;
+  stats: PlayerStats | EntityStats | null;
+  inventory?: string[] | null;
+  weapons?: CombatWeapon[] | null;
+  features?: string[] | null;
+  selectedSpells?: string[] | null;
+  spellSlots?: SpellSlotsMap | null;
+  spellAttackBonus?: number | null;
+  spellSaveDc?: number | null;
+  surprised?: boolean;
 }
 
 export interface Player {
-  nom: string;
-  classe: string;
+  /** Pré-tirés / créateur : identifiant stable pour savoir si le joueur a changé de perso. */
+  id?: string | number;
+  type: "player";
+  name: string;
+  entityClass: string;
   race?: string;
   level: number;
   /** Alignement (ex: Loyal Bon, Neutre Mauvais, Chaotique Bon...) */
@@ -56,8 +92,12 @@ export interface Player {
   description?: string;
   initiative?: number;
   speed?: string;
+  visible: boolean;
+  isAlive: boolean;
   hp: { current: number; max: number };
-  armorClass: number;
+  ac: number;
+  /** Surpris au début du combat : perd son premier tour, puis repasse à false à la fin de ce tour. */
+  surprised?: boolean;
   /** Points d'expérience courants (0 au niveau 1) */
   xp?: number;
   /** Type de dé de vie au format "d10", "d8", etc. */
@@ -67,7 +107,7 @@ export interface Player {
   /** Nombre de dés de vie restants après repos */
   hitDiceRemaining?: number;
   /** Emplacements de sorts par niveau (ex: {1: {max: 4, remaining: 4}}) */
-  spellSlots?: { [spellLevel: number]: { max: number; remaining: number } };
+  spellSlots?: SpellSlotsMap;
   stats: PlayerStats;
   /** Compétences maîtrisées (D&D 5e) */
   skillProficiencies: string[];
@@ -80,8 +120,8 @@ export interface Player {
   /** Langues connues (ex: Commun, Nain, Elfique...) */
   languages?: string[];
   selectedSpells?: string[];
-  inventaire: string[];
-  weapons: Weapon[];
+  inventory: string[];
+  weapons: CombatWeapon[];
   /** Données spécifiques à certaines classes (ex: Guerrier) */
   fighter?: {
     fightingStyle?: string; // ex: "Défense", "Duel", "Archerie"...
@@ -176,6 +216,8 @@ export interface PendingRoll {
   weaponName?: string;
   /** Un identifiant libre défini par l'IA pour empêcher les relances abusives (ex: "perception_ruelle_chat"). */
   id?: string;
+  /** Contexte optionnel pour une résolution purement moteur (sans repasser par le MJ). */
+  engineContext?: Record<string, any> | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +234,7 @@ export interface Message {
    * "enemy-turn"  → attaque ennemie simulée côté client (bulle rouge)
    * "combat-detail" → détail mécanique d'une attaque (bulle orange, PJ cible — solo = joueur local)
    * "turn-end"    → fin de tour (moteur, bulle orange)
+   * "turn-divider" → ligne de séparation visuelle entre tours
    * "debug"       → logs du moteur (masqués hors debug)
    * "scene-image" → image générée (affichée dans le chat + miniature)
    * "scene-image-pending" → créneau réservé pendant l'appel au générateur (ordre chronologique)
@@ -203,6 +246,7 @@ export interface Message {
     | "enemy-turn"
     | "combat-detail"
     | "turn-end"
+    | "turn-divider"
     | "debug"
     | "scene-image"
     | "scene-image-pending"
@@ -237,15 +281,7 @@ export interface EntityStats {
   CHA: number;
 }
 
-export interface EnemyWeapon {
-  name: string;
-  attackBonus: number;
-  damageDice: string;
-  damageBonus: number;
-  kind?: "melee" | "ranged";
-  reach?: string;
-  range?: string;
-}
+export type EnemyWeapon = CombatWeapon;
 
 export interface Entity {
   id: string;
@@ -265,8 +301,12 @@ export interface Entity {
   attackBonus: number | null;
   damageDice: string | null;
   damageBonus: number | null;
-  weapons?: EnemyWeapon[] | null;
+  weapons?: CombatWeapon[] | null;
   features?: string[] | null;
+  selectedSpells?: string[] | null;
+  spellSlots?: SpellSlotsMap | null;
+  spellAttackBonus?: number | null;
+  spellSaveDc?: number | null;
   description: string;
   /** DD pour être repéré par un jet (Perception/Investigation). Si absent → pas de mécanique spéciale. */
   stealthDc?: number | null;
@@ -276,6 +316,8 @@ export interface Entity {
   looted?: boolean;
   /** Surpris au début du combat : perd son prochain tour, puis repasse à false. */
   surprised?: boolean;
+  /** True si la créature a repéré le joueur et participe activement au combat. */
+  awareOfPlayer?: boolean;
 }
 
 /** Mise à jour partielle d'une entité envoyée par l'IA */
@@ -295,14 +337,19 @@ export interface EntityUpdate {
   attackBonus?: number | null;
   damageDice?: string | null;
   damageBonus?: number | null;
-  weapons?: EnemyWeapon[] | null;
+  weapons?: CombatWeapon[] | null;
   features?: string[] | null;
+  selectedSpells?: string[] | null;
+  spellSlots?: SpellSlotsMap | null;
+  spellAttackBonus?: number | null;
+  spellSaveDc?: number | null;
   description?: string;
   stealthDc?: number | null;
   lootItems?: string[] | null;
   inventory?: string[] | null;
   looted?: boolean;
   surprised?: boolean;
+  awareOfPlayer?: boolean;
   /** Modificateur additif d'AC (ex: -2 si pas de bouclier). */
   acDelta?: number;
   /** Modificateurs additifs de caractéristiques (FOR/DEX/CON/INT/SAG/CHA). */
@@ -427,8 +474,8 @@ interface GameContextValue {
   clearRoomEntitySnapshots: () => void;
   /** Résumé mécanique des événements déjà résolus dans une salle (pièges, embuscades, etc.). */
   getRoomMemory: (roomId: string) => string;
-  /** Ajoute une ligne au résumé (dédoublonnage par sous-chaîne). */
-  appendRoomMemory: (roomId: string, line: string) => void;
+  /** Met à jour la mémoire de salle seulement si cela change réellement un fait mémorisé. */
+  appendRoomMemory: (roomId: string, line: string) => boolean;
   clearRoomMemory: () => void;
   // Mode de jeu
   gameMode: GameMode;
@@ -496,6 +543,8 @@ interface GameContextValue {
   setCurrentSceneImage: (url: string) => void;
   imageModel: ImageModelId;
   setImageModel: (m: ImageModelId) => void;
+  autoRollEnabled: boolean;
+  setAutoRollEnabled: (v: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,8 +552,9 @@ interface GameContextValue {
 // ---------------------------------------------------------------------------
 
 const INITIAL_PLAYER: Player = {
-  nom: "Thorin Pied-de-Pierre",
-  classe: "Guerrier",
+  type: "player",
+  name: "Thorin Pied-de-Pierre",
+  entityClass: "Guerrier",
   race: "Nain de Montagne",
   level: 1,
   alignment: "Loyal Bon",
@@ -517,8 +567,10 @@ const INITIAL_PLAYER: Player = {
     "Nain trapu aux cheveux tressés, barbe rousse striée de gris, armure cabossée mais entretenue, regard dur qui cache un cœur loyal.",
   initiative: 1,
   speed: "25 ft",
+  visible: true,
+  isAlive: true,
   hp: { current: 28, max: 40 },
-  armorClass: 16,
+  ac: 16,
   xp: 0,
   hitDie: "d10",
   hitDiceTotal: 1,
@@ -531,7 +583,7 @@ const INITIAL_PLAYER: Player = {
     SAG: 8,
     CHA: 13,
   },
-  inventaire: [
+  inventory: [
     "Bouclier en bois",
     "Potion de soin ×2",
     "Clé rouillée",
@@ -548,6 +600,55 @@ const INITIAL_PLAYER: Player = {
     { name: "Arc Court",      attackBonus: 3, damageDice: "1d6", damageBonus: 1 },
   ],
 };
+
+function normalizePlayerShape(value: any): Player | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, any>;
+  const {
+    nom: _legacyName,
+    classe: _legacyClass,
+    armorClass: _legacyArmorClass,
+    inventaire: _legacyInventory,
+    ...rest
+  } = raw;
+  const incomingHp = raw.hp;
+  let hp = { current: 1, max: 1 };
+  if (incomingHp && typeof incomingHp === "object") {
+    const current = Number(incomingHp.current);
+    const max = Number(incomingHp.max);
+    const safeCurrent = Number.isFinite(current) ? Math.max(0, Math.trunc(current)) : 1;
+    const safeMax = Number.isFinite(max) ? Math.max(1, Math.trunc(max)) : Math.max(1, safeCurrent);
+    hp = { current: safeCurrent, max: Math.max(safeMax, safeCurrent) };
+  }
+  const inventorySource = Array.isArray(raw.inventory)
+    ? raw.inventory
+    : Array.isArray(raw.inventaire)
+      ? raw.inventaire
+      : [];
+  const acRaw = raw.ac ?? raw.armorClass;
+  const ac = Number.isFinite(Number(acRaw)) ? Math.trunc(Number(acRaw)) : 10;
+  return {
+    ...rest,
+    type: "player",
+    name: String(raw.name ?? raw.nom ?? "Joueur").trim() || "Joueur",
+    entityClass:
+      String(raw.entityClass ?? raw.classe ?? "Aventurier").trim() || "Aventurier",
+    description:
+      raw.description == null ? undefined : String(raw.description),
+    visible: raw.visible !== false,
+    isAlive: hp.current > 0,
+    hp,
+    ac,
+    inventory: inventorySource.map((x: any) => String(x ?? "").trim()).filter(Boolean),
+    weapons: Array.isArray(raw.weapons) ? raw.weapons : [],
+    level:
+      typeof raw.level === "number" && Number.isFinite(raw.level)
+        ? Math.max(1, Math.trunc(raw.level))
+        : 1,
+    stats: raw.stats ?? { FOR: 10, DEX: 10, CON: 10, INT: 10, SAG: 10, CHA: 10 },
+    skillProficiencies: Array.isArray(raw.skillProficiencies) ? raw.skillProficiencies : [],
+  } as Player;
+}
 
 const INITIAL_MESSAGES: Message[] = [
   {
@@ -761,8 +862,17 @@ function normalizeLoadedEntitiesList(raw: unknown): Entity[] {
     } else if (rawHp !== null && rawHp !== undefined) {
       hp = null;
     }
-    return { ...e, hp } as Entity;
+    const normalizedType = normalizeEntityType(e?.type) ?? "npc";
+    const awareOfPlayer =
+      typeof e?.awareOfPlayer === "boolean"
+        ? e.awareOfPlayer
+        : normalizedType === "hostile";
+    return { ...e, type: normalizedType, hp, awareOfPlayer } as Entity;
   });
+}
+
+function isHostileReadyForCombat(entity: Entity | null | undefined): boolean {
+  return !!entity && entity.type === "hostile" && entity.isAlive && entity.awareOfPlayer !== false;
 }
 
 interface PersistedPayload {
@@ -793,6 +903,7 @@ interface PersistedPayload {
   imageModel: ImageModelId;
   debugNextRoll: number | null;
   autoPlayerEnabled: boolean;
+  autoRollEnabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -875,42 +986,116 @@ export function GameProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const [roomMemoryByRoom, setRoomMemoryByRoom] = useState<Record<string, string>>({});
+  const roomMemoryByRoomRef = useRef<Record<string, string>>({});
+
+  function normalizeRoomMemoryLine(line: string) {
+    return String(line ?? "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .slice(0, 400);
+  }
+
+  function normalizeRoomMemoryMatch(text: string) {
+    return String(text ?? "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase();
+  }
+
+  function isRoomAwarenessOrSurpriseLine(line: string) {
+    const n = normalizeRoomMemoryMatch(line);
+    const mentionsRoomActors =
+      n.includes("gobelin") ||
+      n.includes("gobelins") ||
+      n.includes("garde") ||
+      n.includes("gardes") ||
+      n.includes("occupant") ||
+      n.includes("occupants");
+    const mentionsAwarenessOrSurprise =
+      n.includes("surpris") ||
+      n.includes("alerte") ||
+      n.includes("vacarme") ||
+      n.includes("intrus tente de forcer") ||
+      n.includes("ne pourront pas etre surpris") ||
+      n.includes("ne pourra pas etre surpris");
+    return mentionsRoomActors && mentionsAwarenessOrSurprise;
+  }
+
+  function isRoomShieldReadinessLine(line: string) {
+    const n = normalizeRoomMemoryMatch(line);
+    const mentionsRoomActors =
+      n.includes("gobelin") ||
+      n.includes("gobelins") ||
+      n.includes("garde") ||
+      n.includes("gardes");
+    return mentionsRoomActors && n.includes("bouclier");
+  }
+
+  function mergeRoomMemoryText(oldText: string, newLine?: string) {
+    const rawLines = String(oldText ?? "")
+      .split("\n")
+      .map((line) => normalizeRoomMemoryLine(line))
+      .filter(Boolean);
+    const incoming = newLine ? normalizeRoomMemoryLine(newLine) : "";
+    const nextLines = [...rawLines];
+
+    const pruneFamily = (predicate: (line: string) => boolean) => {
+      for (let i = nextLines.length - 1; i >= 0; i -= 1) {
+        if (predicate(nextLines[i])) nextLines.splice(i, 1);
+      }
+    };
+
+    if (incoming) {
+      if (isRoomAwarenessOrSurpriseLine(incoming)) {
+        pruneFamily(isRoomAwarenessOrSurpriseLine);
+      }
+      if (isRoomShieldReadinessLine(incoming)) {
+        pruneFamily(isRoomShieldReadinessLine);
+      }
+      if (!nextLines.includes(incoming)) {
+        nextLines.push(incoming);
+      }
+    }
+
+    return nextLines.join("\n");
+  }
 
   const getRoomMemory = useCallback(
     (roomId: string) => {
       if (!roomId || typeof roomId !== "string") return "";
-      return roomMemoryByRoom[roomId] ?? "";
+      const raw = roomMemoryByRoomRef.current[roomId] ?? "";
+      return mergeRoomMemoryText(raw);
     },
-    [roomMemoryByRoom]
+    []
   );
 
   const appendRoomMemory = useCallback((roomId: string, line: string) => {
-    if (!roomId || typeof roomId !== "string") return;
-    const t = String(line ?? "")
-      .trim()
-      .replace(/\s+/g, " ")
-      .slice(0, 400);
-    if (!t) return;
-    setRoomMemoryByRoom((prev) => {
-      const old = prev[roomId] ?? "";
-      if (old.includes(t)) return prev;
-      const nextText = old ? `${old}\n${t}` : t;
-      return { ...prev, [roomId]: nextText };
-    });
+    if (!roomId || typeof roomId !== "string") return false;
+    const t = normalizeRoomMemoryLine(line);
+    if (!t) return false;
+    const prev = roomMemoryByRoomRef.current;
+    const old = prev[roomId] ?? "";
+    const nextText = mergeRoomMemoryText(old, t);
+    if (nextText === old) return false;
+    const next = { ...prev, [roomId]: nextText };
+    roomMemoryByRoomRef.current = next;
+    setRoomMemoryByRoom(next);
+    return true;
   }, []);
 
   const clearRoomMemory = useCallback(() => {
+    roomMemoryByRoomRef.current = {};
     setRoomMemoryByRoom({});
   }, []);
 
-  /** Refuse exploration tant qu'un hostile vivant est présent (sécurité moteur). */
+  /** Refuse exploration tant qu'un hostile engagé a repéré le joueur (sécurité moteur). */
   const setGameMode = useCallback(
     (mode: GameMode, entitiesSnapshotForExplorationCheck?: Entity[], options?: { force?: boolean }) => {
       if (mode === "exploration" && !options?.force) {
         const ents = entitiesSnapshotForExplorationCheck ?? entitiesRef.current;
-        if (ents.some((e) => e.type === "hostile" && e.isAlive)) {
+        if (ents.some((e) => isHostileReadyForCombat(e))) {
           console.warn(
-            "[GameContext] Passage en exploration refusé : au moins un hostile vivant est encore présent."
+            "[GameContext] Passage en exploration refusé : au moins un hostile engagé est encore présent."
           );
           return;
         }
@@ -943,6 +1128,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const [imageModel, setImageModel] = useState<ImageModelId>("disabled");
   const [debugNextRoll, setDebugNextRoll]   = useState<number | null>(null);
   const [autoPlayerEnabled, setAutoPlayerEnabled] = useState<boolean>(false);
+  const [autoRollEnabled, setAutoRollEnabled] = useState<boolean>(false);
 
   /** false jusqu'à ce que la restauration localStorage ait été tentée (évite d'écraser la sauvegarde au premier rendu). */
   const [persistenceReady, setPersistenceReady] = useState(false);
@@ -964,15 +1150,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const setPlayer = useCallback((next: SetStateAction<Player | null>) => {
     setPlayerState((prev) => {
       const resolved = typeof next === "function" ? (next as (p: Player | null) => Player | null)(prev) : next;
+      const normalized = normalizePlayerShape(resolved);
       // On capture le template uniquement hors aventure (sélection/menu).
       if (!isGameStarted) {
-        if (!resolved) {
+        if (!normalized) {
           playerInitialSnapshotRef.current = null;
-        } else if (!prev || prev.id !== resolved.id) {
-          playerInitialSnapshotRef.current = clonePlayer(resolved);
+        } else if (!prev || prev.id !== normalized.id) {
+          playerInitialSnapshotRef.current = clonePlayer(normalized);
         }
       }
-      return resolved;
+      return normalized;
     });
   }, [clonePlayer, isGameStarted]);
 
@@ -994,7 +1181,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
         return;
       }
       const p = data.payload;
-      setPlayerState(p.player ?? null);
+      setPlayerState(normalizePlayerShape(p.player ?? null));
       if (Array.isArray(p.messages) && p.messages.length > 0) {
         const cleaned = p.messages.filter((m) => (m as Message).type !== "scene-image-pending");
         setMessages(cleaned);
@@ -1023,13 +1210,15 @@ export function GameProvider({ children }: { children: ReactNode }) {
         for (const [k, v] of Object.entries(p.roomMemoryByRoom)) {
           if (!k || typeof v !== "string") continue;
           const trimmed = v.trim();
-          if (trimmed) mem[k] = trimmed;
+          if (trimmed) mem[k] = mergeRoomMemoryText(trimmed);
         }
+        roomMemoryByRoomRef.current = mem;
         setRoomMemoryByRoom(mem);
       } else {
+        roomMemoryByRoomRef.current = {};
         setRoomMemoryByRoom({});
       }
-      const hostileAlive = loadedEntities.some((e) => e.type === "hostile" && e.isAlive);
+      const hostileAlive = loadedEntities.some((e) => isHostileReadyForCombat(e));
       if (p.gameMode === "combat" || p.gameMode === "exploration") {
         const want = p.gameMode;
         setGameModeState(want === "exploration" && hostileAlive ? "combat" : want);
@@ -1064,16 +1253,17 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setImageModel("disabled");
       setDebugNextRoll(typeof p.debugNextRoll === "number" ? p.debugNextRoll : null);
       setAutoPlayerEnabled(!!p.autoPlayerEnabled);
+      setAutoRollEnabled(!!p.autoRollEnabled);
     } catch {
       /* JSON corrompu ou quota : ignorer */
     }
     setPersistenceReady(true);
   }, []);
 
-  // Hostiles vivants → combat obligatoire (filet de sécurité si gameMode serait resté en exploration)
+  // Hostiles engagés → combat obligatoire (filet de sécurité si gameMode resterait en exploration)
   useEffect(() => {
     if (gameMode !== "exploration") return;
-    if (entities.some((e) => e.type === "hostile" && e.isAlive)) {
+    if (entities.some((e) => isHostileReadyForCombat(e))) {
       setGameModeState("combat");
     }
   }, [gameMode, entities]);
@@ -1111,6 +1301,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           imageModel,
           debugNextRoll,
           autoPlayerEnabled,
+          autoRollEnabled,
         };
         localStorage.setItem(
           PERSISTENCE_KEY,
@@ -1150,6 +1341,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     imageModel,
     debugNextRoll,
     autoPlayerEnabled,
+    autoRollEnabled,
   ]);
 
   const startNewGame = useCallback(() => {
@@ -1245,59 +1437,232 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setMessages((prev) => prev.filter((m) => !set.has(m.id)));
   }
 
-  function updatePlayer(patch: Partial<Player>) {
+  const updatePlayer = useCallback((patch: Partial<Player>) => {
     setPlayer((prev) => {
       if (!prev) return prev;
       return { ...prev, ...patch };
     });
-  }
+  }, [setPlayer]);
 
   function setHp(value: number) {
     setPlayer((prev) => {
       if (!prev || !prev.hp) return prev;
+      const nextCurrent = Math.max(0, Math.min(value, prev.hp.max));
       return {
         ...prev,
+        isAlive: nextCurrent > 0,
         hp: {
           ...prev.hp,
-          current: Math.max(0, Math.min(value, prev.hp.max)),
+          current: nextCurrent,
         },
       };
     });
   }
 
   function applyEntityUpdates(updates: EntityUpdate[]) {
+    const normalizeHpShape = (
+      incomingHp: any,
+      fallbackHp: { current: number; max: number } | null
+    ): { current: number; max: number } | null => {
+      if (incomingHp === null) return null;
+      if (typeof incomingHp === "number" && Number.isFinite(incomingHp)) {
+        const v = Math.max(0, Math.floor(incomingHp));
+        return { current: v, max: v };
+      }
+      if (incomingHp && typeof incomingHp === "object") {
+        const currRaw = incomingHp.current;
+        const maxRaw = incomingHp.max;
+        const fallbackCurrent =
+          typeof fallbackHp?.current === "number" ? fallbackHp.current : 0;
+        const fallbackMax =
+          typeof fallbackHp?.max === "number"
+            ? fallbackHp.max
+            : Math.max(fallbackCurrent, 1);
+        const currentVal =
+          typeof currRaw === "number" && Number.isFinite(currRaw)
+            ? Math.max(0, Math.floor(currRaw))
+            : fallbackCurrent;
+        const maxValRaw =
+          typeof maxRaw === "number" && Number.isFinite(maxRaw)
+            ? Math.max(1, Math.floor(maxRaw))
+            : fallbackMax;
+        return { current: currentVal, max: Math.max(maxValRaw, currentVal) };
+      }
+      return fallbackHp ?? null;
+    };
+
+    const normalizePlayerWeapons = (
+      incomingWeapons: EntityUpdate["weapons"],
+      fallbackWeapons: CombatWeapon[]
+    ): CombatWeapon[] => {
+      if (!Array.isArray(incomingWeapons)) return fallbackWeapons;
+      return incomingWeapons
+        .map((weapon) => {
+          if (!weapon || typeof weapon !== "object") return null;
+          const name = String((weapon as any).name ?? "").trim();
+          if (!name) return null;
+          return {
+            name,
+            attackBonus:
+              typeof (weapon as any).attackBonus === "number" &&
+              Number.isFinite((weapon as any).attackBonus)
+                ? Math.trunc((weapon as any).attackBonus)
+                : 0,
+            damageDice:
+              typeof (weapon as any).damageDice === "string" &&
+              String((weapon as any).damageDice).trim()
+                ? String((weapon as any).damageDice).trim()
+                : "1d4",
+            damageBonus:
+              typeof (weapon as any).damageBonus === "number" &&
+              Number.isFinite((weapon as any).damageBonus)
+                ? Math.trunc((weapon as any).damageBonus)
+                : 0,
+            kind:
+              (weapon as any).kind === "melee" || (weapon as any).kind === "ranged"
+                ? (weapon as any).kind
+                : undefined,
+            reach:
+              typeof (weapon as any).reach === "string" && String((weapon as any).reach).trim()
+                ? String((weapon as any).reach).trim()
+                : undefined,
+            range:
+              typeof (weapon as any).range === "string" && String((weapon as any).range).trim()
+                ? String((weapon as any).range).trim()
+                : undefined,
+          } satisfies CombatWeapon;
+        })
+        .filter(Boolean) as CombatWeapon[];
+    };
+
+    const applyPlayerUpdates = (base: Player | null, playerUpdates: EntityUpdate[]): Player | null => {
+      if (!base) return base;
+      let currentPlayer = base;
+
+      for (const update of playerUpdates) {
+        if (!update || typeof update !== "object") continue;
+        const action = String(update.action ?? "").trim();
+
+        if (action === "kill" || action === "remove") {
+          currentPlayer = {
+            ...currentPlayer,
+            isAlive: false,
+            hp: {
+              ...currentPlayer.hp,
+              current: 0,
+            },
+            surprised: false,
+          };
+          continue;
+        }
+
+        if (action !== "update" && action !== "spawn") continue;
+
+        const merged: Player = {
+          ...currentPlayer,
+          ...(update.name !== undefined && { name: String(update.name ?? "").trim() || currentPlayer.name }),
+          ...(update.visible !== undefined && { visible: update.visible }),
+          ...(update.race !== undefined && { race: update.race }),
+          ...(update.entityClass !== undefined && { entityClass: update.entityClass }),
+          ...(update.description !== undefined && { description: update.description }),
+          ...(update.stats !== undefined &&
+            update.stats && {
+              stats: {
+                FOR: update.stats.FOR,
+                DEX: update.stats.DEX,
+                CON: update.stats.CON,
+                INT: update.stats.INT,
+                SAG: update.stats.SAG,
+                CHA: update.stats.CHA,
+              },
+            }),
+          ...(update.features !== undefined && { features: update.features ?? [] }),
+          ...(update.selectedSpells !== undefined && {
+            selectedSpells: Array.isArray(update.selectedSpells)
+              ? update.selectedSpells.map((x) => String(x ?? "").trim()).filter(Boolean)
+              : [],
+          }),
+          ...(update.spellSlots !== undefined && { spellSlots: update.spellSlots ?? undefined }),
+          ...(update.spellAttackBonus !== undefined && {
+            spellAttackBonus:
+              typeof update.spellAttackBonus === "number" && Number.isFinite(update.spellAttackBonus)
+                ? Math.trunc(update.spellAttackBonus)
+                : currentPlayer.spellAttackBonus,
+          }),
+          ...(update.spellSaveDc !== undefined && {
+            spellSaveDc:
+              typeof update.spellSaveDc === "number" && Number.isFinite(update.spellSaveDc)
+                ? Math.trunc(update.spellSaveDc)
+                : currentPlayer.spellSaveDc,
+          }),
+          ...(update.weapons !== undefined && {
+            weapons: normalizePlayerWeapons(update.weapons, currentPlayer.weapons ?? []),
+          }),
+          ...((update.inventory !== undefined || update.lootItems !== undefined) && {
+            inventory: Array.isArray(update.inventory)
+              ? update.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
+              : Array.isArray(update.lootItems)
+                ? update.lootItems.map((x) => String(x ?? "").trim()).filter(Boolean)
+                : [],
+          }),
+          ...(update.surprised !== undefined && { surprised: !!update.surprised }),
+          ...(update.awareOfPlayer !== undefined && { awareOfPlayer: !!update.awareOfPlayer }),
+        };
+
+        if (update.hp !== undefined) {
+          const nextHp =
+            normalizeHpShape(update.hp, currentPlayer.hp) ?? {
+              current: 0,
+              max: currentPlayer.hp.max,
+            };
+          merged.hp = nextHp;
+          merged.isAlive = nextHp.current > 0;
+        }
+
+        if (update.ac !== undefined) {
+          merged.ac =
+            typeof update.ac === "number" && Number.isFinite(update.ac)
+              ? Math.trunc(update.ac)
+              : currentPlayer.ac;
+        }
+
+        if (typeof update.acDelta === "number" && Number.isFinite(update.acDelta)) {
+          merged.ac = merged.ac + update.acDelta;
+        }
+
+        currentPlayer = merged;
+      }
+
+      return currentPlayer;
+    };
+
+    const playerUpdateIds = new Set(
+      ["player", String(player?.id ?? "").trim()].filter(Boolean)
+    );
+
+    const playerUpdates = (Array.isArray(updates) ? updates : []).filter((update) => {
+      const id = typeof update?.id === "string" ? update.id.trim() : "";
+      return playerUpdateIds.has(id);
+    });
+
+    if (playerUpdates.length) {
+      if (
+        playerUpdates.some((update) => update?.action === "kill" || update?.action === "remove")
+      ) {
+        pruneDeadFromMelee("player");
+      }
+      setPlayer((prev) => applyPlayerUpdates(prev, playerUpdates));
+    }
+
+    const nonPlayerUpdates = (Array.isArray(updates) ? updates : []).filter((update) => {
+      const id = typeof update?.id === "string" ? update.id.trim() : "";
+      return !playerUpdateIds.has(id);
+    });
+
+    if (!nonPlayerUpdates.length) return;
+
     setEntities((prev) => {
       let current = [...prev];
-      const normalizeHpShape = (
-        incomingHp: any,
-        fallbackHp: { current: number; max: number } | null
-      ): { current: number; max: number } | null => {
-        if (incomingHp === null) return null;
-        if (typeof incomingHp === "number" && Number.isFinite(incomingHp)) {
-          const v = Math.max(0, Math.floor(incomingHp));
-          return { current: v, max: v };
-        }
-        if (incomingHp && typeof incomingHp === "object") {
-          const currRaw = incomingHp.current;
-          const maxRaw = incomingHp.max;
-          const fallbackCurrent =
-            typeof fallbackHp?.current === "number" ? fallbackHp.current : 0;
-          const fallbackMax =
-            typeof fallbackHp?.max === "number"
-              ? fallbackHp.max
-              : Math.max(fallbackCurrent, 1);
-          const currentVal =
-            typeof currRaw === "number" && Number.isFinite(currRaw)
-              ? Math.max(0, Math.floor(currRaw))
-              : fallbackCurrent;
-          const maxValRaw =
-            typeof maxRaw === "number" && Number.isFinite(maxRaw)
-              ? Math.max(1, Math.floor(maxRaw))
-              : fallbackMax;
-          return { current: currentVal, max: Math.max(maxValRaw, currentVal) };
-        }
-        return fallbackHp ?? null;
-      };
       const applyDerivedModifiers = (base: Entity, update: EntityUpdate): Entity => {
         let next = base;
 
@@ -1330,8 +1695,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
         return next;
       };
 
-      /** Adjectifs déjà utilisés par base de nom (ex. "gobelin") pour ce batch de mises à jour */
-      const usedSpawnAdjectivesByBase: Record<string, Set<string>> = {};
       const usedIds = new Set(current.map((e) => e.id));
       const spawnCounters: Record<string, number> = {};
       const toSafeIdBase = (s: string) =>
@@ -1356,7 +1719,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
         return candidate;
       };
 
-      for (const update of updates) {
+      for (const update of nonPlayerUpdates) {
         if (update.action === "spawn") {
           const incomingId =
             typeof update.id === "string" && update.id.trim() ? update.id.trim() : null;
@@ -1385,7 +1748,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
             // On ignore désormais les objets de décor : seules les créatures sont conservées.
             continue;
           }
-          const templateBaseName = String(template?.name ?? "").trim();
           const providedRaw = update.name;
           const providedName = typeof providedRaw === "string" ? providedRaw.trim() : "";
           const idx = current.findIndex((e) => e.id === resolvedSpawnId);
@@ -1393,10 +1755,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           // Anti-clone : même id déjà en jeu → fusion (évite Gobelin C/D si l'IA respawn le même id)
           if (idx >= 0) {
             const ent = current[idx];
-            const nameMissingOrGeneric =
-              !providedName ||
-              (!!templateBaseName && isGenericOrColdSpawnName(templateBaseName, providedName));
-            const mergedName = nameMissingOrGeneric ? ent.name : providedName;
+            const mergedName = providedName || ent.name;
             const nt = normType ?? ent.type;
             current = current.map((e, i) =>
               i !== idx
@@ -1419,25 +1778,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
                     ...(update.damageBonus !== undefined && { damageBonus: update.damageBonus }),
                     ...(update.weapons !== undefined && { weapons: update.weapons }),
                     ...(update.features !== undefined && { features: update.features }),
+                    ...(update.selectedSpells !== undefined && { selectedSpells: update.selectedSpells }),
+                    ...(update.spellSlots !== undefined && { spellSlots: update.spellSlots }),
+                    ...(update.spellAttackBonus !== undefined && {
+                      spellAttackBonus: update.spellAttackBonus,
+                    }),
+                    ...(update.spellSaveDc !== undefined && { spellSaveDc: update.spellSaveDc }),
                     ...(update.description !== undefined && { description: update.description }),
                     ...(update.stealthDc !== undefined && { stealthDc: update.stealthDc }),
                     ...(update.surprised !== undefined && { surprised: !!update.surprised }),
+                    ...(update.awareOfPlayer !== undefined && { awareOfPlayer: !!update.awareOfPlayer }),
                     isAlive: true,
                   }
             );
             continue;
           }
 
-          const nameMissingOrGeneric =
-            !providedName ||
-            (!!templateBaseName && isGenericOrColdSpawnName(templateBaseName, providedName));
-          let resolvedSpawnName = providedName || String(template?.name ?? "").trim() || resolvedSpawnId;
-          if (nameMissingOrGeneric) {
-            const base = templateBaseName || providedName || "Créature";
-            const key = base.toLowerCase();
-            if (!usedSpawnAdjectivesByBase[key]) usedSpawnAdjectivesByBase[key] = new Set();
-            resolvedSpawnName = assignSpawnAdjectiveName(base, current, usedSpawnAdjectivesByBase[key]);
-          }
+          const resolvedSpawnName =
+            providedName || String(template?.name ?? "").trim() || resolvedSpawnId;
 
           const newEntity: Entity = {
             id: resolvedSpawnId,
@@ -1456,6 +1814,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
             damageBonus: update.damageBonus ?? template?.damageBonus ?? null,
             weapons: update.weapons ?? template?.weapons ?? null,
             features: update.features ?? template?.features ?? null,
+            selectedSpells: update.selectedSpells ?? template?.selectedSpells ?? null,
+            spellSlots: update.spellSlots ?? template?.spellSlots ?? null,
+            spellAttackBonus: update.spellAttackBonus ?? template?.spellAttackBonus ?? null,
+            spellSaveDc: update.spellSaveDc ?? template?.spellSaveDc ?? null,
             description: update.description ?? template?.description ?? "",
             stealthDc: update.stealthDc ?? template?.stealthDc ?? null,
             lootItems:
@@ -1465,6 +1827,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
                 : null),
             looted: update.looted ?? false,
             surprised: update.surprised ?? false,
+            awareOfPlayer:
+              typeof update.awareOfPlayer === "boolean"
+                ? update.awareOfPlayer
+                : (normType ?? "npc") === "hostile",
           };
           current = [...current, applyDerivedModifiers(newEntity, update)];
         } else if (update.action === "update") {
@@ -1472,60 +1838,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           if (!updateId) continue;
           const exists = current.some((e) => e.id === updateId);
           if (!exists) {
-            // Sécurité "source" : un update sur entité absente devient un spawn
-            // construit à partir du template (BESTIARY) plutôt qu'un état partiel.
-            const templateId =
-              (typeof update.templateId === "string" && update.templateId.trim()
-                ? update.templateId.trim()
-                : null) ??
-              getEncounterTemplateIdForRoom(currentRoomId, updateId) ??
-              inferTemplateIdFromEntityId(updateId);
-            const template =
-              templateId && (BESTIARY as any)?.[templateId] ? (BESTIARY as any)[templateId] : null;
-            const normType = normalizeEntityType(update.type ?? template?.type);
-            if (normType !== "object") {
-              const providedName = typeof update.name === "string" ? update.name.trim() : "";
-              const templateBaseName = String(template?.name ?? "").trim();
-              const nameMissingOrGeneric =
-                !providedName ||
-                (!!templateBaseName && isGenericOrColdSpawnName(templateBaseName, providedName));
-              let resolvedName = providedName || String(template?.name ?? "").trim() || updateId;
-              if (nameMissingOrGeneric) {
-                const base = templateBaseName || providedName || "Créature";
-                const key = base.toLowerCase();
-                if (!usedSpawnAdjectivesByBase[key]) usedSpawnAdjectivesByBase[key] = new Set();
-                resolvedName = assignSpawnAdjectiveName(base, current, usedSpawnAdjectivesByBase[key]);
-              }
-              const seeded: Entity = {
-                id: updateId,
-                name: resolvedName,
-                type: normType ?? "npc",
-                race: update.race ?? template?.race ?? "Inconnu",
-                entityClass: update.entityClass ?? template?.entityClass ?? "Inconnu",
-                cr: update.cr ?? template?.cr ?? 0,
-                visible: update.visible ?? true,
-                isAlive: true,
-                hp: normalizeHpShape(update.hp ?? template?.hp ?? null, null),
-                ac: update.ac ?? template?.ac ?? null,
-                stats: update.stats ?? template?.stats ?? null,
-                attackBonus: update.attackBonus ?? template?.attackBonus ?? null,
-                damageDice: update.damageDice ?? template?.damageDice ?? null,
-                damageBonus: update.damageBonus ?? template?.damageBonus ?? null,
-                weapons: update.weapons ?? template?.weapons ?? null,
-                features: update.features ?? template?.features ?? null,
-                description: update.description ?? template?.description ?? "",
-                stealthDc: update.stealthDc ?? template?.stealthDc ?? null,
-                lootItems:
-                  update.lootItems ??
-                  (Array.isArray(update.inventory)
-                    ? update.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
-                    : null),
-                looted: update.looted ?? false,
-                surprised: update.surprised ?? false,
-              };
-              current = [...current, applyDerivedModifiers(seeded, update)];
-              continue;
-            }
+            continue;
           }
           current = current.map((e) => {
             if (e.id !== updateId) return e;
@@ -1552,11 +1865,18 @@ export function GameProvider({ children }: { children: ReactNode }) {
               ...(update.damageBonus !== undefined && { damageBonus: update.damageBonus }),
               ...(update.weapons     !== undefined && { weapons:     update.weapons }),
               ...(update.features    !== undefined && { features:    update.features }),
+              ...(update.selectedSpells !== undefined && { selectedSpells: update.selectedSpells }),
+              ...(update.spellSlots !== undefined && { spellSlots: update.spellSlots }),
+              ...(update.spellAttackBonus !== undefined && {
+                spellAttackBonus: update.spellAttackBonus,
+              }),
+              ...(update.spellSaveDc !== undefined && { spellSaveDc: update.spellSaveDc }),
               ...(update.description !== undefined && { description: update.description }),
               ...(update.stealthDc   !== undefined && { stealthDc:   update.stealthDc }),
               ...(update.lootItems   !== undefined && { lootItems:   update.lootItems }),
               ...(update.looted      !== undefined && { looted:      update.looted }),
               ...(update.surprised   !== undefined && { surprised:   !!update.surprised }),
+              ...(update.awareOfPlayer !== undefined && { awareOfPlayer: !!update.awareOfPlayer }),
             };
             return applyDerivedModifiers(merged, update);
           }).filter(Boolean) as Entity[];
@@ -1630,9 +1950,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
     return meleeState[id] ?? [];
   }
 
-  function setReactionFor(id: string, value: boolean) {
-    setReactionState((prev) => ({ ...prev, [id]: value }));
-  }
+  const setReactionFor = useCallback((id: string, value: boolean) => {
+    setReactionState((prev) => {
+      if (prev[id] === value) return prev;
+      return { ...prev, [id]: value };
+    });
+  }, []);
 
   function hasReaction(id: string): boolean {
     return reactionState[id] !== false;
@@ -1679,7 +2002,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const dex = Math.floor(((player.stats?.DEX ?? 10) - 10) / 2);
     const playerEntry: CombatEntry = {
       id: "player",
-      name: player.nom,
+      name: player.name,
       initiative: nat + dex,
     };
     const merged = [...npcInitiativeDraft, playerEntry].sort((a, b) => b.initiative - a.initiative);
@@ -1717,7 +2040,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       return;
     }
     if (!player) return;
-    const hostiles = entities.filter((e) => e.type === "hostile" && e.isAlive);
+    const hostiles = entities.filter((e) => isHostileReadyForCombat(e));
     if (hostiles.length === 0) return;
 
     const cached = initiativeDraftCacheRef.current;
@@ -1726,7 +2049,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setNpcInitiativeDraft(
         cached.map((entry) => ({
           ...entry,
-          name: resolveCombatantDisplayName(entry, entities, player?.nom ?? null),
+          name: resolveCombatantDisplayName(entry, entities, player?.name ?? null),
         }))
       );
       setAwaitingPlayerInitiative(true);
@@ -1752,14 +2075,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setCombatOrder((prev) => {
       let changed = false;
       const next = prev.map((entry) => {
-        const display = resolveCombatantDisplayName(entry, entities, player?.nom ?? null);
+        const display = resolveCombatantDisplayName(entry, entities, player?.name ?? null);
         if (display === entry.name) return entry;
         changed = true;
         return { ...entry, name: display };
       });
       return changed ? next : prev;
     });
-  }, [entities, player?.nom, combatOrder.length]);
+  }, [entities, player?.name, combatOrder.length]);
 
   function replaceEntities(next: Entity[]) {
     // Ne conserver que les entités non-objets (créatures, PNJ, hostiles).
@@ -1939,6 +2262,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       initCombatReactions, pruneDeadFromMelee,
       aiProvider, setAiProvider,
       autoPlayerEnabled, setAutoPlayerEnabled,
+      autoRollEnabled, setAutoRollEnabled,
       startNewGame,
       restartAdventure,
       debugMode, setDebugMode,

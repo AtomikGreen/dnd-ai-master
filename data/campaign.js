@@ -48,8 +48,8 @@ export const GOBLIN_CAVE = {
   "scene_village": {
     id: "scene_village",
     title: "Le Village de Fial - La Forge de Thron",
-    description: "En début d'après-midi, les joueurs sont convoqués en secret à la forge par Thron, le chef du village. Il a l'air très inquiet. Il doit prononcer ce discours : 'Mes enfants, vous êtes les jeunes les plus aguerris du village. Le commis du meunier vient de voir sur la colline à l'ouest des gobelins portant une jeune femme ressemblant à ma fille Lanéa... Je vous demande de la sauver discrètement, si ma femme l'apprend, elle mourra d'inquiétude.'",
-    secrets: "Si les joueurs posent des questions : 1. Ils apprennent qu'un gobelours a été aperçu récemment. 2. L'antre est à environ 3 heures de marche à l'ouest. Le commis du meunier peut montrer la direction mais n'ira pas plus loin.",
+    description: "Mes enfants, vous êtes les jeunes les plus aguerris du village, et certains d’entre vous sont des amis de ma fille Lanéa. Un commis du vieil Erdrios, le meunier, vient de m’apprendre qu’il vient de voir sur la colline un petit groupe de gobelins portant une jeune femme qui ressemblait beaucoup à ma fille. Or justement Lanéa est partie tôt ce matin dans cette direction, et elle n’est pas revenue à l’heure du repas. Je ne vous cache pas ma préoccupation, et si sa mère l’apprend, elle risque de mourir d’inquiétude. Alors en toute franchise, je voudrais vous demander un énorme service : pourriez-vous aller vérifier si c’est bien ma fille que ces monstres ont attrapée et, si vous le pensez possible, en profiter pour la délivrer des mains de ces créatures ? Si j’y vais moi, ma femme va se douter que quelque chose de grave est en train de se passer.",
+    secrets: "Uniquement si les joueurs interrogent explicitement Thron, le commis du meunier ou d'autres villageois sur des détails supplémentaires : 1. Le commis peut indiquer où se situe l'entrée de l'antre, à environ trois heures de marche à l'ouest, dans les collines, mais il n'ira pas plus loin. 2. D'autres villageois peuvent mentionner qu'un gobelours, bien plus grand et plus fort qu'un gobelin, a été aperçu récemment du même côté. Ces informations ne doivent jamais être données spontanément.",
     exits: [
       {
         id: "scene_journey",
@@ -62,7 +62,7 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer à quelques encablures de l’antre par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa.",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 90% de chance de se faire attaquer à quelques encablures de l’antre par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa.",
     exits: [
       {
         id: "room_intro",
@@ -82,6 +82,11 @@ export const GOBLIN_CAVE = {
         id: "room_1",
         direction: "nord",
         description: "Au-delà de la porte verrouillée, l'accès mène à une cavité naturelle plongée dans la pénombre."
+      },
+      {
+        id: "scene_journey",
+        direction: "est",
+        description: "Le chemin de la colline qui retourne au village"
       }
     ]
   },
@@ -147,8 +152,8 @@ export const GOBLIN_CAVE = {
   "room_3": {
     id: "room_3",
     title: "L'Entrepôt",
-    description: "La porte est fermée à clef. À l'intérieur, des rouleaux de tissus, poteries, outils de paysans. Quatre piliers en bois portent des torches éteintes.",
-    secrets: "Serrure : Dextérité DD 10 pour crocheter. C'est le butin des vols au village.",
+    description: "L’intérieur de cette salle comporte des rouleaux de tissus, des poteries, une selle de cheval, des outils de paysans, mais rien de grande valeur. Sur chacun des quatre piliers en bois est accrochée une torche, mais aucune n’est allumée.",
+    secrets: "La porte dans cette salle est fermée à clef, mais là encore la serrure est des plus sommaires. Réussir un jet de Dextérité DD 10 si le personnage possède des outils de voleur est suffisant pour la crocheter. Cette salle sert en fait à entasser le résultat des différents vols effectués par la tribu.",
     exits: [
       {
         id: "room_4",
@@ -165,8 +170,8 @@ export const GOBLIN_CAVE = {
   "room_4": {
     id: "room_4",
     title: "La Salle de Torture",
-    description: "Torches éteintes. Beaucoup d'instruments de torture. Sur un chevalet est attaché un halfelin mal en point : Gandelme le Dextre.",
-    secrets: "Gandelme a 0 PV et 4 niveaux d'épuisement. Il ne peut ni marcher ni combattre sans soins magiques. Si soigné, il demande aux joueurs de retrouver son équipement (qui est dans la salle 17, mais il ne le sait pas).",
+    description: "Il y a ici un grand nombre d'instruments de torture et notamment un chevalet sur lequel a pris place un personnage que certains d’entre vous connaissent, le halfelin Gandelme le Dextre, qui était venu rendre visite à Fial à son frère Petit-Pinpin la semaine dernière ! D’après les marques qu’ils portent, le petit homme a visiblement été torturé.",
+    secrets: "Ici aussi, des torches sont accrochées aux murs, mais aucune n’est allumée. Gandelme est épuisé, affamé et déshydraté. On ne lui a rien donné à boire ni à manger depuis sa capture. Il est si faible (0 pv et épuisement niveau 4) qu’il ne peut pas marcher et encore moins combattre. Un sort de soins lui redonnera des points de vie et lui permettra de marcher, mais ne réduira pas ses niveaux d’épuisement. Il insistera pour que l’on retrouve son équipement. Celui-ci se trouve dans la chambre du chef, salle 17, mais il ne le sait pas, bien entendu.",
     exits: [
       {
         id: "room_3",
@@ -178,8 +183,8 @@ export const GOBLIN_CAVE = {
   "room_5": {
     id: "room_5",
     title: "La Réserve de nourriture",
-    description: "Vaste pièce sombre. Au sud, un monceau de nourriture volée (viande, alcools, fruits).",
-    secrets: "Rien de particulier, mais cela montre la capacité de la tribu à tenir un siège.",
+    description: "La double porte donne sur vaste pièce sans lumière qui est en grande partie vide. Dans la partie sud on trouve toutefois un monceau de nourriture : viandes, fruits séchés, alcools, légumes.",
+    secrets: "De quoi nourrir de nombreux gobelins durant des jours.",
     exits: [
       {
         id: "room_6",
@@ -196,8 +201,8 @@ export const GOBLIN_CAVE = {
   "room_6": {
     id: "room_6",
     title: "La Cuisine",
-    description: "Deux torches illuminent la pièce. Un fourneau fume, des plats sales et de la nourriture peu ragoûtante traînent.",
-    secrets: "Aucun monstre. Lieu de vie crasseux.",
+    description: "Deux torches aux murs illuminent cette pièce qui ne contient pas grand-chose non plus. Juste un fourneau avec un feu allumé dont la fumée s’échappe par un trou au plafond, des plats et des casseroles sales, et un peu de nourriture qui ne fait pas du tout envie.",
+    secrets: "Rien de special",
     exits: [
       {
         id: "room_5",
@@ -214,8 +219,8 @@ export const GOBLIN_CAVE = {
   "room_9": {
     id: "room_9",
     title: "La Salle Commune",
-    description: "Deux grandes tables, des bancs. Deux grands Hobgobelins sont en train de manger bruyamment.",
-    secrets: "Les hobgobelins n'ont pas leur bouclier en main. Si l'un meurt, l'autre crie pour alerter les gobelins des salles 7 et 10. Combat difficile !",
+    description: "La salle contient deux grandes tables et plusieurs bancs. Actuellement deux créatures de la taille d’un humain mais avec des traits semblables à ceux des gobelins sont en train de manger.",
+    secrets: "Si les personnages prennent le temps d’écouter avant de rentrer dans la pièce, ils entendront clairement deux créatures parler entre elles en gobelins. Des Hobgobelins sont occupés à manger et pensant que tout bruit normal vient surement des gobelins de l’antre, les deux hobgobelins ne sont normalement pas sur leur garde. Les hobgobelins ont leur épée longue sur eux et feront leur possible pour récupérer rapidement leur bouclier qui sont posés sur la table. Fiers guerriers, ils essayeront de se débarrasser des intrus tous seuls, mais si l’un d’eux vient à mourir, le survivant n’hésitera pas à crier pour alerter les gobelins de la salle 7 et de la salle 10.",
     exits: [
       {
         id: "room_10",
@@ -237,8 +242,8 @@ export const GOBLIN_CAVE = {
   "room_7": {
     id: "room_7",
     title: "Chambre de Gobelins (Dés)",
-    description: "Deux gobelins jouent aux dés sur une table ronde. Il y a six petites paillasses et un coffre fermé.",
-    secrets: "S'ils n'ont pas entendu de bruit, les gobelins sont surpris. Un gobelin a la clef du coffre (contient 252 pc).",
+    description: "À l'intérieur de cette pièce se trouvent deux gobelins en train de jouer aux dés sur une table ronde en bois. Il y a aussi six paillasses de petite taille et un coffre fermé à clef.",
+    secrets: "Les gobelins seront normalement surpris. Comme leurs congénères de l’entrée, il y a peu de chance qu’ils aient le temps de prendre leur bouclier (baisser leur CA de 2 dans ce cas). Un des gobelins porte sur lui la clef du coffre qui contient 252 pc.",
     exits: [
       {
         id: "room_8",
@@ -255,8 +260,8 @@ export const GOBLIN_CAVE = {
   "room_8": {
     id: "room_8",
     title: "La Chambre des Hobgobelins",
-    description: "Deux paillasses de taille humaine.",
-    secrets: "Une grosse bourse est cachée ici : 11 po et 1 pp. Les propriétaires sont dans la salle 9.",
+    description: "Dans cette pièce se trouvent deux paillasses de taille humaine et une grosse bourse.",
+    secrets: "C’est bien entendu là que dorment les deux hobgobelins, mais pour le moment ils sont en train de manger dans la salle commune. La bourse contient 11 po et 1 pp.",
     exits: [
       {
         id: "room_9",
@@ -273,8 +278,8 @@ export const GOBLIN_CAVE = {
   "room_10": {
     id: "room_10",
     title: "Chambre de Gobelins (Sommeil)",
-    description: "Six paillasses. Deux gobelins dorment profondément.",
-    secrets: "Ils ne se réveillent que si les hobgobelins de la salle 9 crient.",
+    description: "Il y a dans cette pièce six paillasses et deux gobelins y sont allongés, en train de dormir.",
+    secrets: "Ces gobelins ont le sommeil profond et un simple combat dans la salle 9 ne devrait pas les réveiller. Mais en cas de cris d’un hobgobelin, ils accourront voir ce qu’il se passe.",
     exits: [
       {
         id: "room_9",
@@ -286,8 +291,8 @@ export const GOBLIN_CAVE = {
   "room_11": {
     id: "room_11",
     title: "La Chambre du Gobelours",
-    description: "Un immense Gobelours (Bugbear) est surpris en train de cacher un sac sous son lit.",
-    secrets: "Le monstre attaque immédiatement, furieux d'être dérangé. Il a une Morgenstern (pas de bouclier). Son sac contient 40 po. Un passage secret existe vers la salle 12 (Investigation DD 15).",
+    description: "",
+    secrets: "Lorsqu’ils ouvrent la porte de cette pièce, les personnages aperçoivent une créature qui correspond à la description qu’on leur a peut-être fait à Fial d’un gobelours. Le monstre est de profil et en train de cacher un petit sac sous sa paillasse. Il ne possède comme arme qu’une Morgenstern, n’a pas de bouclier (baisser sa CA de 2). Le petit sac qu’il tentait de cacher contient 40 po. Le gobelours n’appréciera certainement pas qu’on entre chez lui comme cela sans demander la permission, et encore moins alors qu’il était en train de ranger le butin de sa dernière sortie. Il attaquera donc, sans hésiter.",
     exits: [
       {
         id: "room_12",
@@ -304,8 +309,8 @@ export const GOBLIN_CAVE = {
   "room_12": {
     id: "room_12",
     title: "La Salle du Trésor (Secrète)",
-    description: "Une pièce secrète plongée dans l'obscurité totale.",
-    secrets: "Le grand coffre n'est pas fermé ! Il contient : 6 statuettes en ivoire (60 po), 2 potions de soins (2d4+2 PV), 2000 pc, 1000 pa, 70 po.",
+    description: "",
+    secrets: "Protégée par un passage secret (Investigation DD 15), on peut y trouver six petites statuettes en ivoire (valeur de 60 po au total), deux potions de soins (qui font regagner 2d4+2 pv) et un grand coffre non fermé à clef qui contient 2000 pc, 1000 pa et 70 po. Il n’y a aucune lumière ici.",
     exits: [
       {
         id: "room_11",
@@ -317,8 +322,8 @@ export const GOBLIN_CAVE = {
   "room_13": {
     id: "room_13",
     title: "La Salle du Trône",
-    description: "La plus grande salle. Un grand trône en bois, de grands tapis au mur. Trois gobelins gardent leur chef.",
-    secrets: "Les 3 gobelins attaquent. Le chef est un poltron ! S'il perd, il fuit via un passage secret derrière son trône (activé en tournant le trône). Le joueur doit faire Investigation DD 15 pour le trouver, ou DD 5 s'il a vu le chef s'enfuir.",
+    description: "Au fond de cette vaste salle, la plus grande du complexe jusque-là, se trouve un trône en bois sur lequel est assis celui qui doit assurément être le chef de cette petite tribu de gobelins. Trois autres gobelins sont présents. Deux grands tapis recouvrent des pans de mur.",
+    secrets: "Les trois gobelins attaqueront dès que le groupe entrera. Par contre le chef, à traiter comme un gobelin normal, est un poltron qui fera tout pour ne pas combattre. Dès qu'il verra que le combat tourne mal, il essayera de s'enfuir par le passage secret derrière son trône, qui s’active en faisant tourner ce dernier (Investigation DD 15 par défaut, ou DD 5 si un personnage a vu le chef l’activer). Chaque gobelin porte 24 pa sur lui.",
     exits: [
       {
         id: "room_14",
@@ -345,8 +350,8 @@ export const GOBLIN_CAVE = {
   "room_14": {
     id: "room_14",
     title: "Le Laboratoire",
-    description: "Pièce fermée à clef (DEX DD 15 avec outils, ou FOR DD 15 pour casser). Étagères, pots, fioles, matériel d'alchimiste.",
-    secrets: "Rien de dangereux, mais rien d'utile non plus pour un non-initié.",
+    description: "Dans cette pièce se trouvent nombre d'étagères contenant plein de pots et de fioles sans étiquette, et tout un tas de matériel qui semble être celui d’un alchimiste.",
+    secrets: "Cette pièce est fermée à clef (Dextérité DD 15 pour la crocheter, à condition d’avoir des outils de voleur, ou Force DD 15 pour l’enfoncer). Les pots, les fioles et le materiel dans son ensemble sont les ingrédients de l’apprenti alchimiste de la salle 15, mais même un magicien n’y reconnaîtra rien !",
     exits: [
       {
         id: "room_15",
@@ -363,8 +368,8 @@ export const GOBLIN_CAVE = {
   "room_15": {
     id: "room_15",
     title: "La Chambre de l'Alchimiste",
-    description: "Un beau bureau, un tapis épais, un lit. Un jeune humain, Elric (apprenti alchimiste), est ici.",
-    secrets: "Elric est un beau parleur et un escroc. Il prétend être prisonnier et supplie qu'on le laisse partir, mais il tentera de s'enfuir ou de trahir les joueurs. Il a la clef de la salle 14 et un grimoire de magie.",
+    description: "Cette pièce possède un bureau de belle facture, une chaise, un tapis épais au sol, et un lit. Elle sent nettement meilleure que toutes les autres pièces visitées.",
+    secrets: "Elric, le jeune apprenti alchimiste humain qui vit ici, est le seul à vivre de jour et à dormir de nuit. Suivant l’heure à laquelle les personnages arrivent, il dort ou bien est en train de travailler sur son grimoire, assis à son bureau. Elric se rend rapidement compte que, seul, il ne fera pas le poids face aux personnages. Il essayera donc de les endormir par de belles paroles, prétendant en premier lieu être prisonnier des gobelins, puis suppliant le membre du groupe qui semble le plus clément de le laisser partir. En fait, il tentera de s'enfuir dès qu’il en aura l’occasion. Ni Gandelme ni Lanéa ne l’avaient vu avant, et il n’a participé à aucun raid avec les gobelins. Il n’a en fait que peu de relations avec les gobelins. Renvoyé par son mentor pour incapacité, il cherchait un endroit tranquille pour réaliser ses expériences, et a été attaqué par les gobelins. Mais, parlant leur langue, et plutôt doué pour embobiner les autres, il a réussi à convaincre leur chef qu’il pouvait transformer le fer en or. Il est donc confiné ici jusqu’à ce qu’il parvienne à montrer les preuves de son soi-disant talent. Il n’est pas autorisé à sortir de l’antre, mais les gobelins le nourrissent, ce qui lui permet de se consacrer de plein temps à ses expériences… infructueuses jusque-là. Il n’a rien de valeur sur lui, mis à part la clef de la salle 14 et son grimoire qui contient tous les sorts qu’il a préparés (voir sa fiche de stat) plus un autre sort de niveau 1 (à déterminer au hasard).",
     exits: [
       {
         id: "room_14",
@@ -376,8 +381,8 @@ export const GOBLIN_CAVE = {
   "room_16": {
     id: "room_16",
     title: "La Cellule",
-    description: "Pièce sombre. Une jeune femme est attachée pieds et poings liés : c'est Lanéa, la fille du chef du village !",
-    secrets: "Elle n'est pas blessée. Si on la libère, elle informe les joueurs que le halfelin Gandelme est aussi prisonnier quelque part (Salle 4).",
+    description: "Cette pièce qui baigne dans l’obscurité est une cellule. Ceux d’entre vous qui connaissent Lanéa, la fille du chef, la reconnaissent tout de suite, pieds et poings liés par une corde. Elle ne semble toutefois pas avoir été maltraitée et vous reconnaît immédiatement.",
+    secrets: "Si le groupe n’a pas encore trouvé Gandelme dans la salle 4, Lanéa leur révèle qu’elle l’a aperçu la veille et qu’il faut absolument le trouver avant de partir d’ici.",
     exits: [
       {
         id: "room_13",
@@ -389,8 +394,8 @@ export const GOBLIN_CAVE = {
   "room_17": {
     id: "room_17",
     title: "La Chambre du Chef",
-    description: "Chambre bien décorée, vrai lit, tapis. Un sac à dos, un bouclier de petite taille et une épée courte sont posés au sol.",
-    secrets: "Ce sont les affaires volées au halfelin Gandelme (Salle 4). Le sac contient des outils de voleur et 20 po.",
+    description: "Cette chambre bien décorée contient un vrai lit, des tapis par terre et sur les murs, et un sac à dos sur lequel est posé un bouclier et une épée courte de petite taille. Les deux torches au mur sont éteintes.",
+    secrets: "Le bouclier et l’épée courte appartiennent au halfelin Gandelme, capturé par les gobelins il y a une semaine, de même que le sac à dos qui, en plus de l’équipement standard de tout aventurier (sac d’explorateur), contient des outils de voleur et 20 po.",
     exits: [
       {
         id: "room_13",

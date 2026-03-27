@@ -1158,8 +1158,9 @@ export default function CharacterBuilder({ onSave }) {
 
     const character = {
       id,
-      nom: name.trim(),
-      classe: className,
+      type: "player",
+      name: name.trim(),
+      entityClass: className,
       race,
       level,
       alignment: alignment || undefined,
@@ -1171,8 +1172,10 @@ export default function CharacterBuilder({ onSave }) {
       description: description || undefined,
       initiative: modifiers.DEX ?? 0,
       speed: `${raceObj.speed ?? 30} ft`,
+      visible: true,
+      isAlive: true,
       hp: { current: maxHp, max: maxHp },
-      armorClass,
+      ac: armorClass,
       xp: XP_BY_LEVEL[level] ?? 0,
       hitDie: hitDie || undefined,
       hitDiceTotal: level,
@@ -1199,7 +1202,7 @@ export default function CharacterBuilder({ onSave }) {
           : Array.isArray(selectedSpells)
             ? selectedSpells.map((s) => s.name)
             : [],
-      inventaire: inventory,
+      inventory,
       weapons: weaponsForState.length ? weaponsForState : [],
       ...(isFighter
         ? {

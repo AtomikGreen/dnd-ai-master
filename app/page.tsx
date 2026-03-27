@@ -367,7 +367,7 @@ export default function Home() {
   }
 
   const stats: PlayerStats  = player.stats;
-  const inventaire: string[] = player.inventaire;
+  const inventaire: string[] = player.inventory;
   const weapons: Weapon[]    = player.weapons;
 
   const displayEntities = debugMode
@@ -397,9 +397,9 @@ export default function Home() {
           🧙
         </div>
         <div>
-          <h3 className="text-2xl font-bold text-slate-100">{player.nom}</h3>
+          <h3 className="text-2xl font-bold text-slate-100">{player.name}</h3>
           <p className="text-slate-400">
-            {player.race ? `${player.race} — ${player.classe}` : player.classe}
+            {player.race ? `${player.race} — ${player.entityClass}` : player.entityClass}
           </p>
           <p className="text-xs text-slate-500 mt-1">
             Niveau {player.level} · Initiative {player.initiative ?? abilityMod(stats.DEX)} · Vitesse {player.speed ?? "30 ft"}
@@ -421,7 +421,7 @@ export default function Home() {
         </div>
         <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
           <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Classe d&apos;armure</p>
-          <p className="text-3xl font-bold text-blue-300">{player.armorClass}</p>
+          <p className="text-3xl font-bold text-blue-300">{player.ac}</p>
         </div>
       </div>
 
@@ -663,7 +663,7 @@ export default function Home() {
         </div>
         <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
           <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Classe d&apos;armure</p>
-          <p className="text-3xl font-bold text-blue-300">{player.armorClass}</p>
+          <p className="text-3xl font-bold text-blue-300">{player.ac}</p>
         </div>
       </div>
 
@@ -899,7 +899,7 @@ export default function Home() {
               </div>
               <div className="flex-1 min-w-0">
                 <p className={`font-bold ${isPlayer ? "text-blue-300" : "text-slate-100"}`}>
-                  {resolveCombatantDisplayName(entry, entities, player?.nom)}
+                  {resolveCombatantDisplayName(entry, entities, player?.name)}
                 </p>
                 {entityData && (
                   <p className="text-xs text-slate-400">{entityData.race} · {entityData.entityClass}</p>
@@ -939,10 +939,10 @@ export default function Home() {
             className="cursor-pointer rounded-lg border border-slate-700 bg-slate-800/60 p-3 hover:border-slate-500 hover:bg-slate-700/60 transition-all group"
           >
             <div className="flex items-center justify-between mb-1">
-              <h2 className="text-base font-bold tracking-wide text-slate-200">{player.nom}</h2>
+              <h2 className="text-base font-bold tracking-wide text-slate-200">{player.name}</h2>
               <span className="text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">voir ↗</span>
             </div>
-            <p className="text-xs text-slate-400 mb-2">{player.classe}</p>
+            <p className="text-xs text-slate-400 mb-2">{player.entityClass}</p>
             <div className="space-y-1">
               <div className="flex justify-between text-xs text-slate-400">
                 <span>HP</span>
@@ -956,7 +956,7 @@ export default function Home() {
               </div>
               <div className="flex justify-between text-xs text-slate-400 pt-1">
                 <span>Classe d&apos;Armure</span>
-                <span className="tabular-nums font-semibold text-slate-200">{player.armorClass}</span>
+                <span className="tabular-nums font-semibold text-slate-200">{player.ac}</span>
               </div>
             </div>
           </div>
@@ -1147,7 +1147,7 @@ export default function Home() {
                       <span
                         className={`truncate ${entry.id === "player" ? "text-blue-300" : ""}`}
                       >
-                        {resolveCombatantDisplayName(entry, entities, player?.nom)}
+                        {resolveCombatantDisplayName(entry, entities, player?.name)}
                       </span>
                     </span>
                     <span className="tabular-nums text-slate-500">{entry.initiative}</span>
@@ -1205,27 +1205,27 @@ export default function Home() {
 
       {/* ── Modals ── */}
       {activeModal === "player" && (
-        <Modal title={`${player.nom} — Fiche de personnage`} onClose={closeModal}>
+        <Modal title={`${player.name} — Fiche de personnage`} onClose={closeModal}>
           {modalPlayer}
         </Modal>
       )}
       {activeModal === "stats" && (
-        <Modal title={`${player.nom} — Stats & compétences`} onClose={closeModal}>
+        <Modal title={`${player.name} — Stats & compétences`} onClose={closeModal}>
           {modalStats}
         </Modal>
       )}
       {activeModal === "weapons" && (
-        <Modal title={`${player.nom} — Armes`} onClose={closeModal}>
+        <Modal title={`${player.name} — Armes`} onClose={closeModal}>
           {modalWeapons}
         </Modal>
       )}
       {activeModal === "spells" && (
-        <Modal title={`${player.nom} — Sorts & magie`} onClose={closeModal}>
+        <Modal title={`${player.name} — Sorts & magie`} onClose={closeModal}>
           {modalSpells}
         </Modal>
       )}
       {activeModal === "inventory" && (
-        <Modal title={`${player.nom} — Inventaire`} onClose={closeModal}>
+        <Modal title={`${player.name} — Inventaire`} onClose={closeModal}>
           {modalInventory}
         </Modal>
       )}

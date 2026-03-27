@@ -19,24 +19,28 @@ function resolveModel(requested) {
 }
 
 const VISUAL_SYNTH_SYSTEM = [
-  "Tu es un ingénieur de prompt pour Stable Diffusion expert en D&D. Ton but est de synthétiser les informations contextuelles fournies (Lieu, Personnages, Équipement, Action) en un prompt visuel unique, détaillé et cohérent.",
+  "Tu es un directeur artistique et ingénieur de prompt pour génération d'image fantasy/JDR.",
+  "Ton rôle : transformer un contexte de scène en un prompt visuel unique, clair, fidèle, efficace, sans contradiction.",
   "",
-  "CONSIGNES :",
-  "",
-  "- Pour le héros joueur (objet playerInfo), utilise impérativement characterName, race, characterClass et level s'ils sont présents, en plus de description et visibleGear.",
-  "- GÉOGRAPHIE : la ligne ou champ « location » / Environment décrit le décor et la direction du voyage (collines boisées, sentier vers l'ouest, montagne, etc.). C'est LA référence pour le paysage et la destination visuelle.",
-  "- narrativeFocus peut résumer des événements passés (forge, village, PNJ) pour l'ambiance — ne les utilise PAS pour inventer des personnages dans l'image ni pour montrer « marche vers le village » si location parle d'un trajet en nature sauvage / collines.",
-  "- PERSONNAGES : si presentNPCs est vide ou [], le cadre ne contient qu'UN seul humanoïde : le héros joueur. Aucun compagnon, aucun soldat générique, aucun PNJ non listé.",
-  "- Si presentNPCs contient des entrées, seuls le héros + ces PNJ peuvent apparaître — pas d'extras.",
-  "- Décris les personnages physiques en utilisant leurs descriptions fournies (race, barbe, vêtements, tablier).",
-  "- Inclue l'équipement visible (cotte de mailles, hache, etc.).",
-  "- Décris l'environnement et l'éclairage (cinématique, dark fantasy).",
-  "- Utilise des mots-clés de style (digital painting, concept art, hyperdetailed).",
-  "- Reste fidèle à la scène D&D. Ne génère que le prompt final, sans texte introductif.",
+  "RÈGLES :",
+  "- Le champ 'location' décrit le décor visible réel : c'est la vérité principale pour l'environnement.",
+  "- Le champ 'gmNarration' décrit la mise en scène immédiate récente : utilise-le pour l'action, l'ambiance et la pose.",
+  "- Le champ 'imageTrigger.focus' indique ce qu'il faut montrer en priorité dans l'image.",
+  "- Le champ 'imageTrigger.engineEvent' est la vérité mécanique. S'il indique une cible touchée, morte ou encore vivante, respecte-le.",
+  "- Le champ 'eventFocusTarget' décrit la cible importante du moment. Si elle est morte ou à 0 PV, elle peut apparaître comme corps, victime, ou silhouette vaincue même si elle n'est pas dans presentNPCs.",
+  "- presentNPCs décrit les personnages actuellement visibles et encore présents dans la scène. N'invente jamais d'autres humanoïdes.",
+  "- Si presentNPCs est vide, l'image ne doit contenir que le héros joueur, sauf éventuel corps/victime explicitement indiqué par eventFocusTarget.",
+  "- Si presentNPCs contient des entrées, seuls le héros joueur + ces entrées peuvent apparaître, plus éventuellement un corps/victime explicitement indiqué par eventFocusTarget.",
+  "- Pour le héros joueur, utilise prioritairement characterName, race, characterClass, level, description et visibleGear.",
+  "- Décris la composition, l'échelle du plan, la lumière, les matières, et l'action centrale. Sois concret, visuel et compact.",
+  "- N'invente ni village, ni forge, ni compagnon, ni foule, ni voyage si le décor actuel ne les montre pas.",
+  "- N'utilise pas de guillemets autour des noms dans le prompt final.",
+  "- Rédige le prompt final entièrement en FRANÇAIS.",
+  "- Retourne uniquement le prompt final, sans commentaire, sans JSON, sans introduction.",
 ].join("\n");
 
 const IMAGE_PROMPT_STYLE_SUFFIX =
-  "dark fantasy RPG illustration, Dungeons and Dragons scene, cinematic lighting, digital painting, concept art, hyperdetailed, high quality";
+  "illustration dark fantasy de jeu de role, peinture numerique, art conceptuel, eclairage cinematographique, tres detaille, haute qualite";
 
 /**
  * Garde-fous ajoutés au prompt envoyé au modèle image (synthèse ou fallback).
@@ -55,15 +59,15 @@ function buildCompositionGuards(vc) {
   const guards = [];
   if (onlyPlayer) {
     guards.push(
-      "CRITICAL — COMPOSITION: Exactly ONE humanoid in frame: the player hero (Hero appearance / gear). No adventuring party, no three companions, no generic soldiers, no crowd. presentNPCs is empty: do NOT paint forge NPCs, villagers, escorts, or anyone else from story text."
+      "COMPOSITION CRITIQUE : un seul humanoide vivant dans le cadre, le heros joueur. Aucun compagnon, aucun soldat, aucune foule, aucun PNJ d'arriere-plan non liste."
     );
   } else {
     guards.push(
-      `CRITICAL — COMPOSITION: Only the player hero plus the ${npcs.length} NPC(s) listed in presentNPCs may appear. No extra unnamed companions.`
+      `COMPOSITION CRITIQUE : seuls le heros joueur et les ${npcs.length} personnage(s) listes dans presentNPCs peuvent apparaitre comme personnages vivants. Aucun extra non nomme.`
     );
   }
   guards.push(
-    "CRITICAL — SETTING: The Environment / location field defines visible terrain and direction of travel (e.g. forested western hills, wilderness trail toward mountains). Long narrative text may mention a village or forge for backstory only — do NOT show marching toward a welcoming village as the main goal if location describes travel into wild hills/forest away from settlement. A village may appear small and distant in the background only when the story is leaving it."
+    "DECOR CRITIQUE : le champ location definit le lieu visible reel. Ne remplace jamais ce decor par un autre lieu mentionne seulement dans le contexte narratif."
   );
   return guards;
 }
@@ -89,13 +93,15 @@ function fallbackPromptFromVisualContext(vc) {
   const parts = [];
   const loc = typeof o.location === "string" ? o.location.trim() : "";
   const name = typeof o.sceneName === "string" ? o.sceneName.trim() : "";
-  if (name) parts.push(`Scene title: ${name}.`);
-  if (loc) parts.push(`Environment: ${loc}`);
+  if (name) parts.push(`Scene : ${name}.`);
+  if (loc) parts.push(`Decor visible : ${loc}`);
   const focus = typeof o.narrativeFocus === "string" ? o.narrativeFocus.trim() : "";
+  const gmNarration = typeof o.gmNarration === "string" ? o.gmNarration.trim() : "";
   if (focus) {
-    parts.push(
-      `Story mood and recent beats (atmosphere only; do NOT add characters from this text unless they appear in presentNPCs; do NOT override Environment for destination): ${focus}`
-    );
+    parts.push(`Focus narratif : ${focus}`);
+  }
+  if (gmNarration) {
+    parts.push(`Narration MJ recente : ${gmNarration}`);
   }
   const pi = o.playerInfo;
   if (pi && typeof pi === "object") {
@@ -105,16 +111,38 @@ function fallbackPromptFromVisualContext(vc) {
     const cls = typeof p.characterClass === "string" ? p.characterClass.trim() : "";
     const lvl = typeof p.level === "number" && Number.isFinite(p.level) ? p.level : null;
     const identityBits = [
-      cn && `name: ${cn}`,
-      race && `race: ${race}`,
-      cls && `class: ${cls}`,
-      lvl != null && lvl > 0 && `level: ${lvl}`,
+      cn && `nom : ${cn}`,
+      race && `race : ${race}`,
+      cls && `classe : ${cls}`,
+      lvl != null && lvl > 0 && `niveau : ${lvl}`,
     ].filter(Boolean);
-    if (identityBits.length) parts.push(`Player hero (${identityBits.join(", ")})`);
+    if (identityBits.length) parts.push(`Hero joueur (${identityBits.join(", ")})`);
     const d = typeof p.description === "string" ? p.description.trim() : "";
     const g = typeof p.visibleGear === "string" ? p.visibleGear.trim() : "";
-    if (d) parts.push(`Hero appearance: ${d}`);
-    if (g) parts.push(`Hero visible gear: ${g}`);
+    if (d) parts.push(`Apparence du hero : ${d}`);
+    if (g) parts.push(`Equipement visible du hero : ${g}`);
+  }
+  const eventFocusTarget =
+    o.eventFocusTarget && typeof o.eventFocusTarget === "object"
+      ? /** @type {Record<string, unknown>} */ (o.eventFocusTarget)
+      : null;
+  if (eventFocusTarget) {
+    const nm = typeof eventFocusTarget.name === "string" ? eventFocusTarget.name.trim() : "";
+    const ap = typeof eventFocusTarget.appearance === "string" ? eventFocusTarget.appearance.trim() : "";
+    const alive =
+      typeof eventFocusTarget.isAlive === "boolean"
+        ? eventFocusTarget.isAlive
+          ? "vivant"
+          : "vaincu ou mort"
+        : "";
+    const hpAfter =
+      typeof eventFocusTarget.hpAfter === "number" && typeof eventFocusTarget.hpMax === "number"
+        ? `${eventFocusTarget.hpAfter}/${eventFocusTarget.hpMax} PV`
+        : "";
+    const bits = [nm, ap, alive, hpAfter].filter(Boolean);
+    if (bits.length) {
+      parts.push(`Cible visuelle importante de l'evenement : ${bits.join(" ; ")}`);
+    }
   }
   const npcs = Array.isArray(o.presentNPCs) ? o.presentNPCs : [];
   for (const n of npcs) {
@@ -122,7 +150,7 @@ function fallbackPromptFromVisualContext(vc) {
     const rec = /** @type {Record<string, unknown>} */ (n);
     const nm = typeof rec.name === "string" ? rec.name : "";
     const ap = typeof rec.appearance === "string" ? rec.appearance : "";
-    if (nm || ap) parts.push(`${nm || "Character"}: ${ap}`);
+    if (nm || ap) parts.push(`${nm || "Personnage"} : ${ap}`);
   }
   return parts.join("\n\n");
 }
@@ -202,6 +230,9 @@ export async function POST(request) {
     const selectedModel = resolveModel(model);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent`;
 
+    const controller = new AbortController();
+    const timeoutMs = Number(process.env.IMAGE_GEN_TIMEOUT_MS ?? 120000);
+    const t = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 120000);
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -215,7 +246,8 @@ export async function POST(request) {
           },
         ],
       }),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(t));
 
     const data = await res.json().catch(() => ({}));
 
