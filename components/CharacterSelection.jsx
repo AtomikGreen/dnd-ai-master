@@ -15,6 +15,7 @@ const PREGENERATED = [
   {
     id: "pre-1",
     type: "player",
+    controller: "player",
     name: "Thorin Pied-de-Pierre",
     entityClass: "Guerrier",
     race: "Nain des Montagnes",
@@ -75,6 +76,7 @@ const PREGENERATED = [
   {
     id: "pre-2",
     type: "player",
+    controller: "player",
     name: "Elyndra Lame-d'Ombre",
     entityClass: "Magicien",
     race: "Haut-Elfe",

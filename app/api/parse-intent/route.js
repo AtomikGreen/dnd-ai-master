@@ -18,11 +18,13 @@ const GEMINI_MODEL = "gemini-3-flash-preview";
 
 const ARBITER_SYSTEM = `Arbitre logique D&D 5e : aucune narration, uniquement un objet JSON.
 
+ROLE : Tu traduis les intentions informelles du joueur en actions D&D formelles.
+
 Sortie obligatoire :
 {
   "resolution": "combat_intent" | "requires_roll" | "trivial_success" | "impossible" | "unclear_input",
   "reason": "texte court",
-  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"end_turn"|"loot", "targetId": "", "weapon": "" },
+  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"short_rest"|"long_rest"|"end_turn"|"loot", "targetId": "", "weapon": "" },
   "rollRequest": null | { "kind": "check"|"save"|"attack"|"gm_secret", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Athlétisme", "dc": <nombre>, "raison": "...", "roll": "1d100" },
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "..." }
 }
@@ -36,9 +38,9 @@ RÈGLE ANTI-CHAÎNE (1 SEULE action majeure par tour) :
 - Ignore le reste pour ce tour : ne renvoie qu’une seule résolution et un seul intent (ou sceneUpdate si c’est une navigation).
 - Si la première action correspond à une navigation (direction/entrée vers une sortie autorisée), privilégie la scèneUpdate associée et ignore les autres actions mentionnées après.
 
-Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée ex. Second souffle → combat_intent + type second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason qui décrit ce que voit le joueur et liste brièvement les sorties disponibles. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
+Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée. Capacités/repos : "second souffle" -> combat_intent + type second_wind ; "repos court", "courte pause pour souffler/se ressourcer" -> combat_intent + type short_rest ; "repos long", "dormir 8h/se reposer pour la nuit" -> combat_intent + type long_rest. Ne confonds jamais "courte pause/repos court" avec second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. SÉMANTIQUE DE NAVIGATION À RESPECTER STRICTEMENT : "je me dirige vers", "je vais vers", "je m'approche de", "je me rapproche de", "je marche jusqu'à" une porte / issue / sortie = seulement s'en approcher, jamais l'ouvrir, la franchir, la crocheter ni la forcer. "j'ouvre", "je pousse la porte", "je tente la porte", "j'essaie d'ouvrir", "je crochette", "je force", "j'enfonce" = interaction avec la porte ; si le verrou ou la résistance créent une incertitude, alors seulement requires_roll ou impossible. "j'entre", "je passe", "je franchis", "je traverse", "je vais dedans", "j'y vais" = franchissement / passage vers l'autre salle, mais seulement si l'historique récent montre que le personnage est déjà au seuil ou qu'une seule issue immédiate cohérente est en train d'être suivie ; sinon interpréter "j'y vais" comme trop ambigu plutôt que comme une nouvelle action technique. N'infère jamais de crochetage ou de forçage uniquement parce que les secrets mentionnent une serrure, une clef, un verrou ou un DD : il faut une intention explicite du joueur d'ouvrir malgré l'obstacle ou d'interagir avec la serrure. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason factuelle et procédurale (destinée au moteur/narrateur, pas au joueur) qui résume brièvement l'ambiguïté. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
 
-Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind : targetId peut être "". rollRequest=null et sceneUpdate=null.
+Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, short_rest, long_rest, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind/short_rest/long_rest : targetId peut être "". rollRequest=null et sceneUpdate=null. RÈGLE IMPÉRATIVE : en combat, si l'intention du joueur est d'attaquer, de lancer un sort offensif, de se déplacer pour frapper, ou plus généralement d'accomplir une action de combat standard résolue par le moteur, tu dois répondre "combat_intent" avec intent renseigné, JAMAIS "requires_roll". Le jet d'attaque ou les dégâts seront gérés ensuite par le moteur client ; toi tu ne demandes pas un skillcheck, tu décris seulement l'intention de combat structurée. "requires_roll" en combat est réservé aux cas exceptionnellement hors grammaire de combat standard.
 
 Fiabilité : clé intent (pas actionIntent). Jamais de string à la place d’un objet. Utiliser type/stat/dc (pas action/ability/difficultyClass). JSON seul, sans markdown.`;
 
@@ -236,6 +238,8 @@ function safeParseArbiterJson(raw) {
         "spell",
         "dodge",
         "second_wind",
+        "short_rest",
+        "long_rest",
         "end_turn",
         "loot",
       ]);
@@ -333,6 +337,72 @@ function tryExtractDcFromSecrets(secrets, regex) {
   return Number.isFinite(n) ? n : null;
 }
 
+function normalizeLoose(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’']/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isExplicitDoorTraversalIntent(rawText) {
+  const raw = String(rawText ?? "").trim();
+  if (!raw) return false;
+  return /(ouvre|ouvrir|j['’]ouvre|franchi|franchir|je\s+passe(?:\s+la\s+porte)?|passer\s+la\s+porte|je\s+rentre|je\s+rentre|j['’]entre|je\s+vais\s+dedans|j['’]y\s+vais|je\s+traverse)/i.test(raw);
+}
+
+function isApproachOnlyIntent(rawText) {
+  const raw = String(rawText ?? "").trim();
+  if (!raw) return false;
+  const approachVerb =
+    /(je\s+me\s+dirige(?:r)?|je\s+vais\s+vers|je\s+m['’]approche|je\s+me\s+rapproche|je\s+marche\s+vers|je\s+me\s+rends?\s+vers)/i;
+  if (!approachVerb.test(raw)) return false;
+  if (isExplicitDoorTraversalIntent(raw)) return false;
+  if (/(crochet|crocheter|serrure|outils?\s+de\s+voleur|forcer|enfonc|défonc|deverrou|déverrou)/i.test(raw)) {
+    return false;
+  }
+  return true;
+}
+
+function classifyRestIntent(rawText) {
+  const raw = normalizeLoose(String(rawText ?? ""));
+  if (!raw) return null;
+  if (
+    /\b(repos\s+court|short\s+rest|courte?\s+pause|petite?\s+pause|souffler\s+un\s+peu|me\s+ressourcer|recuperer\s+mes\s+forces)\b/.test(
+      raw
+    )
+  ) {
+    return "short_rest";
+  }
+  if (
+    /\b(repos\s+long|long\s+rest|dormir|nuit\s+de\s+repos|pour\s+la\s+nuit|huit\s+heures?)\b/.test(
+      raw
+    )
+  ) {
+    return "long_rest";
+  }
+  return null;
+}
+
+function normalizeParsedRestIntent(rawText, parsedDecision) {
+  if (!parsedDecision || typeof parsedDecision !== "object") return parsedDecision;
+  const restType = classifyRestIntent(rawText);
+  if (!restType) return parsedDecision;
+  if (parsedDecision.sceneUpdate) return parsedDecision;
+  return {
+    resolution: "combat_intent",
+    reason:
+      restType === "short_rest"
+        ? "Demande explicite de repos court"
+        : "Demande explicite de repos long",
+    intent: { type: restType, targetId: "", weapon: "" },
+    rollRequest: null,
+    sceneUpdate: null,
+  };
+}
+
 function buildDeterministicFallback({
   text,
   gameMode,
@@ -382,6 +452,20 @@ function buildDeterministicFallback({
   const raw = String(text ?? "").trim();
   if (!raw) return null;
 
+  const restType = classifyRestIntent(raw);
+  if (restType) {
+    return {
+      resolution: "combat_intent",
+      reason:
+        restType === "short_rest"
+          ? "Demande explicite de repos court"
+          : "Demande explicite de repos long",
+      intent: { type: restType, targetId: "", weapon: "" },
+      rollRequest: null,
+      sceneUpdate: null,
+    };
+  }
+
   // Capacités de classe : doivent toujours devenir une intention mécanique explicite.
   if (/(second\s+souffle|second\s+wind)/i.test(raw)) {
     return {
@@ -409,6 +493,18 @@ function buildDeterministicFallback({
 
   if (/(entre|j['’]?entre|je\s+rentre|je\s+passe\s+la\s+porte|je\s+pénètre|je\s+vais\s+dans|je\s+vais\s+vers|je\s+me\s+dirige|je\s+prends|je\s+m['’]?engage|je\s+continue|je\s+pars\s+vers)/i.test(raw)) {
     const selectedExit = pickExitFromText(raw, allowedExits);
+    if (selectedExit && isApproachOnlyIntent(raw)) {
+      const dir = String(selectedExit?.direction ?? "").trim();
+      return {
+        resolution: "trivial_success",
+        reason: dir
+          ? `Le joueur s'approche de la porte / sortie vers ${dir} sans tenter de l'ouvrir.`
+          : "Le joueur s'approche d'une porte / sortie sans tenter de l'ouvrir.",
+        intent: null,
+        rollRequest: null,
+        sceneUpdate: null,
+      };
+    }
     if (!selectedExit && allowedExits.length > 1) {
       const options = allowedExits
         .map((e) => {
@@ -602,6 +698,12 @@ export async function POST(request) {
       if (fallback) {
         parsed = { ok: true, parsed: fallback };
       }
+    }
+    if (parsed.ok) {
+      parsed = {
+        ok: true,
+        parsed: normalizeParsedRestIntent(text, parsed.parsed),
+      };
     }
 
     const traceProvider = provider === "gemini" ? "gemini" : "openrouter";

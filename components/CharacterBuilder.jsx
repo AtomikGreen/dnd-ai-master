@@ -1159,6 +1159,7 @@ export default function CharacterBuilder({ onSave }) {
     const character = {
       id,
       type: "player",
+      controller: "player",
       name: name.trim(),
       entityClass: className,
       race,

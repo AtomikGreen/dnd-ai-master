@@ -10,7 +10,7 @@ import {
   ReactNode,
   type SetStateAction,
 } from "react";
-import { CAMPAIGN_CONTEXT, GOBLIN_CAVE } from "@/data/campaign";
+import { CAMPAIGN_CONTEXT, CAMPAIGN_START_WORLD_TIME_MINUTES, GOBLIN_CAVE } from "@/data/campaign";
 import { BESTIARY } from "@/data/bestiary";
 import { resolveCombatantDisplayName } from "@/lib/combatDisplayName";
 
@@ -48,7 +48,9 @@ export type SpellSlotsMap = { [spellLevel: number]: SpellSlotRow };
 
 export interface CombatantBase {
   id: string;
+  templateId?: string;
   type: string;
+  controller?: CombatantController;
   name: string;
   entityClass?: string;
   race?: string;
@@ -72,6 +74,7 @@ export interface Player {
   /** Pré-tirés / créateur : identifiant stable pour savoir si le joueur a changé de perso. */
   id?: string | number;
   type: "player";
+  controller: "player";
   name: string;
   entityClass: string;
   race?: string;
@@ -106,6 +109,10 @@ export interface Player {
   hitDiceTotal?: number;
   /** Nombre de dés de vie restants après repos */
   hitDiceRemaining?: number;
+  /** État D&D 5e à 0 PV : inconscience, stabilisation, jets contre la mort, mort. */
+  deathState?: DeathState;
+  /** Minute monde du dernier repos long effectivement bénéficié. */
+  lastLongRestFinishedAtMinute?: number | null;
   /** Emplacements de sorts par niveau (ex: {1: {max: 4, remaining: 4}}) */
   spellSlots?: SpellSlotsMap;
   stats: PlayerStats;
@@ -207,7 +214,7 @@ export interface PendingRoll {
   stat: string;       // ex: "FOR", "DEX"
   totalBonus: number; // modificateur total (stat mod + maîtrise + bonus arme…)
   raison: string;     // ex: "attaque à l'Épée Longue"
-  kind?: "attack" | "check" | "save";
+  kind?: "attack" | "check" | "save" | "hit_die" | "death_save";
   /** Pour un test : nom de compétence (Perception, Acrobatics, etc.) si applicable */
   skill?: string;
   /** Pour une attaque : id de la cible dans `entities` */
@@ -218,6 +225,15 @@ export interface PendingRoll {
   id?: string;
   /** Contexte optionnel pour une résolution purement moteur (sans repasser par le MJ). */
   engineContext?: Record<string, any> | null;
+}
+
+export interface DeathState {
+  successes: number;
+  failures: number;
+  stable: boolean;
+  unconscious: boolean;
+  dead: boolean;
+  autoRecoverAtMinute?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +286,7 @@ export interface Message {
  * "object"   = inanimé.
  */
 export type EntityType = "hostile" | "npc" | "friendly" | "object";
+export type CombatantController = "player" | "ai";
 
 /** Caractéristiques D&D 5e d'une entité */
 export interface EntityStats {
@@ -288,6 +305,8 @@ export interface Entity {
   name: string;
   /** hostile=attaque le joueur, npc=neutre/réactif, friendly=allié, object=inanimé */
   type: EntityType;
+  /** Qui décide de ses actions quand c'est son tour. */
+  controller: CombatantController;
   race: string;
   entityClass: string;
   cr: number;
@@ -327,6 +346,7 @@ export interface EntityUpdate {
   templateId?: string;
   name?: string;
   type?: EntityType;
+  controller?: CombatantController;
   race?: string;
   entityClass?: string;
   cr?: number;
@@ -354,6 +374,9 @@ export interface EntityUpdate {
   acDelta?: number;
   /** Modificateurs additifs de caractéristiques (FOR/DEX/CON/INT/SAG/CHA). */
   statDeltas?: Partial<EntityStats>;
+  /** Dés de vie (PJ / godmode) — valeurs absolues. */
+  hitDiceRemaining?: number | null;
+  hitDiceTotal?: number | null;
 }
 
 function normalizeEntityType(t: any): EntityType | undefined {
@@ -362,11 +385,106 @@ function normalizeEntityType(t: any): EntityType | undefined {
   return undefined;
 }
 
+function normalizeEntityController(controller: unknown): CombatantController {
+  return controller === "player" ? "player" : "ai";
+}
+
+function normalizeEntityNameKey(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function coalesceLogicalEntityDuplicates(entities: Entity[]): Entity[] {
+  const result: Entity[] = [];
+  const indexByLogicalKey = new Map<string, number>();
+  for (const entity of Array.isArray(entities) ? entities : []) {
+    if (!entity) continue;
+    const nameKey = normalizeEntityNameKey(entity.name);
+    const typeKey = normalizeEntityType(entity.type) ?? "npc";
+    const logicalKey = nameKey ? `${typeKey}::${nameKey}` : "";
+    if (!logicalKey) {
+      result.push(entity);
+      continue;
+    }
+    const existingIdx = indexByLogicalKey.get(logicalKey);
+    if (existingIdx == null) {
+      indexByLogicalKey.set(logicalKey, result.length);
+      result.push(entity);
+      continue;
+    }
+    const existing = result[existingIdx];
+    result[existingIdx] = {
+      ...existing,
+      ...entity,
+      id: existing.id,
+      name: existing.name || entity.name,
+      type: existing.type || entity.type,
+      controller: existing.controller ?? entity.controller,
+      visible: existing.visible || entity.visible,
+      isAlive: existing.isAlive || entity.isAlive,
+      hp:
+        existing.hp && (existing.hp.current > 0 || !entity.hp)
+          ? existing.hp
+          : entity.hp ?? existing.hp,
+      awareOfPlayer:
+        typeof existing.awareOfPlayer === "boolean"
+          ? existing.awareOfPlayer || entity.awareOfPlayer === true
+          : entity.awareOfPlayer,
+      surprised:
+        typeof existing.surprised === "boolean"
+          ? existing.surprised && entity.surprised !== false
+          : entity.surprised,
+      lootItems:
+        Array.isArray(existing.lootItems) && existing.lootItems.length > 0
+          ? existing.lootItems
+          : entity.lootItems ?? existing.lootItems,
+    };
+  }
+  return result;
+}
+
 function inferTemplateIdFromEntityId(entityId: string): string | null {
   const id = String(entityId ?? "").trim().toLowerCase();
   if (!id) return null;
   const withoutSuffix = id.replace(/_\d+$/g, "");
   return withoutSuffix || null;
+}
+
+function inferTemplateIdFromEntityLike(entityLike: any): string | null {
+  const explicitTemplateId =
+    typeof entityLike?.templateId === "string" && entityLike.templateId.trim()
+      ? entityLike.templateId.trim()
+      : null;
+  if (explicitTemplateId && (BESTIARY as any)?.[explicitTemplateId]) {
+    return explicitTemplateId;
+  }
+
+  const byId = inferTemplateIdFromEntityId(String(entityLike?.id ?? "").trim());
+  if (byId && (BESTIARY as any)?.[byId]) {
+    return byId;
+  }
+
+  const normalizedName = String(entityLike?.name ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ");
+  const nameTokens = normalizedName
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4);
+  for (const token of nameTokens) {
+    if ((BESTIARY as any)?.[token]) {
+      return token;
+    }
+  }
+
+  return null;
 }
 
 function getEncounterTemplateIdForRoom(roomId: string, entityId: string): string | null {
@@ -389,7 +507,7 @@ function getEncounterTemplateIdForRoom(roomId: string, entityId: string): string
 // Types combat
 // ---------------------------------------------------------------------------
 
-export type GameMode = "exploration" | "combat";
+export type GameMode = "exploration" | "combat" | "short_rest";
 
 export interface CombatEntry {
   id: string;
@@ -411,6 +529,8 @@ interface GameContextValue {
   setPlayer: React.Dispatch<SetStateAction<Player | null>>;
   updatePlayer: (patch: Partial<Player>) => void;
   setHp: (value: number) => void;
+  worldTimeMinutes: number;
+  setWorldTimeMinutes: React.Dispatch<SetStateAction<number>>;
   // Démarrage
   isGameStarted: boolean;
   startGame: () => void;
@@ -476,6 +596,8 @@ interface GameContextValue {
   getRoomMemory: (roomId: string) => string;
   /** Met à jour la mémoire de salle seulement si cela change réellement un fait mémorisé. */
   appendRoomMemory: (roomId: string, line: string) => boolean;
+  /** Remplace ou efface la mémoire d'une salle ciblée. */
+  setRoomMemoryText: (roomId: string, text: string) => void;
   clearRoomMemory: () => void;
   // Mode de jeu
   gameMode: GameMode;
@@ -553,6 +675,7 @@ interface GameContextValue {
 
 const INITIAL_PLAYER: Player = {
   type: "player",
+  controller: "player",
   name: "Thorin Pied-de-Pierre",
   entityClass: "Guerrier",
   race: "Nain de Montagne",
@@ -575,6 +698,15 @@ const INITIAL_PLAYER: Player = {
   hitDie: "d10",
   hitDiceTotal: 1,
   hitDiceRemaining: 1,
+  deathState: {
+    successes: 0,
+    failures: 0,
+    stable: false,
+    unconscious: false,
+    dead: false,
+    autoRecoverAtMinute: null,
+  },
+  lastLongRestFinishedAtMinute: null,
   stats: {
     FOR: 16,
     DEX: 12,
@@ -600,6 +732,30 @@ const INITIAL_PLAYER: Player = {
     { name: "Arc Court",      attackBonus: 3, damageDice: "1d6", damageBonus: 1 },
   ],
 };
+
+function normalizeDeathState(raw: any, hpCurrent: number): DeathState {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const dead = source.dead === true;
+  const stable = !dead && source.stable === true;
+  const unconscious = dead ? false : source.unconscious === true || hpCurrent <= 0;
+  return {
+    successes:
+      typeof source.successes === "number" && Number.isFinite(source.successes)
+        ? Math.max(0, Math.min(3, Math.trunc(source.successes)))
+        : 0,
+    failures:
+      typeof source.failures === "number" && Number.isFinite(source.failures)
+        ? Math.max(0, Math.min(3, Math.trunc(source.failures)))
+        : 0,
+    stable,
+    unconscious,
+    dead,
+    autoRecoverAtMinute:
+      typeof source.autoRecoverAtMinute === "number" && Number.isFinite(source.autoRecoverAtMinute)
+        ? Math.max(0, Math.trunc(source.autoRecoverAtMinute))
+        : null,
+  };
+}
 
 function normalizePlayerShape(value: any): Player | null {
   if (!value || typeof value !== "object") return null;
@@ -627,24 +783,47 @@ function normalizePlayerShape(value: any): Player | null {
       : [];
   const acRaw = raw.ac ?? raw.armorClass;
   const ac = Number.isFinite(Number(acRaw)) ? Math.trunc(Number(acRaw)) : 10;
+  const level =
+    typeof raw.level === "number" && Number.isFinite(raw.level)
+      ? Math.max(1, Math.trunc(raw.level))
+      : 1;
+  const hitDiceTotal =
+    typeof raw.hitDiceTotal === "number" && Number.isFinite(raw.hitDiceTotal)
+      ? Math.max(1, Math.trunc(raw.hitDiceTotal))
+      : level;
+  const hitDiceRemaining =
+    typeof raw.hitDiceRemaining === "number" && Number.isFinite(raw.hitDiceRemaining)
+      ? Math.max(0, Math.min(hitDiceTotal, Math.trunc(raw.hitDiceRemaining)))
+      : hitDiceTotal;
+  const deathState = normalizeDeathState(raw.deathState, hp.current);
   return {
     ...rest,
     type: "player",
+    controller: "player",
     name: String(raw.name ?? raw.nom ?? "Joueur").trim() || "Joueur",
     entityClass:
       String(raw.entityClass ?? raw.classe ?? "Aventurier").trim() || "Aventurier",
     description:
       raw.description == null ? undefined : String(raw.description),
     visible: raw.visible !== false,
-    isAlive: hp.current > 0,
+    isAlive: deathState.dead !== true,
     hp,
     ac,
     inventory: inventorySource.map((x: any) => String(x ?? "").trim()).filter(Boolean),
     weapons: Array.isArray(raw.weapons) ? raw.weapons : [],
-    level:
-      typeof raw.level === "number" && Number.isFinite(raw.level)
-        ? Math.max(1, Math.trunc(raw.level))
-        : 1,
+    level,
+    hitDie:
+      typeof raw.hitDie === "string" && raw.hitDie.trim()
+        ? raw.hitDie.trim()
+        : undefined,
+    hitDiceTotal,
+    hitDiceRemaining,
+    deathState,
+    lastLongRestFinishedAtMinute:
+      typeof raw.lastLongRestFinishedAtMinute === "number" &&
+      Number.isFinite(raw.lastLongRestFinishedAtMinute)
+        ? Math.max(0, Math.trunc(raw.lastLongRestFinishedAtMinute))
+        : null,
     stats: raw.stats ?? { FOR: 10, DEX: 10, CON: 10, INT: 10, SAG: 10, CHA: 10 },
     skillProficiencies: Array.isArray(raw.skillProficiencies) ? raw.skillProficiencies : [],
   } as Player;
@@ -843,13 +1022,13 @@ const INITIAL_SCENE =
 // Persistance locale (F5 / tests)
 // ---------------------------------------------------------------------------
 
-const PERSISTENCE_KEY = "dnd-ai-master-game-state-v1";
-const PERSISTENCE_VERSION = 1;
+const PERSISTENCE_KEY = "dnd-ai-master-game-state-v2";
+const PERSISTENCE_VERSION = 2;
 
 /** Normalise les PV après chargement JSON (sauvegarde / cache par salle). */
 function normalizeLoadedEntitiesList(raw: unknown): Entity[] {
   if (!Array.isArray(raw)) return [];
-  return raw.map((e: any) => {
+  return coalesceLogicalEntityDuplicates(raw.map((e: any) => {
     const rawHp = e?.hp;
     let hp = rawHp;
     if (typeof rawHp === "number" && Number.isFinite(rawHp)) {
@@ -863,12 +1042,13 @@ function normalizeLoadedEntitiesList(raw: unknown): Entity[] {
       hp = null;
     }
     const normalizedType = normalizeEntityType(e?.type) ?? "npc";
+    const normalizedController = normalizeEntityController(e?.controller);
     const awareOfPlayer =
       typeof e?.awareOfPlayer === "boolean"
         ? e.awareOfPlayer
         : normalizedType === "hostile";
-    return { ...e, type: normalizedType, hp, awareOfPlayer } as Entity;
-  });
+    return { ...e, type: normalizedType, controller: normalizedController, hp, awareOfPlayer } as Entity;
+  }));
 }
 
 function isHostileReadyForCombat(entity: Entity | null | undefined): boolean {
@@ -877,6 +1057,7 @@ function isHostileReadyForCombat(entity: Entity | null | undefined): boolean {
 
 interface PersistedPayload {
   player: Player | null;
+  worldTimeMinutes: number;
   messages: Message[];
   pendingRoll: PendingRoll | null;
   isGameStarted: boolean;
@@ -943,6 +1124,11 @@ function resetRemainingResourcesDeep<T>(value: T): T {
 
 export function GameProvider({ children }: { children: ReactNode }) {
   const [player, setPlayerState]      = useState<Player | null>(null);
+  const [worldTimeMinutes, setWorldTimeMinutes] = useState<number>(
+    typeof CAMPAIGN_START_WORLD_TIME_MINUTES === "number" && Number.isFinite(CAMPAIGN_START_WORLD_TIME_MINUTES)
+      ? Math.max(0, Math.trunc(CAMPAIGN_START_WORLD_TIME_MINUTES))
+      : 0
+  );
   const [messages, setMessages]       = useState<Message[]>(INITIAL_MESSAGES);
   const [pendingRoll, setPendingRoll] = useState<PendingRoll | null>(null);
   const [isGameStarted, setIsGameStarted] = useState<boolean>(false);
@@ -951,7 +1137,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const [currentRoomId, setCurrentRoomId] = useState<string>("scene_village");
   const [sceneVersion, setSceneVersion] = useState<number>(0);
   // On ne conserve que les créatures (pas les objets de décor) dans l'état de jeu.
-  const [entities, setEntities]       = useState<Entity[]>(INITIAL_ENTITIES.filter((e) => e.type !== "object"));
+  const [entities, setEntities]       = useState<Entity[]>(
+    normalizeLoadedEntitiesList(INITIAL_ENTITIES).filter((e) => e.type !== "object")
+  );
   const [gameMode, setGameModeState] = useState<GameMode>("exploration");
 
   const entitiesRef = useRef<Entity[]>(entities);
@@ -1083,6 +1271,23 @@ export function GameProvider({ children }: { children: ReactNode }) {
     return true;
   }, []);
 
+  const setRoomMemoryText = useCallback((roomId: string, text: string) => {
+    if (!roomId || typeof roomId !== "string") return;
+    const normalized = String(text ?? "")
+      .split("\n")
+      .map((line) => normalizeRoomMemoryLine(line))
+      .filter(Boolean)
+      .join("\n");
+    const prev = roomMemoryByRoomRef.current;
+    const old = prev[roomId] ?? "";
+    if (normalized === old) return;
+    const next = { ...prev };
+    if (normalized) next[roomId] = normalized;
+    else delete next[roomId];
+    roomMemoryByRoomRef.current = next;
+    setRoomMemoryByRoom(next);
+  }, []);
+
   const clearRoomMemory = useCallback(() => {
     roomMemoryByRoomRef.current = {};
     setRoomMemoryByRoom({});
@@ -1182,6 +1387,11 @@ export function GameProvider({ children }: { children: ReactNode }) {
       }
       const p = data.payload;
       setPlayerState(normalizePlayerShape(p.player ?? null));
+      setWorldTimeMinutes(
+        typeof p.worldTimeMinutes === "number" && Number.isFinite(p.worldTimeMinutes)
+          ? Math.max(0, Math.trunc(p.worldTimeMinutes))
+          : 0
+      );
       if (Array.isArray(p.messages) && p.messages.length > 0) {
         const cleaned = p.messages.filter((m) => (m as Message).type !== "scene-image-pending");
         setMessages(cleaned);
@@ -1219,9 +1429,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
         setRoomMemoryByRoom({});
       }
       const hostileAlive = loadedEntities.some((e) => isHostileReadyForCombat(e));
-      if (p.gameMode === "combat" || p.gameMode === "exploration") {
+      if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
         const want = p.gameMode;
-        setGameModeState(want === "exploration" && hostileAlive ? "combat" : want);
+        setGameModeState((want === "exploration" || want === "short_rest") && hostileAlive ? "combat" : want);
       }
       if (Array.isArray(p.combatOrder)) setCombatOrder(p.combatOrder);
       setCombatTurnIndex(typeof p.combatTurnIndex === "number" ? p.combatTurnIndex : 0);
@@ -1260,7 +1470,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setPersistenceReady(true);
   }, []);
 
-  // Hostiles engagés → combat obligatoire (filet de sécurité si gameMode resterait en exploration)
+  // Hostiles qui vous ont repéré → combat obligatoire en exploration uniquement.
+  // En repos court, on ne force pas le combat (l'entrée en repos est déjà refusée si menace immédiate).
   useEffect(() => {
     if (gameMode !== "exploration") return;
     if (entities.some((e) => isHostileReadyForCombat(e))) {
@@ -1277,6 +1488,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       try {
         const payload: PersistedPayload = {
           player,
+          worldTimeMinutes,
           messages,
           pendingRoll,
           isGameStarted,
@@ -1318,6 +1530,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
   }, [
     persistenceReady,
     player,
+    worldTimeMinutes,
     messages,
     pendingRoll,
     isGameStarted,
@@ -1448,9 +1661,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setPlayer((prev) => {
       if (!prev || !prev.hp) return prev;
       const nextCurrent = Math.max(0, Math.min(value, prev.hp.max));
+      const nextDeathState =
+        nextCurrent > 0
+          ? normalizeDeathState(null, nextCurrent)
+          : normalizeDeathState(prev.deathState, nextCurrent);
       return {
         ...prev,
-        isAlive: nextCurrent > 0,
+        isAlive: nextDeathState.dead !== true,
+        deathState: nextDeathState,
         hp: {
           ...prev.hp,
           current: nextCurrent,
@@ -1546,6 +1764,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
         if (action === "kill" || action === "remove") {
           currentPlayer = {
             ...currentPlayer,
+            controller: "player",
             isAlive: false,
             hp: {
               ...currentPlayer.hp,
@@ -1560,6 +1779,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
         const merged: Player = {
           ...currentPlayer,
+          controller: "player",
           ...(update.name !== undefined && { name: String(update.name ?? "").trim() || currentPlayer.name }),
           ...(update.visible !== undefined && { visible: update.visible }),
           ...(update.race !== undefined && { race: update.race }),
@@ -1628,6 +1848,21 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
         if (typeof update.acDelta === "number" && Number.isFinite(update.acDelta)) {
           merged.ac = merged.ac + update.acDelta;
+        }
+
+        if (typeof update.hitDiceTotal === "number" && Number.isFinite(update.hitDiceTotal)) {
+          merged.hitDiceTotal = Math.max(1, Math.trunc(update.hitDiceTotal));
+        }
+        const hitDiceCap =
+          merged.hitDiceTotal ?? currentPlayer.hitDiceTotal ?? currentPlayer.level ?? 1;
+        if (typeof update.hitDiceRemaining === "number" && Number.isFinite(update.hitDiceRemaining)) {
+          merged.hitDiceRemaining = Math.max(
+            0,
+            Math.min(hitDiceCap, Math.trunc(update.hitDiceRemaining))
+          );
+        } else if (typeof update.hitDiceTotal === "number" && Number.isFinite(update.hitDiceTotal)) {
+          const prevRem = currentPlayer.hitDiceRemaining ?? 0;
+          merged.hitDiceRemaining = Math.min(hitDiceCap, prevRem);
         }
 
         currentPlayer = merged;
@@ -1728,9 +1963,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
               ? update.templateId.trim()
               : null) ??
             (incomingId ? getEncounterTemplateIdForRoom(currentRoomId, incomingId) : null) ??
-            (incomingId ? inferTemplateIdFromEntityId(incomingId) : null);
+            (incomingId ? inferTemplateIdFromEntityId(incomingId) : null) ??
+            inferTemplateIdFromEntityLike(update);
           const template =
             templateId && (BESTIARY as any)?.[templateId] ? (BESTIARY as any)[templateId] : null;
+          const providedRaw = update.name;
+          const providedName = typeof providedRaw === "string" ? providedRaw.trim() : "";
+          const resolvedSpawnName =
+            providedName || String(template?.name ?? "").trim() || incomingId || "";
           const resolvedSpawnId =
             incomingId ??
             nextSpawnId(
@@ -1748,22 +1988,30 @@ export function GameProvider({ children }: { children: ReactNode }) {
             // On ignore désormais les objets de décor : seules les créatures sont conservées.
             continue;
           }
-          const providedRaw = update.name;
-          const providedName = typeof providedRaw === "string" ? providedRaw.trim() : "";
           const idx = current.findIndex((e) => e.id === resolvedSpawnId);
+          const logicalDuplicateIdx =
+            resolvedSpawnName
+              ? current.findIndex((e) =>
+                  normalizeEntityNameKey(e?.name) === normalizeEntityNameKey(resolvedSpawnName) &&
+                  normalizeEntityType(e?.type) === (normType ?? "npc")
+                )
+              : -1;
+          const mergeIdx = idx >= 0 ? idx : logicalDuplicateIdx;
 
           // Anti-clone : même id déjà en jeu → fusion (évite Gobelin C/D si l'IA respawn le même id)
-          if (idx >= 0) {
-            const ent = current[idx];
-            const mergedName = providedName || ent.name;
+          if (mergeIdx >= 0) {
+            const ent = current[mergeIdx];
+            const mergedName = resolvedSpawnName || ent.name;
             const nt = normType ?? ent.type;
             current = current.map((e, i) =>
-              i !== idx
+              i !== mergeIdx
                 ? e
                 : {
                     ...e,
+                    templateId: templateId ?? e.templateId,
                     name: mergedName,
                     type: nt,
+                    controller: normalizeEntityController(update.controller ?? ent.controller),
                     ...(update.race !== undefined && { race: update.race }),
                     ...(update.entityClass !== undefined && { entityClass: update.entityClass }),
                     ...(update.cr !== undefined && { cr: update.cr }),
@@ -1794,13 +2042,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
             continue;
           }
 
-          const resolvedSpawnName =
-            providedName || String(template?.name ?? "").trim() || resolvedSpawnId;
+          const resolvedController = normalizeEntityController(update.controller);
 
           const newEntity: Entity = {
             id: resolvedSpawnId,
+            templateId: templateId ?? undefined,
             name: resolvedSpawnName,
             type: normType ?? "npc",
+            controller: resolvedController,
             race: update.race ?? template?.race ?? "Inconnu",
             entityClass: update.entityClass ?? template?.entityClass ?? "Inconnu",
             cr: update.cr ?? template?.cr ?? 0,
@@ -1843,14 +2092,25 @@ export function GameProvider({ children }: { children: ReactNode }) {
           current = current.map((e) => {
             if (e.id !== updateId) return e;
             const normType = update.type !== undefined ? normalizeEntityType(update.type) : undefined;
+            const inferredTemplateId =
+              (typeof update.templateId === "string" && update.templateId.trim()
+                ? update.templateId.trim()
+                : null) ??
+              inferTemplateIdFromEntityLike({ ...e, ...update, id: updateId });
+            const template =
+              inferredTemplateId && (BESTIARY as any)?.[inferredTemplateId]
+                ? (BESTIARY as any)[inferredTemplateId]
+                : null;
             // Si on nous demande de transformer une entité en "object", on la retire simplement.
             if (normType === "object") {
               return null as any;
             }
-            const merged = {
+            const merged: Entity = {
               ...e,
+              ...(inferredTemplateId && { templateId: inferredTemplateId }),
               ...(update.name        !== undefined && { name:        update.name }),
               ...(update.type        !== undefined && normType && { type: normType ?? e.type }),
+              ...(update.controller  !== undefined && { controller: normalizeEntityController(update.controller) }),
               ...(update.race        !== undefined && { race:        update.race }),
               ...(update.entityClass !== undefined && { entityClass: update.entityClass }),
               ...(update.cr          !== undefined && { cr:          update.cr }),
@@ -1878,6 +2138,40 @@ export function GameProvider({ children }: { children: ReactNode }) {
               ...(update.surprised   !== undefined && { surprised:   !!update.surprised }),
               ...(update.awareOfPlayer !== undefined && { awareOfPlayer: !!update.awareOfPlayer }),
             };
+            if (update.hp !== undefined) {
+              merged.isAlive = (merged.hp?.current ?? 0) > 0;
+            }
+            const nextType = normType ?? merged.type;
+            if (nextType === "hostile" && template) {
+              if (!merged.race) merged.race = template.race ?? merged.race;
+              if (!merged.entityClass || merged.entityClass === "Inconnu") {
+                merged.entityClass = template.entityClass ?? merged.entityClass;
+              }
+              if (merged.cr == null) merged.cr = template.cr ?? merged.cr;
+              if (merged.ac == null) merged.ac = template.ac ?? merged.ac;
+              if (!merged.stats) merged.stats = template.stats ?? merged.stats;
+              if (merged.attackBonus == null) merged.attackBonus = template.attackBonus ?? merged.attackBonus;
+              if (!merged.damageDice) merged.damageDice = template.damageDice ?? merged.damageDice;
+              if (merged.damageBonus == null) merged.damageBonus = template.damageBonus ?? merged.damageBonus;
+              if (!Array.isArray(merged.weapons) || merged.weapons.length === 0) {
+                merged.weapons = template.weapons ?? merged.weapons;
+              }
+              if (!Array.isArray(merged.features) || merged.features.length === 0) {
+                merged.features = template.features ?? merged.features;
+              }
+              if (!Array.isArray(merged.selectedSpells) || merged.selectedSpells.length === 0) {
+                merged.selectedSpells = template.selectedSpells ?? merged.selectedSpells;
+              }
+              if (!merged.spellSlots) merged.spellSlots = template.spellSlots ?? merged.spellSlots;
+              if (merged.spellAttackBonus == null) {
+                merged.spellAttackBonus = template.spellAttackBonus ?? merged.spellAttackBonus;
+              }
+              if (merged.spellSaveDc == null) {
+                merged.spellSaveDc = template.spellSaveDc ?? merged.spellSaveDc;
+              }
+              if (!merged.description) merged.description = template.description ?? merged.description;
+              if (merged.stealthDc == null) merged.stealthDc = template.stealthDc ?? merged.stealthDc;
+            }
             return applyDerivedModifiers(merged, update);
           }).filter(Boolean) as Entity[];
         } else if (update.action === "kill") {
@@ -2086,7 +2380,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
   function replaceEntities(next: Entity[]) {
     // Ne conserver que les entités non-objets (créatures, PNJ, hostiles).
-    setEntities(next.filter((e) => e.type !== "object"));
+    setEntities(normalizeLoadedEntitiesList(next).filter((e) => e.type !== "object"));
     setCombatOrder([]);
     setCombatTurnIndex(0);
     setGameModeState("exploration");
@@ -2116,9 +2410,18 @@ export function GameProvider({ children }: { children: ReactNode }) {
       const restored = resetRemainingResourcesDeep(seed);
       return {
         ...restored,
+        isAlive: true,
         hp: { ...restored.hp, current: restored.hp.max },
+        hitDiceRemaining: restored.hitDiceTotal ?? restored.level ?? 1,
+        deathState: normalizeDeathState(null, restored.hp.max),
+        lastLongRestFinishedAtMinute: null,
       };
     });
+    setWorldTimeMinutes(
+      typeof CAMPAIGN_START_WORLD_TIME_MINUTES === "number" && Number.isFinite(CAMPAIGN_START_WORLD_TIME_MINUTES)
+        ? Math.max(0, Math.trunc(CAMPAIGN_START_WORLD_TIME_MINUTES))
+        : 0
+    );
     setMeleeState({});
     setReactionState({});
     setEngagedWithId(null);
@@ -2136,7 +2439,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setCurrentSceneImage("/file.svg");
 
     // État de combat / entités : initialiser quelques PNJ présents dès l'intro
-    setEntities([
+    setEntities(normalizeLoadedEntitiesList([
       {
         id: "thron",
         name: "Thron",
@@ -2175,7 +2478,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           "Jeune homme nerveux, les mains sales de farine; témoin de l'enlèvement, il évite votre regard.",
         stealthDc: null,
       },
-    ]);
+    ]));
     setCombatOrder([]);
     setCombatTurnIndex(0);
     setGameModeState("exploration");
@@ -2234,6 +2537,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
     <GameContext.Provider value={{
       player, updatePlayer, setHp,
       setPlayer,
+      worldTimeMinutes,
+      setWorldTimeMinutes,
       isGameStarted, startGame,
       messages, addMessage, appendSceneImagePendingSlot, updateMessage, removeMessagesByIds,
       pendingRoll, setPendingRoll,
@@ -2243,7 +2548,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       currentRoomId, setCurrentRoomId,
       entities, applyEntityUpdates, replaceEntities, clearEntities,
       rememberRoomEntitiesSnapshot, takeEntitiesForRoom, clearRoomEntitySnapshots,
-      getRoomMemory, appendRoomMemory, clearRoomMemory,
+      getRoomMemory, appendRoomMemory, setRoomMemoryText, clearRoomMemory,
       gameMode, setGameMode,
       combatOrder, setCombatOrder,
       combatTurnIndex, setCombatTurnIndex,

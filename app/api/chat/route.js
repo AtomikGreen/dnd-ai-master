@@ -5,7 +5,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAICacheManager } from "@google/generative-ai/server";
 import { NextResponse } from "next/server";
-import { CAMPAIGN_CONTEXT, GOBLIN_CAVE } from "@/data/campaign";
+import { CAMPAIGN_CONTEXT, GOBLIN_CAVE, getVisibleExitsForRoom } from "@/data/campaign";
 import { logInteraction } from "@/lib/aiTraceLog";
 import {
   buildDynamicContext,
@@ -25,7 +25,7 @@ const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
 const GEMINI_MODEL     = "gemini-3-flash-preview";
 const NARRATOR_CACHE_TTL_SECONDS = 3 * 60 * 60;
 /** Incrémenter ou purger le cache Gemini quand getStaticSystemRules() change matériellement. */
-const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v13";
+const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v21";
 let narratorCachePromise = null;
 /** Active le Context Caching : seul getStaticSystemRules() est stocké côté API ; le tour courant passe en JSON (dynamicContext). */
 const USE_GEMINI_CACHE = process.env.USE_GEMINI_CACHE === "true";
@@ -99,6 +99,14 @@ function buildOpenRouterMessages(messages, systemInstruction) {
 function truncateText(s, n = 800) {
   const str = typeof s === "string" ? s : String(s ?? "");
   return str.length > n ? str.slice(0, n) + "…" : str;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function elapsedMsSince(t0) {
+  return Date.now() - t0;
 }
 
 function safeGeminiResponseText(generateContentResult) {
@@ -187,7 +195,7 @@ const NARRATOR_JSON_FALLBACK_REPLY =
   "Le narrateur n'a pas pu achever une réponse lisible (sortie interrompue ou mal formée). Tu peux réessayer dans un instant ou reformuler ton action en une courte phrase.";
 
 const GEMINI_RECENT_CHAT_INSTRUCTION =
-  "Utilise recentChat pour le ton et la continuité. Si le dernier message assistant a déjà couvert le même lieu / le même danger (ex. piège repéré, même couloir), ta narration doit être TRÈS courte : 1 à 2 phrases, ~35–55 mots max, sans re-décrire le décor ni les issues. Ne cumule pas impasse + sorties + ambiance dans le même message.";
+  "Utilise recentChat pour le ton et la continuité. Si le dernier message assistant a déjà couvert presque exactement le même lieu, le même danger ou le même constat, sois plus concis et n'en refais pas une description complète. Mais si un vrai nouveau lieu, une vraie découverte, ou un élément marquant apparaît, tu peux reprendre de l'ampleur. Ne tends pas vers une longueur uniforme d'un message à l'autre.";
 
 function buildNarratorClientResponse(raw) {
   if (!detectFormatIssue(raw)) {
@@ -552,22 +560,6 @@ function tryParseJsonLenient(raw) {
   return null;
 }
 
-/** Si le modèle dépasse encore la consigne, coupe à une fin de phrase propre quand c’est possible. */
-function clampNarrativeLength(reply, maxWords = 95) {
-  const s = String(reply ?? "").trim();
-  if (!s) return s;
-  const words = s.split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return s;
-  const slice = words.slice(0, maxWords).join(" ");
-  const cut = Math.max(
-    slice.lastIndexOf(". "),
-    slice.lastIndexOf("? "),
-    slice.lastIndexOf("! ")
-  );
-  if (cut > 24) return slice.slice(0, cut + 1).trim();
-  return `${slice}…`;
-}
-
 function parseResponse(raw, existingEntities = []) {
   try {
     const parsed = tryParseJsonLenient(raw);
@@ -588,12 +580,15 @@ function parseResponse(raw, existingEntities = []) {
       typeof textContent === "string"
         ? textContent.trim()
         : JSON.stringify(textContent);
-    reply = clampNarrativeLength(reply, 95);
     if (reply === "") {
       console.warn("JSON PARSING WARNING: Missing narrative key. Raw data:", data);
     }
 
-    let imageDecision = null;
+    let imageDecision = {
+      shouldGenerate: false,
+      reason: "",
+      focus: "",
+    };
     if (data.imageDecision && typeof data.imageDecision === "object" && !Array.isArray(data.imageDecision)) {
       const shouldGenerate = data.imageDecision.shouldGenerate === true;
       const reason = String(data.imageDecision.reason ?? "").trim();
@@ -621,8 +616,12 @@ function parseResponse(raw, existingEntities = []) {
   } catch {
     return {
       valid: true,
-      reply: clampNarrativeLength(String(raw ?? "").trim(), 95),
-      imageDecision: null,
+      reply: String(raw ?? "").trim(),
+      imageDecision: {
+        shouldGenerate: false,
+        reason: "",
+        focus: "",
+      },
       rollRequest: null,
       actionIntent: null,
       gameMode: null,
@@ -657,10 +656,20 @@ function detectFormatIssue(raw) {
   if (typeof narrative !== "string") return "narrative non-string";
   if (!narrative.trim()) return "narrative manquante ou vide";
   const img = data.imageDecision;
-  if (!img || typeof img !== "object" || Array.isArray(img)) return "imageDecision manquante ou invalide (objet requis)";
-  if (typeof img.shouldGenerate !== "boolean") return "imageDecision.shouldGenerate manquant ou non-booléen";
-  if (typeof img.reason !== "string") return "imageDecision.reason manquant ou non-string";
-  if (typeof img.focus !== "string") return "imageDecision.focus manquant ou non-string";
+  if (img != null) {
+    if (typeof img !== "object" || Array.isArray(img)) {
+      return "imageDecision invalide (objet requis si présent)";
+    }
+    if (img.shouldGenerate != null && typeof img.shouldGenerate !== "boolean") {
+      return "imageDecision.shouldGenerate non-booléen";
+    }
+    if (img.reason != null && typeof img.reason !== "string") {
+      return "imageDecision.reason non-string";
+    }
+    if (img.focus != null && typeof img.focus !== "string") {
+      return "imageDecision.focus non-string";
+    }
+  }
   return null;
 }
 
@@ -669,6 +678,10 @@ function detectFormatIssue(raw) {
 // ---------------------------------------------------------------------------
 export async function POST(request) {
   try {
+    const t0 = Date.now();
+    const phaseTimestamps = {
+      start: nowIso(),
+    };
     const body = await request.json();
     const {
       messages,
@@ -681,6 +694,8 @@ export async function POST(request) {
       engineEvent = null,
       roomMemory = "",
       debugMode = false,
+      worldTimeMinutes = null,
+      worldTimeLabel = "",
     } = body;
 
     console.log(
@@ -706,7 +721,7 @@ export async function POST(request) {
     const roomId = typeof currentRoomId === "string" ? currentRoomId.trim() : "";
     const currentRoom = roomId && GOBLIN_CAVE[roomId] ? GOBLIN_CAVE[roomId] : null;
     if (currentRoom) {
-      const exits = Array.isArray(currentRoom.exits) ? currentRoom.exits : [];
+      const exits = getVisibleExitsForRoom(roomId, roomMemory ?? "");
       const allowedExits = exits
         .map((exitDef) => {
           const exitId =
@@ -720,15 +735,12 @@ export async function POST(request) {
           const r = GOBLIN_CAVE[exitId];
           return r
             ? {
-                id: r.id,
-                title: r.title ?? r.id,
                 description: exitDesc || (r.description ?? ""),
               }
             : null;
         })
         .filter(Boolean);
       campaignContext = {
-        currentRoomTitle: currentRoom.title ?? roomId,
         allowedExits,
         encounterEntities: Array.isArray(currentRoom.encounterEntities)
           ? currentRoom.encounterEntities
@@ -749,7 +761,9 @@ export async function POST(request) {
       gameMode,
       engineEvent,
       campaignContext,
-      roomMemory
+      roomMemory,
+      worldTimeMinutes,
+      worldTimeLabel
     );
     const staticSystemRules = getStaticSystemRules();
     /** Même ordre que l’ancien prompt monolithique : faits de partie puis règles invariantes. */
@@ -765,6 +779,24 @@ export async function POST(request) {
       recentChat,
       recentChatInstruction: GEMINI_RECENT_CHAT_INSTRUCTION,
     };
+    const narratorPromptMetrics = {
+      currentSceneChars: String(sceneStr ?? "").length,
+      entitiesCount: Array.isArray(entities) ? entities.length : 0,
+      recentChatCount: recentChat.length,
+      recentChatChars: recentChat.reduce((sum, m) => sum + String(m?.content ?? "").length, 0),
+      filteredMessageCount: Array.isArray(limitedMessages) ? limitedMessages.length : 0,
+      dynamicContextChars: String(dynamicContext ?? "").length,
+      staticRulesChars: String(staticSystemRules ?? "").length,
+      playerMessageChars: String(userMessage ?? "").length,
+      engineEventChars: engineEvent ? JSON.stringify(engineEvent).length : 0,
+      cacheEnabled: USE_GEMINI_CACHE,
+    };
+    console.info("[/api/chat] start", {
+      provider,
+      roomId: String(currentRoomId ?? ""),
+      gameMode,
+      metrics: narratorPromptMetrics,
+    });
 
     // -----------------------------------------------------------------------
     // Chemin A : Google Gemini (SDK natif)
@@ -833,6 +865,12 @@ export async function POST(request) {
               });
             }
           }
+          phaseTimestamps.afterModel = nowIso();
+          console.info("[/api/chat] after-model", {
+            elapsedMs: elapsedMsSince(t0),
+            provider: "gemini-cache",
+            rawChars: String(raw ?? "").length,
+          });
 
           const clientPack = buildNarratorClientResponse(raw);
           const parsed = clientPack.response;
@@ -840,14 +878,36 @@ export async function POST(request) {
           if (narratorFallback) {
             console.warn("[/api/chat] Narrateur: message de secours (JSON irrécupérable).");
           }
-
-          await logInteraction("GM", "gemini-cache", geminiDynamicInput, staticSystemRules, raw, parsed, {
+          phaseTimestamps.responseSent = nowIso();
+          console.info("[/api/chat] response-sent", {
+            elapsedMs: elapsedMsSince(t0),
+            provider: "gemini-cache",
+            status: 200,
+          });
+          void logInteraction("GM", "gemini-cache", geminiDynamicInput, staticSystemRules, raw, parsed, {
             formatRetryUsed,
             formatRetryReason,
             firstAttemptRaw,
             formatEmergencyUsed,
             narratorFallback,
             geminiGeneration: { attempts: geminiAttempts },
+            promptMetrics: narratorPromptMetrics,
+            timing: {
+              phases: phaseTimestamps,
+              elapsedMs: {
+                totalBeforeReturn: elapsedMsSince(t0),
+                model: phaseTimestamps.afterModel
+                  ? new Date(phaseTimestamps.afterModel).getTime() - new Date(phaseTimestamps.start).getTime()
+                  : null,
+              },
+              note: "responseSent correspond au moment où la réponse est préparée et rendue au runtime serveur.",
+            },
+          }).then(() => {
+            console.info("[/api/chat] after-log", {
+              elapsedMs: elapsedMsSince(t0),
+              provider: "gemini-cache",
+              status: 200,
+            });
           });
           return NextResponse.json({
             ...parsed,
@@ -930,6 +990,12 @@ export async function POST(request) {
           });
         }
       }
+      phaseTimestamps.afterModel = nowIso();
+      console.info("[/api/chat] after-model", {
+        elapsedMs: elapsedMsSince(t0),
+        provider: "gemini",
+        rawChars: String(raw ?? "").length,
+      });
 
       const clientPack = buildNarratorClientResponse(raw);
       const parsed = clientPack.response;
@@ -937,14 +1003,36 @@ export async function POST(request) {
       if (narratorFallback) {
         console.warn("[/api/chat] Narrateur: message de secours (JSON irrécupérable, mode sans cache).");
       }
-
-      await logInteraction("GM", "gemini", geminiDynamicInput, staticSystemRules, raw, parsed, {
+      phaseTimestamps.responseSent = nowIso();
+      console.info("[/api/chat] response-sent", {
+        elapsedMs: elapsedMsSince(t0),
+        provider: "gemini",
+        status: 200,
+      });
+      void logInteraction("GM", "gemini", geminiDynamicInput, staticSystemRules, raw, parsed, {
         formatRetryUsed,
         formatRetryReason,
         firstAttemptRaw,
         formatEmergencyUsed,
         narratorFallback,
         geminiGeneration: { attempts: geminiAttempts },
+        promptMetrics: narratorPromptMetrics,
+        timing: {
+          phases: phaseTimestamps,
+          elapsedMs: {
+            totalBeforeReturn: elapsedMsSince(t0),
+            model: phaseTimestamps.afterModel
+              ? new Date(phaseTimestamps.afterModel).getTime() - new Date(phaseTimestamps.start).getTime()
+              : null,
+          },
+          note: "responseSent correspond au moment où la réponse est préparée et rendue au runtime serveur.",
+        },
+      }).then(() => {
+        console.info("[/api/chat] after-log", {
+          elapsedMs: elapsedMsSince(t0),
+          provider: "gemini",
+          status: 200,
+        });
       });
       return NextResponse.json({
         ...parsed,
@@ -1029,6 +1117,12 @@ export async function POST(request) {
         raw = retryData.choices?.[0]?.message?.content ?? raw;
       }
     }
+    phaseTimestamps.afterModel = nowIso();
+    console.info("[/api/chat] after-model", {
+      elapsedMs: elapsedMsSince(t0),
+      provider: "openrouter",
+      rawChars: String(raw ?? "").length,
+    });
 
     // parseResponse est déjà blindé (fallback narration brute si JSON foireux)
     const safe = parseResponse(raw, entities);
@@ -1038,10 +1132,33 @@ export async function POST(request) {
       messagesOrdered: limitedMessages,
       messages: openRouterMessages,
     };
-    await logInteraction("GM", "openrouter", dynamicInputOpenRouter, staticSystemRules, raw, safe, {
+    phaseTimestamps.responseSent = nowIso();
+    console.info("[/api/chat] response-sent", {
+      elapsedMs: elapsedMsSince(t0),
+      provider: "openrouter",
+      status: 200,
+    });
+    void logInteraction("GM", "openrouter", dynamicInputOpenRouter, staticSystemRules, raw, safe, {
       formatRetryUsed,
       formatRetryReason,
       firstAttemptRaw,
+      promptMetrics: narratorPromptMetrics,
+      timing: {
+        phases: phaseTimestamps,
+        elapsedMs: {
+          totalBeforeReturn: elapsedMsSince(t0),
+          model: phaseTimestamps.afterModel
+            ? new Date(phaseTimestamps.afterModel).getTime() - new Date(phaseTimestamps.start).getTime()
+            : null,
+        },
+        note: "responseSent correspond au moment où la réponse est préparée et rendue au runtime serveur.",
+      },
+    }).then(() => {
+      console.info("[/api/chat] after-log", {
+        elapsedMs: elapsedMsSince(t0),
+        provider: "openrouter",
+        status: 200,
+      });
     });
     return NextResponse.json({
       ...safe,

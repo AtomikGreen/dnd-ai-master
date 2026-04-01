@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react
 import { useGame } from "@/context/GameContext";
 import { playBip } from "@/lib/sounds";
 import { ARMORS, SPELLS, WEAPONS, ROGUE_SNEAK_ATTACK_DICE_BY_LEVEL } from "@/data/srd5";
-import { GOBLIN_CAVE } from "@/data/campaign";
+import { GOBLIN_CAVE, getVisibleExitsForRoom } from "@/data/campaign";
 import { BESTIARY } from "@/data/bestiary";
 import SceneImage from "./SceneImage";
 import { resolveCombatantDisplayName } from "@/lib/combatDisplayName";
@@ -91,13 +91,17 @@ function repairMojibakeForDisplay(input) {
  * Ex: rollDiceDetailed("2d6") â†’ { total: 9, rolls: [4, 5], notation: "2d6" }
  */
 function rollDiceDetailed(notation) {
-  const m = String(notation ?? "1d4").match(/^(\d+)d(\d+)$/i);
-  if (!m) return { total: 1, rolls: [1], notation: notation ?? "1d4" };
-  const count = parseInt(m[1]);
-  const sides = parseInt(m[2]);
+  const raw = String(notation ?? "1d4").trim();
+  const m = raw.match(/^(\d+)d(\d+)$/i) ?? raw.match(/^d(\d+)$/i);
+  if (!m) return { total: 1, rolls: [1], notation: raw || "1d4" };
+  const count = m.length === 2 ? 1 : parseInt(m[1]);
+  const sides = m.length === 2 ? parseInt(m[1]) : parseInt(m[2]);
+  if (!Number.isFinite(count) || !Number.isFinite(sides) || count <= 0 || sides <= 0) {
+    return { total: 1, rolls: [1], notation: raw || "1d4" };
+  }
   const rolls = [];
   for (let i = 0; i < count; i++) rolls.push(Math.floor(Math.random() * sides) + 1);
-  return { total: rolls.reduce((a, b) => a + b, 0), rolls, notation };
+  return { total: rolls.reduce((a, b) => a + b, 0), rolls, notation: raw };
 }
 
 /** Retourne uniquement le total (wrapper simple). */
@@ -360,6 +364,13 @@ function applyUpdatesLocally(entities, updates) {
   if (!updates?.length) return entities;
   let current = [...entities];
   const normalizeType = (t) => (t === "monster" ? "hostile" : t);
+  const normalizeNameKey = (value) =>
+    String(value ?? "")
+      .trim()
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ");
   const toSafeIdBase = (s) =>
     String(s ?? "")
       .trim()
@@ -419,6 +430,7 @@ function applyUpdatesLocally(entities, updates) {
         if (e.id !== upd.id) return e;
         const merged = {
           ...e,
+          ...(upd.templateId !== undefined && { templateId: upd.templateId }),
           ...(upd.name !== undefined && { name: upd.name }),
           ...(upd.type !== undefined && { type: normalizeType(upd.type) ?? e.type }),
           ...(upd.race !== undefined && { race: upd.race }),
@@ -438,9 +450,47 @@ function applyUpdatesLocally(entities, updates) {
           ...(upd.looted !== undefined && { looted: upd.looted }),
           ...(upd.surprised !== undefined && { surprised: !!upd.surprised }),
           ...(upd.awareOfPlayer !== undefined && { awareOfPlayer: !!upd.awareOfPlayer }),
+          ...(upd.controller !== undefined && { controller: upd.controller }),
         };
         if (upd.hp !== undefined) {
           merged.hp = normalizeHpShape(upd.hp, e.hp ?? null);
+          merged.isAlive = (merged.hp?.current ?? 0) > 0;
+        }
+        const nextType = normalizeType(upd.type) ?? merged.type;
+        const inferredTemplateId =
+          (typeof upd.templateId === "string" && upd.templateId.trim() ? upd.templateId.trim() : null) ??
+          inferBestiaryTemplateIdForEntity({ ...merged, ...upd });
+        const template = inferredTemplateId && BESTIARY?.[inferredTemplateId] ? BESTIARY[inferredTemplateId] : null;
+        if (nextType === "hostile" && template) {
+          if (!merged.templateId) merged.templateId = inferredTemplateId;
+          if (!merged.race) merged.race = template.race ?? merged.race;
+          if (!merged.entityClass || merged.entityClass === "Inconnu") {
+            merged.entityClass = template.entityClass ?? merged.entityClass;
+          }
+          if (merged.cr == null) merged.cr = template.cr ?? merged.cr;
+          if (merged.ac == null) merged.ac = template.ac ?? merged.ac;
+          if (!merged.stats) merged.stats = template.stats ?? merged.stats;
+          if (merged.attackBonus == null) merged.attackBonus = template.attackBonus ?? merged.attackBonus;
+          if (!merged.damageDice) merged.damageDice = template.damageDice ?? merged.damageDice;
+          if (merged.damageBonus == null) merged.damageBonus = template.damageBonus ?? merged.damageBonus;
+          if (!Array.isArray(merged.weapons) || merged.weapons.length === 0) {
+            merged.weapons = template.weapons ?? merged.weapons;
+          }
+          if (!Array.isArray(merged.features) || merged.features.length === 0) {
+            merged.features = template.features ?? merged.features;
+          }
+          if (!Array.isArray(merged.selectedSpells) || merged.selectedSpells.length === 0) {
+            merged.selectedSpells = template.selectedSpells ?? merged.selectedSpells;
+          }
+          if (!merged.spellSlots) merged.spellSlots = template.spellSlots ?? merged.spellSlots;
+          if (merged.spellAttackBonus == null) {
+            merged.spellAttackBonus = template.spellAttackBonus ?? merged.spellAttackBonus;
+          }
+          if (merged.spellSaveDc == null) {
+            merged.spellSaveDc = template.spellSaveDc ?? merged.spellSaveDc;
+          }
+          if (!merged.description) merged.description = template.description ?? merged.description;
+          if (merged.stealthDc == null) merged.stealthDc = template.stealthDc ?? merged.stealthDc;
         }
         return merged;
       });
@@ -450,19 +500,30 @@ function applyUpdatesLocally(entities, updates) {
         (typeof upd.templateId === "string" && upd.templateId.trim() ? upd.templateId.trim() : null) ??
         (incomingId ? incomingId.replace(/_\d+$/g, "") : null);
       const template = templateId && BESTIARY?.[templateId] ? BESTIARY[templateId] : null;
+      const providedName = typeof upd.name === "string" ? upd.name.trim() : "";
+      const resolvedSpawnName = providedName || String(template?.name ?? "").trim() || incomingId || "";
+      const logicalDuplicateIdx =
+        resolvedSpawnName
+          ? current.findIndex((e) =>
+              normalizeNameKey(e?.name) === normalizeNameKey(resolvedSpawnName) &&
+              normalizeType(e?.type) === (normalizeType(upd.type ?? template?.type) ?? "npc")
+            )
+          : -1;
       const resolvedId =
         incomingId ??
         nextSpawnId(String(templateId ?? upd.name ?? template?.name ?? upd.type ?? "spawn"));
       const idx = current.findIndex((e) => e.id === resolvedId);
+      const mergeIdx = idx >= 0 ? idx : logicalDuplicateIdx;
       const nt = normalizeType(upd.type ?? template?.type) ?? "npc";
       // Anti-clone : id déjà présent → fusion type update (ne pas recréer une fiche)
-      if (idx >= 0) {
-        const ent = current[idx];
+      if (mergeIdx >= 0) {
+        const ent = current[mergeIdx];
         current = current.map((e, i) =>
-          i !== idx
+          i !== mergeIdx
             ? e
             : {
                 ...e,
+                ...(templateId !== undefined && { templateId }),
                 ...(upd.name !== undefined && { name: upd.name }),
                 ...(upd.race !== undefined && { race: upd.race }),
                 ...(upd.entityClass !== undefined && { entityClass: upd.entityClass }),
@@ -475,6 +536,10 @@ function applyUpdatesLocally(entities, updates) {
                 ...(upd.damageBonus !== undefined && { damageBonus: upd.damageBonus }),
                 ...(upd.weapons !== undefined && { weapons: upd.weapons }),
                 ...(upd.features !== undefined && { features: upd.features }),
+                ...(upd.selectedSpells !== undefined && { selectedSpells: upd.selectedSpells }),
+                ...(upd.spellSlots !== undefined && { spellSlots: upd.spellSlots }),
+                ...(upd.spellAttackBonus !== undefined && { spellAttackBonus: upd.spellAttackBonus }),
+                ...(upd.spellSaveDc !== undefined && { spellSaveDc: upd.spellSaveDc }),
                 ...(upd.description !== undefined && { description: upd.description }),
                 ...(upd.stealthDc !== undefined && { stealthDc: upd.stealthDc }),
                 ...(upd.lootItems !== undefined && { lootItems: upd.lootItems }),
@@ -482,14 +547,15 @@ function applyUpdatesLocally(entities, updates) {
                 ...(upd.surprised !== undefined && { surprised: !!upd.surprised }),
                 ...(upd.awareOfPlayer !== undefined && { awareOfPlayer: !!upd.awareOfPlayer }),
                 ...(upd.hp !== undefined && { hp: normalizeHpShape(upd.hp, ent.hp ?? null) }),
+                ...(upd.controller !== undefined && { controller: upd.controller }),
                 type: nt,
-                name: upd.name ?? e.name,
+                name: resolvedSpawnName || e.name,
                 isAlive: true,
               }
         );
       } else {
         const newE = {
-          id: resolvedId, name: upd.name ?? template?.name ?? resolvedId, type: nt,
+          id: resolvedId, templateId: templateId ?? undefined, name: resolvedSpawnName || resolvedId, type: nt,
           race: upd.race ?? template?.race ?? "Inconnu",
           entityClass: upd.entityClass ?? template?.entityClass ?? "Inconnu",
           cr: upd.cr ?? template?.cr ?? 0,
@@ -502,6 +568,10 @@ function applyUpdatesLocally(entities, updates) {
           damageBonus: upd.damageBonus ?? template?.damageBonus ?? null,
           weapons: upd.weapons ?? template?.weapons ?? null,
           features: upd.features ?? template?.features ?? null,
+          selectedSpells: upd.selectedSpells ?? template?.selectedSpells ?? null,
+          spellSlots: upd.spellSlots ?? template?.spellSlots ?? null,
+          spellAttackBonus: upd.spellAttackBonus ?? template?.spellAttackBonus ?? null,
+          spellSaveDc: upd.spellSaveDc ?? template?.spellSaveDc ?? null,
           description: upd.description ?? template?.description ?? "",
           stealthDc: upd.stealthDc ?? template?.stealthDc ?? null,
           lootItems:
@@ -512,6 +582,7 @@ function applyUpdatesLocally(entities, updates) {
               : null,
           looted: upd.looted ?? false,
           surprised: upd.surprised ?? false,
+          controller: upd.controller ?? "ai",
           awareOfPlayer:
             typeof upd.awareOfPlayer === "boolean"
               ? upd.awareOfPlayer
@@ -551,6 +622,15 @@ function BoldText({ text }) {
 
 function safeJson(obj) {
   try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+}
+
+function isSubstantiveArbiterEngineEvent(event) {
+  if (!event || typeof event !== "object") return false;
+  const kind = String(event.kind ?? "").trim();
+  const reason = typeof event.reason === "string" ? event.reason.trim() : "";
+  const details = typeof event.details === "string" ? event.details.trim() : "";
+  if (reason || details) return true;
+  return kind !== "" && kind !== "scene_rule_resolution";
 }
 
 function rewriteDeathyToWounded(reply, engineEvent) {
@@ -1139,6 +1219,7 @@ function executeCombatActionIntent(intent, ctx) {
     postEntities,
     player,
     gameMode,
+    setGameMode,
     turnResources,
     setTurnResources,
     setHp,
@@ -1164,8 +1245,11 @@ function executeCombatActionIntent(intent, ctx) {
   };
 
   const { type, targetId, itemName } = intent;
+  let effectiveMode = gameMode;
+  const canOpenCombatFromExploration =
+    gameMode !== "combat" && ["attack", "spell", "move_and_attack"].includes(type);
 
-  if (gameMode !== "combat" && type !== "second_wind") {
+  if (gameMode !== "combat" && type !== "second_wind" && !canOpenCombatFromExploration) {
     return fail("Action impossible : hors combat.");
   }
 
@@ -1310,12 +1394,72 @@ function executeCombatActionIntent(intent, ctx) {
     return { ok: true, pendingRoll: null };
   }
 
+  if (type === "move" && !targetId) {
+    if (!turnResources?.movement) {
+      return fail("Action impossible : vous n'avez pas la possibilité de faire ca.");
+    }
+    consumeMovementResource(setTurnResources);
+    if (!parserMinimalNarration) {
+      addMessage(
+        "ai",
+        "Vous vous déplacez pour vous repositionner dans la zone de combat.",
+        "dice",
+        makeMsgId()
+      );
+    }
+    return { ok: true, pendingRoll: null };
+  }
+
   if (!targetId) {
     return fail("Action impossible : aucune cible indiquée.");
   }
   const targetEnt = findLivingTarget(targetId);
   if (!targetEnt) {
     return fail("Action impossible : cible introuvable, invisible ou hors combat.");
+  }
+
+  if (canOpenCombatFromExploration) {
+    if (targetEnt.controller === "player") {
+      return fail("Action impossible : hors combat.");
+    }
+    const targetAwareBeforeAttack = targetEnt.awareOfPlayer !== false;
+    const awarenessUpdates = postEntities
+      .filter((e) => e && e.isAlive && e.visible !== false && e.type === "hostile")
+      .map((e) => ({
+        id: e.id,
+        action: "update",
+        awareOfPlayer: true,
+        // Si l'ennemi n'avait pas encore repéré le PJ, l'ouverture du combat
+        // par une attaque le laisse surpris pour le premier round.
+        ...(e.awareOfPlayer === false ? { surprised: true } : {}),
+      }));
+    if (targetEnt.type !== "hostile") {
+      const existingTargetUpdateIdx = awarenessUpdates.findIndex((upd) => upd.id === targetEnt.id);
+      const targetCombatUpdate = {
+        id: targetEnt.id,
+        action: "update",
+        templateId: inferBestiaryTemplateIdForEntity(targetEnt) ?? undefined,
+        type: "hostile",
+        controller: "ai",
+        awareOfPlayer: true,
+        surprised: !targetAwareBeforeAttack,
+      };
+      if (existingTargetUpdateIdx >= 0) {
+        awarenessUpdates[existingTargetUpdateIdx] = {
+          ...awarenessUpdates[existingTargetUpdateIdx],
+          ...targetCombatUpdate,
+        };
+      } else {
+        awarenessUpdates.push(targetCombatUpdate);
+      }
+    }
+    if (awarenessUpdates.length) {
+      applyEntityUpdates?.(awarenessUpdates);
+    }
+    setGameMode?.("combat");
+    // Ouverture de combat D&D 5e : on entre d'abord en initiative.
+    // L'attaque déclarée ne se résout pas avant que l'ordre de tour soit établi.
+    return { ok: true, pendingRoll: null };
   }
 
   const tryEngageMelee = () => {
@@ -1343,7 +1487,7 @@ function executeCombatActionIntent(intent, ctx) {
     if (resolved.kind === "spell") {
       const spell = SPELLS[resolved.spellName];
       const resourceKind = resourceForCastingTime(spell?.castingTime);
-      if (!hasResource(turnResources, gameMode, resourceKind)) {
+      if (!hasResource(turnResources, effectiveMode, resourceKind)) {
         const label =
           resourceKind === "bonus"
             ? "Action bonus"
@@ -1548,6 +1692,34 @@ function normalizeFr(s) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
+}
+
+function inferBestiaryTemplateIdForEntity(entityLike) {
+  const explicitTemplateId =
+    typeof entityLike?.templateId === "string" && entityLike.templateId.trim()
+      ? entityLike.templateId.trim()
+      : "";
+  if (explicitTemplateId && BESTIARY?.[explicitTemplateId]) return explicitTemplateId;
+
+  const rawId = String(entityLike?.id ?? "").trim().toLowerCase();
+  if (rawId) {
+    const withoutNumericSuffix = rawId.replace(/_\d+$/g, "");
+    if (BESTIARY?.[withoutNumericSuffix]) return withoutNumericSuffix;
+    for (const token of withoutNumericSuffix.split("_").filter(Boolean)) {
+      if (BESTIARY?.[token]) return token;
+    }
+  }
+
+  const nameTokens = normalizeFr(entityLike?.name ?? "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4);
+  for (const token of nameTokens) {
+    if (BESTIARY?.[token]) return token;
+  }
+
+  return null;
 }
 
 function detectMentionedWeaponName(text) {
@@ -1788,7 +1960,8 @@ async function resolveSpellCastNow({
 export default function ChatInterface() {
   const {
     messages, addMessage, appendSceneImagePendingSlot, updateMessage, removeMessagesByIds,
-    player, setHp, updatePlayer,
+    player, setHp, setPlayer, updatePlayer,
+    worldTimeMinutes, setWorldTimeMinutes,
     pendingRoll, setPendingRoll,
     currentScene, setCurrentScene,
     currentSceneName,
@@ -1796,7 +1969,7 @@ export default function ChatInterface() {
     currentRoomId, setCurrentRoomId,
     entities,
     applyEntityUpdates, replaceEntities,
-    rememberRoomEntitiesSnapshot, takeEntitiesForRoom, getRoomMemory, appendRoomMemory,
+    rememberRoomEntitiesSnapshot, takeEntitiesForRoom, getRoomMemory, appendRoomMemory, setRoomMemoryText,
     setGameMode, setCombatOrder,
     gameMode,
     combatOrder, combatTurnIndex, setCombatTurnIndex,
@@ -1804,7 +1977,7 @@ export default function ChatInterface() {
     registerCombatNextTurn, nextTurn,
     hasDisengagedThisTurn, setHasDisengagedThisTurn,
     turnResources, setTurnResources,
-    getMeleeWith, addMeleeMutual, clearMeleeFor, setReactionFor, hasReaction, initCombatReactions,
+    getMeleeWith, addMeleeMutual, removeFromMelee, clearMeleeFor, setReactionFor, hasReaction, initCombatReactions,
     aiProvider, setAiProvider,
     autoPlayerEnabled, setAutoPlayerEnabled,
     autoRollEnabled, setAutoRollEnabled,
@@ -1823,9 +1996,11 @@ export default function ChatInterface() {
   const [retryCountdown, setRetryCountdown] = useState(0);
   const [apiLog, setApiLog]             = useState(null); // { sent, received }
   const [movementGate, setMovementGate] = useState(null); // { text: string, hostileIds: string[] }
+  const [opportunityAttackPrompt, setOpportunityAttackPrompt] = useState(null); // { reactorId, targetId, reactorName, targetName }
   const [showActionsHelp, setShowActionsHelp] = useState(false);
   const [fullImageUrl, setFullImageUrl] = useState(null);
   const [sceneImageTrigger, setSceneImageTrigger] = useState(null);
+  const [shortRestState, setShortRestState] = useState(null); // { startedAtMinute: number, spentDice: number }
   const [arcaneRecoveryOpen, setArcaneRecoveryOpen] = useState(false);
   const [arcaneRecoveryPick, setArcaneRecoveryPick] = useState({}); // { [spellLevel]: number }
   const [latencyAvgMs, setLatencyAvgMs] = useState(null);
@@ -1851,6 +2026,7 @@ export default function ChatInterface() {
   const countdownRef = useRef(null);
   const turnResourcesRef = useRef(turnResources);
   const lastImageGenKeyRef = useRef(null);
+  const narratorImageBudgetByRoomRef = useRef({});
   const latencyWindowRef = useRef([]); // number[] (ms)
   // Ref pour avoir toujours les HP Ã  jour dans simulateEnemyTurns (évite les stale closures)
   const playerHpRef = useRef(player.hp.current);
@@ -1901,6 +2077,89 @@ export default function ChatInterface() {
   useEffect(() => { flowBlockedRef.current = flowBlocked; }, [flowBlocked]);
   const failedRequestPayloadRef = useRef(failedRequestPayload);
   useEffect(() => { failedRequestPayloadRef.current = failedRequestPayload; }, [failedRequestPayload]);
+  const opportunityAttackPromptResolverRef = useRef(null);
+  const shortRestStateRef = useRef(shortRestState);
+  useEffect(() => { shortRestStateRef.current = shortRestState; }, [shortRestState]);
+
+  function formatWorldTimeLabel(totalMinutes) {
+    const safeMinutes = Math.max(0, Math.trunc(Number(totalMinutes) || 0));
+    const day = Math.floor(safeMinutes / 1440) + 1;
+    const minutesInDay = safeMinutes % 1440;
+    const hours = Math.floor(minutesInDay / 60);
+    const minutes = minutesInDay % 60;
+    return `Jour ${day}, ${String(hours).padStart(2, "0")}h${String(minutes).padStart(2, "0")}`;
+  }
+
+  function getPlayerDeathStateSnapshot(sourcePlayer = player) {
+    const hpCurrent = sourcePlayer?.hp?.current ?? 0;
+    const raw = sourcePlayer?.deathState ?? {};
+    const dead = raw?.dead === true;
+    return {
+      successes: Math.max(0, Math.min(3, Math.trunc(Number(raw?.successes ?? 0) || 0))),
+      failures: Math.max(0, Math.min(3, Math.trunc(Number(raw?.failures ?? 0) || 0))),
+      stable: !dead && raw?.stable === true,
+      unconscious: dead ? false : raw?.unconscious === true || hpCurrent <= 0,
+      dead,
+      autoRecoverAtMinute:
+        typeof raw?.autoRecoverAtMinute === "number" && Number.isFinite(raw.autoRecoverAtMinute)
+          ? Math.max(0, Math.trunc(raw.autoRecoverAtMinute))
+          : null,
+    };
+  }
+
+  function isPlayerDeadNow() {
+    return isGameOverRef.current || getPlayerDeathStateSnapshot().dead === true;
+  }
+
+  function isPlayerAtZeroHpNow() {
+    return (playerHpRef.current ?? player?.hp?.current ?? 0) <= 0;
+  }
+
+  function isPlayerUnconsciousNow() {
+    const deathState = getPlayerDeathStateSnapshot();
+    return deathState.unconscious === true && deathState.dead !== true;
+  }
+
+  function resetPlayerDeathState(overrides = {}) {
+    const base = {
+      successes: 0,
+      failures: 0,
+      stable: false,
+      unconscious: false,
+      dead: false,
+      autoRecoverAtMinute: null,
+    };
+    return { ...base, ...overrides };
+  }
+
+  function updatePlayerDeathState(updater) {
+    setPlayer((prev) => {
+      if (!prev) return prev;
+      const nextDeathState =
+        typeof updater === "function"
+          ? updater(getPlayerDeathStateSnapshot(prev), prev)
+          : updater;
+      return {
+        ...prev,
+        isAlive: nextDeathState?.dead !== true,
+        deathState: nextDeathState,
+      };
+    });
+  }
+
+  function restorePlayerToConsciousness(nextHp) {
+    setPlayer((prev) => {
+      if (!prev?.hp) return prev;
+      const clampedHp = Math.max(1, Math.min(nextHp, prev.hp.max));
+      playerHpRef.current = clampedHp;
+      return {
+        ...prev,
+        isAlive: true,
+        hp: { ...prev.hp, current: clampedHp },
+        deathState: resetPlayerDeathState(),
+      };
+    });
+  }
 
   // Déduplication idempotente des secrets MJ.
   // But : ne pas rejouer deux fois le même gm_secret (ex: re-continue, retry, re-render),
@@ -1923,6 +2182,8 @@ export default function ChatInterface() {
 
   function getPublicPendingRollTitle(roll) {
     if (!roll) return "Jet requis";
+    if (roll.kind === "death_save") return "Jet de sauvegarde contre la mort";
+    if (roll.kind === "hit_die") return "Dé de vie";
     const label = roll.skill ? `Jet de ${roll.skill}` : `Jet de ${roll.stat}`;
     return shouldHidePendingRollReason(roll) ? label : `${label} (${roll.raison})`;
   }
@@ -1997,14 +2258,48 @@ export default function ChatInterface() {
     (imageDecision, context = {}) => {
       if (!imageDecision || typeof imageDecision !== "object") return;
       if (imageDecision.shouldGenerate !== true) return;
+      const engineEvent =
+        context.engineEvent && typeof context.engineEvent === "object" ? context.engineEvent : null;
+      const roomKey =
+        String(
+          engineEvent?.kind === "scene_transition"
+            ? engineEvent?.targetRoomId ?? context.roomId ?? gameStateRef.current?.currentRoomId ?? currentRoomId ?? ""
+            : context.roomId ?? gameStateRef.current?.currentRoomId ?? currentRoomId ?? ""
+        ).trim() || "scene";
+      const sceneBucket = narratorImageBudgetByRoomRef.current[roomKey] ?? {
+        total: 0,
+        sceneEntry: 0,
+        combatEnd: 0,
+      };
+      const eventKind = String(engineEvent?.kind ?? "").trim();
+      const remainingHostiles = (gameStateRef.current?.entities ?? entities).filter((entity) =>
+        isHostileReadyForCombat(entity)
+      ).length;
+      const isSceneEntryImage = eventKind === "scene_transition";
+      const isCombatEndImage =
+        engineEvent?.targetIsAlive === false &&
+        remainingHostiles === 0 &&
+        (eventKind === "attack_resolution" ||
+          eventKind === "spell_attack_resolution" ||
+          eventKind === "spell_save_resolution" ||
+          eventKind === "gm_secret_resolution");
+      if (!isSceneEntryImage && !isCombatEndImage) return;
+      if (sceneBucket.total >= 2) return;
+      if (isSceneEntryImage && sceneBucket.sceneEntry >= 1) return;
+      if (isCombatEndImage && sceneBucket.combatEnd >= 1) return;
+
       const reason = String(imageDecision.reason ?? "").trim() || "Moment visuellement marquant";
       const focus = String(imageDecision.focus ?? "").trim() || reason;
-      const roomKey =
-        String(context.roomId ?? gameStateRef.current?.currentRoomId ?? currentRoomId ?? "").trim() ||
-        "scene";
       const sceneKey =
-        String(context.sceneName ?? gameStateRef.current?.currentSceneName ?? currentSceneName ?? "").trim() ||
+        String(
+          context.sceneName ?? gameStateRef.current?.currentSceneName ?? currentSceneName ?? ""
+        ).trim() ||
         "scene";
+      narratorImageBudgetByRoomRef.current[roomKey] = {
+        total: sceneBucket.total + 1,
+        sceneEntry: sceneBucket.sceneEntry + (isSceneEntryImage ? 1 : 0),
+        combatEnd: sceneBucket.combatEnd + (isCombatEndImage ? 1 : 0),
+      };
       queueSceneImageTrigger({
         key: `narrator:${roomKey}:${sceneKey}:${reason}:${focus}:${imageModel}`,
         kind: "narrator_decision",
@@ -2014,18 +2309,20 @@ export default function ChatInterface() {
         engineEvent: context.engineEvent ?? null,
       });
     },
-    [currentRoomId, currentSceneName, imageModel, queueSceneImageTrigger]
+    [currentRoomId, currentSceneName, imageModel, queueSceneImageTrigger, entities]
   );
 
   const getRuntimeCombatant = useCallback(
     (combatantId, entitiesOverride = null) => {
       if (!combatantId) return null;
       if (combatantId === "player") {
+        const deathState = getPlayerDeathStateSnapshot(player);
         return player
           ? {
               ...player,
               id: "player",
-              isAlive: (playerHpRef.current ?? player.hp?.current ?? 0) > 0,
+              controller: "player",
+              isAlive: deathState.dead !== true,
               hp: player.hp
                 ? {
                     ...player.hp,
@@ -2113,8 +2410,18 @@ export default function ChatInterface() {
       const maxHp = combatant.hp.max;
       const hpAfter = Math.max(0, Math.min(nextHp, maxHp));
       if (combatant.id === "player") {
-        setHp(hpAfter);
-        playerHpRef.current = hpAfter;
+        if (hpAfter > 0) {
+          restorePlayerToConsciousness(hpAfter);
+        } else {
+          setPlayer((prev) => {
+            if (!prev?.hp) return prev;
+            playerHpRef.current = 0;
+            return {
+              ...prev,
+              hp: { ...prev.hp, current: 0 },
+            };
+          });
+        }
       } else if (hpAfter <= 0) {
         applyEntityUpdates([{ id: combatant.id, action: "kill" }]);
       } else {
@@ -2128,8 +2435,429 @@ export default function ChatInterface() {
       }
       return { hpAfter, maxHp };
     },
-    [applyEntityUpdates, setHp]
+    [applyEntityUpdates, restorePlayerToConsciousness, setPlayer]
   );
+
+  function getPlayerConModifier(sourcePlayer = player) {
+    const con = sourcePlayer?.stats?.CON;
+    return typeof con === "number" ? Math.floor((con - 10) / 2) : 0;
+  }
+
+  function resetRemainingResourcesDeepLocal(value) {
+    if (Array.isArray(value)) {
+      return value.map((entry) => resetRemainingResourcesDeepLocal(entry));
+    }
+    if (!value || typeof value !== "object") return value;
+
+    const out = {};
+    for (const [key, raw] of Object.entries(value)) {
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        const candidate = raw;
+        if (typeof candidate.max === "number" && typeof candidate.remaining === "number") {
+          out[key] = { ...candidate, remaining: candidate.max };
+          continue;
+        }
+      }
+      out[key] = resetRemainingResourcesDeepLocal(raw);
+    }
+    return out;
+  }
+
+  function restoreSpellSlotsToMax(spellSlots) {
+    if (!spellSlots || typeof spellSlots !== "object") return spellSlots;
+    const next = {};
+    for (const [level, row] of Object.entries(spellSlots)) {
+      if (!row || typeof row !== "object") {
+        next[level] = row;
+        continue;
+      }
+      const max = Number(row.max ?? 0);
+      next[level] = {
+        ...row,
+        remaining: Number.isFinite(max) ? Math.max(0, Math.trunc(max)) : 0,
+      };
+    }
+    return next;
+  }
+
+  function markPlayerDead(reason = "") {
+    setPlayer((prev) => {
+      if (!prev) return prev;
+      playerHpRef.current = 0;
+      return {
+        ...prev,
+        isAlive: false,
+        hp: prev.hp ? { ...prev.hp, current: 0 } : prev.hp,
+        deathState: resetPlayerDeathState({
+          failures: 3,
+          dead: true,
+          unconscious: false,
+        }),
+      };
+    });
+    if (reason) {
+      addMessage("ai", reason, "meta", makeMsgId());
+    }
+    setShortRestState(null);
+    setMovementGate(null);
+    setPendingRoll(null);
+    pendingRollRef.current = null;
+    setIsGameOver(true);
+    isGameOverRef.current = true;
+  }
+
+  function bringPlayerToZeroHp() {
+    setPlayer((prev) => {
+      if (!prev?.hp) return prev;
+      playerHpRef.current = 0;
+      return {
+        ...prev,
+        isAlive: true,
+        hp: { ...prev.hp, current: 0 },
+        deathState: resetPlayerDeathState({
+          unconscious: true,
+        }),
+      };
+    });
+  }
+
+  function applyDamageToPlayer(damage, options = {}) {
+    const numericDamage = Math.max(0, Math.trunc(Number(damage) || 0));
+    const isCritical = options.critical === true;
+    const hpBefore = playerHpRef.current ?? player?.hp?.current ?? 0;
+    const hpMax = player?.hp?.max ?? 0;
+    const deathStateBefore = getPlayerDeathStateSnapshot();
+
+    if (numericDamage <= 0) {
+      return {
+        hpBefore,
+        hpAfter: hpBefore,
+        damage: 0,
+        instantDeath: false,
+        knockedUnconscious: false,
+        deathFailuresApplied: 0,
+        dead: deathStateBefore.dead === true,
+      };
+    }
+
+    if (hpBefore > 0) {
+      const hpAfter = Math.max(0, hpBefore - numericDamage);
+      if (hpAfter > 0) {
+        setHp(hpAfter);
+        playerHpRef.current = hpAfter;
+        return {
+          hpBefore,
+          hpAfter,
+          damage: numericDamage,
+          instantDeath: false,
+          knockedUnconscious: false,
+          deathFailuresApplied: 0,
+          dead: false,
+        };
+      }
+      const excessDamage = Math.max(0, numericDamage - hpBefore);
+      if (excessDamage >= hpMax) {
+        markPlayerDead("La violence du coup vous tue sur le coup.");
+        return {
+          hpBefore,
+          hpAfter: 0,
+          damage: numericDamage,
+          instantDeath: true,
+          knockedUnconscious: false,
+          deathFailuresApplied: 0,
+          dead: true,
+        };
+      }
+      bringPlayerToZeroHp();
+      return {
+        hpBefore,
+        hpAfter: 0,
+        damage: numericDamage,
+        instantDeath: false,
+        knockedUnconscious: true,
+        deathFailuresApplied: 0,
+        dead: false,
+      };
+    }
+
+    if (numericDamage >= hpMax) {
+      markPlayerDead("Le coup achève votre corps inerte sur le coup.");
+      return {
+        hpBefore: 0,
+        hpAfter: 0,
+        damage: numericDamage,
+        instantDeath: true,
+        knockedUnconscious: false,
+        deathFailuresApplied: 0,
+        dead: true,
+      };
+    }
+
+    const addedFailures = isCritical ? 2 : 1;
+    let becameDead = false;
+    updatePlayerDeathState((current) => {
+      const nextFailures = Math.min(3, current.failures + addedFailures);
+      becameDead = nextFailures >= 3;
+      return resetPlayerDeathState({
+        ...current,
+        failures: nextFailures,
+        unconscious: true,
+        stable: false,
+        dead: becameDead,
+      });
+    });
+    if (becameDead) {
+      setIsGameOver(true);
+      isGameOverRef.current = true;
+    }
+    return {
+      hpBefore: 0,
+      hpAfter: 0,
+      damage: numericDamage,
+      instantDeath: false,
+      knockedUnconscious: false,
+      deathFailuresApplied: addedFailures,
+      dead: becameDead,
+    };
+  }
+
+  function applyDamageToCombatant(target, damage, options = {}) {
+    if (!target?.hp) {
+      return { hpBefore: null, hpAfter: null, damage: 0, dead: false, instantDeath: false };
+    }
+    if (target.id === "player") {
+      return applyDamageToPlayer(damage, options);
+    }
+    const hpBefore = target.hp.current ?? 0;
+    const hpAfter = Math.max(0, hpBefore - Math.max(0, Math.trunc(Number(damage) || 0)));
+    applyHpToCombatant(target, hpAfter);
+    return {
+      hpBefore,
+      hpAfter,
+      damage,
+      dead: hpAfter <= 0,
+      instantDeath: false,
+    };
+  }
+
+  function advanceWorldClock(minutes) {
+    const safeMinutes = Math.max(0, Math.trunc(Number(minutes) || 0));
+    if (safeMinutes <= 0) return worldTimeMinutes;
+    const nextValue = worldTimeMinutes + safeMinutes;
+    setWorldTimeMinutes(nextValue);
+    return nextValue;
+  }
+
+  function restoreShortRestResources(sourcePlayer) {
+    if (!sourcePlayer) return sourcePlayer;
+    const next = JSON.parse(JSON.stringify(sourcePlayer));
+    if (next.fighter?.resources) {
+      next.fighter.resources = resetRemainingResourcesDeepLocal(next.fighter.resources);
+    }
+    if (next.cleric?.resources) {
+      next.cleric.resources = resetRemainingResourcesDeepLocal(next.cleric.resources);
+    }
+    return next;
+  }
+
+  function restoreLongRestPlayer(sourcePlayer, nextMinute) {
+    if (!sourcePlayer?.hp) return sourcePlayer;
+    const next = JSON.parse(JSON.stringify(sourcePlayer));
+    next.hp.current = next.hp.max;
+    next.isAlive = true;
+    next.hitDiceRemaining = Math.min(
+      next.hitDiceTotal ?? next.level ?? 1,
+      (next.hitDiceRemaining ?? 0) + Math.max(1, Math.floor((next.hitDiceTotal ?? next.level ?? 1) / 2))
+    );
+    if (next.spellSlots) {
+      next.spellSlots = restoreSpellSlotsToMax(next.spellSlots);
+    }
+    if (next.fighter) next.fighter = resetRemainingResourcesDeepLocal(next.fighter);
+    if (next.wizard) {
+      next.wizard = resetRemainingResourcesDeepLocal(next.wizard);
+      next.wizard.arcaneRecovery = { used: false };
+    }
+    if (next.cleric) next.cleric = resetRemainingResourcesDeepLocal(next.cleric);
+    if (next.rogue) next.rogue = resetRemainingResourcesDeepLocal(next.rogue);
+    next.deathState = resetPlayerDeathState();
+    next.lastLongRestFinishedAtMinute = nextMinute;
+    return next;
+  }
+
+  function finishShortRest(reason = "") {
+    setShortRestState(null);
+    setGameMode("exploration", entities, { force: true });
+    pendingRollRef.current = null;
+    setPendingRoll(null);
+    if (reason) {
+      addMessage("ai", reason, "meta", makeMsgId());
+    }
+  }
+
+  function startShortRest() {
+    if (gameMode === "combat") {
+      addMessage("ai", "Impossible de prendre un repos court en plein combat.", "intent-error", makeMsgId());
+      return true;
+    }
+    if (entities.some((e) => isHostileReadyForCombat(e))) {
+      addMessage(
+        "ai",
+        "Impossible de prendre un repos court ici : un adversaire conscient de votre présence vous menace encore.",
+        "intent-error",
+        makeMsgId()
+      );
+      return true;
+    }
+    if ((player?.hp?.current ?? 0) <= 0 || isPlayerDeadNow()) {
+      addMessage("ai", "Impossible de prendre un repos court à 0 PV ou mort.", "intent-error", makeMsgId());
+      return true;
+    }
+    const nextMinute = advanceWorldClock(60);
+    setPlayer((prev) => {
+      if (!prev) return prev;
+      const next = restoreShortRestResources(prev);
+      return {
+        ...next,
+        deathState: getPlayerDeathStateSnapshot(next),
+      };
+    });
+    setGameMode("short_rest", entities, { force: true });
+    setShortRestState({ startedAtMinute: nextMinute, spentDice: 0 });
+    pendingRollRef.current = null;
+    setPendingRoll(null);
+    addMessage(
+      "ai",
+      `Vous prenez un repos court d'une heure.`,
+      "meta",
+      makeMsgId()
+    );
+    return true;
+  }
+
+  function startLongRest() {
+    if (gameMode === "combat") {
+      addMessage("ai", "Impossible de prendre un repos long en plein combat.", "intent-error", makeMsgId());
+      return true;
+    }
+    if ((player?.hp?.current ?? 0) <= 0 || isPlayerDeadNow()) {
+      addMessage("ai", "Impossible de bénéficier d'un repos long à 0 PV ou mort.", "intent-error", makeMsgId());
+      return true;
+    }
+    const lastLongRestMinute = player?.lastLongRestFinishedAtMinute;
+    if (
+      typeof lastLongRestMinute === "number" &&
+      Number.isFinite(lastLongRestMinute) &&
+      // Règle "1 repos long par 24h" : on compte depuis le DÉBUT du repos long.
+      // Comme on stocke l'instant de FIN, on ajoute la durée fixe (8h) pour obtenir l'élapsé depuis le début.
+      (worldTimeMinutes - lastLongRestMinute) + 8 * 60 < 24 * 60
+    ) {
+      const elapsedSinceStart = (worldTimeMinutes - lastLongRestMinute) + 8 * 60;
+      const remaining = Math.max(0, 24 * 60 - elapsedSinceStart);
+      const hours = Math.floor(remaining / 60);
+      const minutes = remaining % 60;
+      addMessage(
+        "ai",
+        `Vous avez déjà bénéficié d'un repos long récemment. Attendez encore ${hours}h${String(minutes).padStart(2, "0")} avant d'en profiter à nouveau.`,
+        "intent-error",
+        makeMsgId()
+      );
+      return true;
+    }
+    const nextMinute = advanceWorldClock(8 * 60);
+    setPlayer((prev) => {
+      const next = restoreLongRestPlayer(prev, nextMinute);
+      playerHpRef.current = next?.hp?.max ?? playerHpRef.current;
+      return next;
+    });
+    finishShortRest();
+    addMessage(
+      "ai",
+      `Vous prenez un repos long de huit heures. Vos PV sont entièrement restaurés, vous récupérez vos ressources de repos long et la moitié de vos dés de vie dépensés.`,
+      "meta",
+      makeMsgId()
+    );
+    return true;
+  }
+
+  function triggerHitDieRollFromShortRest() {
+    if (gameMode !== "short_rest") {
+      addMessage("ai", "Commencez d'abord par prendre un repos court.", "intent-error", makeMsgId());
+      return true;
+    }
+    if (!shortRestStateRef.current) {
+      const seed = { startedAtMinute: worldTimeMinutes, spentDice: 0 };
+      shortRestStateRef.current = seed;
+      setShortRestState(seed);
+    }
+    const remainingHitDice = player?.hitDiceRemaining ?? 0;
+    if (remainingHitDice <= 0) {
+      addMessage("ai", "Vous n'avez plus de dés de vie à dépenser pendant ce repos court.", "intent-error", makeMsgId());
+      return true;
+    }
+    if ((player?.hp?.current ?? 0) >= (player?.hp?.max ?? 0)) {
+      addMessage("ai", "Vous êtes déjà à vos PV maximum.", "intent-error", makeMsgId());
+      return true;
+    }
+    const pendingHitDieRoll = {
+      kind: "hit_die",
+      stat: "CON",
+      totalBonus: getPlayerConModifier(),
+      raison: `Dé de vie (${player?.hitDie ?? "d8"}) pendant le repos court`,
+      engineContext: {
+        kind: "short_rest_hit_die",
+        hitDie: player?.hitDie ?? "d8",
+      },
+    };
+    pendingRollRef.current = pendingHitDieRoll;
+    setPendingRoll(pendingHitDieRoll);
+    return true;
+  }
+
+  function tryHandleNaturalLanguageRest(text, msgType, isDebug, overrides = null) {
+    if (msgType || isDebug || overrides?.bypassIntentParser === true) return false;
+    const raw = String(text ?? "").trim();
+    if (!raw) return false;
+    const normalized = normalizeFr(raw);
+
+    if (shortRestStateRef.current) {
+      if (
+        /\b(j'?arrete|j'?arr[eê]te|ca suffit|ça suffit|fin du repos|termine le repos|stop rest|end rest)\b/.test(normalized)
+      ) {
+        finishShortRest("Le repos court prend fin.");
+        return true;
+      }
+      if (
+        /\b(de de vie|des de vie|hit die|hit dice|encore un|encore une|un autre|je depense|je lance|je roule)\b/.test(normalized)
+      ) {
+        return triggerHitDieRollFromShortRest();
+      }
+    }
+
+    if (shortRestStateRef.current) {
+      finishShortRest("Le repos court est interrompu.");
+    }
+    return false;
+  }
+
+  useEffect(() => {
+    const deathState = getPlayerDeathStateSnapshot();
+    if (
+      deathState.dead === true ||
+      deathState.stable !== true ||
+      deathState.autoRecoverAtMinute == null ||
+      (playerHpRef.current ?? player?.hp?.current ?? 0) > 0 ||
+      worldTimeMinutes < deathState.autoRecoverAtMinute
+    ) {
+      return;
+    }
+    restorePlayerToConsciousness(1);
+    addMessage(
+      "ai",
+      `Après plusieurs heures de repos involontaire, vous reprenez conscience avec **1 PV**. Horloge : **${formatWorldTimeLabel(worldTimeMinutes)}**.`,
+      "meta",
+      makeMsgId()
+    );
+  }, [addMessage, player, restorePlayerToConsciousness, worldTimeMinutes]);
 
   /**
    * Index de tour combat : mis à jour au rendu ET de façon synchrone via commitCombatTurnIndex.
@@ -2142,6 +2870,95 @@ export default function ChatInterface() {
   function commitCombatTurnIndex(next) {
     combatTurnIndexLiveRef.current = next;
     setCombatTurnIndex(next);
+  }
+
+  function isPlayerDownNow() {
+    return isPlayerDeadNow();
+  }
+
+  function isCombatantAliveForTurnOrder(combatantId, entitiesOverride = null) {
+    if (!combatantId) return false;
+    const pool = Array.isArray(entitiesOverride) ? entitiesOverride : entities;
+    if (combatantId === "player") {
+      return !isPlayerDeadNow();
+    }
+    const combatant = pool.find((entity) => entity?.id === combatantId) ?? null;
+    return combatant?.isAlive === true;
+  }
+
+  function hasLivingPlayerCombatant(currentEntities = null) {
+    if (!isPlayerDeadNow()) return true;
+    const pool = Array.isArray(currentEntities) ? currentEntities : entities;
+    return pool.some((combatant) =>
+      combatant?.id !== "player" &&
+      combatant?.isAlive === true &&
+      combatantControllerValue(combatant) === "player"
+    );
+  }
+
+  function combatantControllerValue(combatant) {
+    if (!combatant) return null;
+    if (combatant.controller === "player" || combatant.controller === "ai") {
+      return combatant.controller;
+    }
+    if (combatant.id === "player" || combatant.type === "player") return "player";
+    return "ai";
+  }
+
+  function controllerForCombatantId(combatantId, entitiesOverride = null) {
+    if (!combatantId) return null;
+    if (combatantId === "player") return "player";
+    const pool = Array.isArray(entitiesOverride) ? entitiesOverride : entities;
+    const combatant = pool.find((entity) => entity?.id === combatantId) ?? null;
+    return combatantControllerValue(combatant);
+  }
+
+  function isPlayerTurnNow(snapshot = null) {
+    const snap = snapshot ?? gameStateRef.current;
+    const mode = snap?.gameMode ?? gameMode;
+    if (mode !== "combat") return true;
+    if (!hasLivingPlayerCombatant(snap?.entities ?? null)) return false;
+    if (awaitingPlayerInitiativeRef.current) return false;
+    const order = Array.isArray(snap?.combatOrder) ? snap.combatOrder : combatOrder;
+    if (!order.length) return false;
+    const activeEntry = order[combatTurnIndexLiveRef.current];
+    return controllerForCombatantId(activeEntry?.id, snap?.entities ?? null) === "player";
+  }
+
+  async function preparePlayerTurnStartState() {
+    const hpCurrent = playerHpRef.current ?? player?.hp?.current ?? 0;
+    const deathState = getPlayerDeathStateSnapshot();
+    if (deathState.dead) return true;
+    if (hpCurrent > 0) return false;
+
+    if (deathState.stable) {
+      addMessage(
+        "ai",
+        `${player?.name ?? "Vous"} demeure inconscient mais stabilisé à **0 PV**.`,
+        "turn-end",
+        makeMsgId()
+      );
+      addMessage("ai", "", "turn-divider", makeMsgId());
+      await nextTurn();
+      return true;
+    }
+
+    const deathSaveRoll = {
+      kind: "death_save",
+      stat: "CON",
+      totalBonus: 0,
+      raison: "Jet de sauvegarde contre la mort",
+      engineContext: { kind: "death_save" },
+    };
+    pendingRollRef.current = deathSaveRoll;
+    setPendingRoll(deathSaveRoll);
+    addMessage(
+      "ai",
+      `🎲 ${player?.name ?? "Vous"} êtes à **0 PV**. Lancez maintenant un **jet de sauvegarde contre la mort**.`,
+      "meta",
+      makeMsgId()
+    );
+    return true;
   }
 
   function insertSpawnedCombatantsIntoInitiative(spawnedEntities, options = {}) {
@@ -2202,6 +3019,7 @@ export default function ChatInterface() {
    * L'auto-joueur ne part pas tant qu'un tour MJ n'est pas terminé.
    */
   const apiProcessingDepthRef = useRef(0);
+  const PARSE_INTENT_TIMEOUT_MS = 120000;
 
   /**
    * Après sceneUpdate.hasChanged, le client enchaîne avec [SceneEntered] en setTimeout(0).
@@ -2236,6 +3054,309 @@ export default function ChatInterface() {
     if (!failedRequestPayloadRef.current || retryPayload) {
       addMessage("ai", `Échec critique : ${msg}`, "retry-action", makeMsgId());
     }
+  }
+
+  function buildGodmodePlayerUpdate(playerPatch) {
+    if (!playerPatch || typeof playerPatch !== "object") return null;
+    const currentInv = Array.isArray(player?.inventory) ? player.inventory : [];
+    let nextInventory = currentInv;
+    let inventoryTouched = false;
+
+    if (Array.isArray(playerPatch.inventorySet)) {
+      nextInventory = playerPatch.inventorySet.map((item) => String(item ?? "").trim()).filter(Boolean);
+      inventoryTouched = true;
+    } else {
+      if (Array.isArray(playerPatch.inventoryAdd) && playerPatch.inventoryAdd.length > 0) {
+        nextInventory = [
+          ...nextInventory,
+          ...playerPatch.inventoryAdd.map((item) => String(item ?? "").trim()).filter(Boolean),
+        ];
+        inventoryTouched = true;
+      }
+      if (Array.isArray(playerPatch.inventoryRemove) && playerPatch.inventoryRemove.length > 0) {
+        const removals = new Set(
+          playerPatch.inventoryRemove.map((item) => String(item ?? "").trim().toLowerCase()).filter(Boolean)
+        );
+        nextInventory = nextInventory.filter((item) => !removals.has(String(item ?? "").trim().toLowerCase()));
+        inventoryTouched = true;
+      }
+    }
+
+    let hp = null;
+    const currentHpNow =
+      typeof player?.hp?.current === "number" && Number.isFinite(player.hp.current)
+        ? player.hp.current
+        : 0;
+    const maxHpNow =
+      typeof player?.hp?.max === "number" && Number.isFinite(player.hp.max)
+        ? player.hp.max
+        : Math.max(1, currentHpNow);
+    const hasHpCurrent =
+      typeof playerPatch.hpCurrent === "number" && Number.isFinite(playerPatch.hpCurrent);
+    const hasHpMax =
+      typeof playerPatch.hpMax === "number" && Number.isFinite(playerPatch.hpMax);
+    if (hasHpCurrent || hasHpMax) {
+      const nextCurrent = hasHpCurrent ? Math.max(0, Math.trunc(playerPatch.hpCurrent)) : currentHpNow;
+      const nextMax = hasHpMax ? Math.max(1, Math.trunc(playerPatch.hpMax)) : maxHpNow;
+      hp = { current: Math.min(nextCurrent, Math.max(nextCurrent, nextMax)), max: Math.max(nextCurrent, nextMax) };
+    }
+
+    let hitDiceRemainingOut;
+    let hitDiceTotalOut;
+    if (typeof playerPatch.hitDiceRemaining === "number" && Number.isFinite(playerPatch.hitDiceRemaining)) {
+      hitDiceRemainingOut = Math.max(0, Math.trunc(playerPatch.hitDiceRemaining));
+    }
+    if (typeof playerPatch.hitDiceTotal === "number" && Number.isFinite(playerPatch.hitDiceTotal)) {
+      hitDiceTotalOut = Math.max(1, Math.trunc(playerPatch.hitDiceTotal));
+    }
+    const hitDiceTouched = hitDiceRemainingOut !== undefined || hitDiceTotalOut !== undefined;
+
+    if (!hp && !inventoryTouched && !hitDiceTouched) return null;
+    return {
+      action: "update",
+      id: "player",
+      ...(hp ? { hp } : {}),
+      ...(inventoryTouched ? { inventory: nextInventory } : {}),
+      ...(hitDiceRemainingOut !== undefined ? { hitDiceRemaining: hitDiceRemainingOut } : {}),
+      ...(hitDiceTotalOut !== undefined ? { hitDiceTotal: hitDiceTotalOut } : {}),
+    };
+  }
+
+  function clearTransientFlowForGodmode() {
+    setPendingRoll(null);
+    pendingRollRef.current = null;
+    setMovementGate(null);
+    setWaitForGmNarrationForInitiative(false);
+    waitForGmNarrationForInitiativeLiveRef.current = false;
+    setFlowBlocked(false);
+    setFailedRequestPayload(null);
+    setError(null);
+    setIsAutoPlayerThinking(false);
+    flowBlockedRef.current = false;
+    failedRequestPayloadRef.current = null;
+    autoTurnInProgressRef.current = false;
+    rollResolutionInProgressRef.current = false;
+  }
+
+  function resolveGodmodeChatMessageIds(chatHistoryPatch) {
+    if (!chatHistoryPatch || typeof chatHistoryPatch !== "object") return [];
+    const currentMessages = Array.isArray(messages) ? messages : [];
+    const ids = new Set();
+
+    if (chatHistoryPatch.clearAll === true) {
+      for (const message of currentMessages) {
+        if (message?.id) ids.add(message.id);
+      }
+    }
+
+    if (
+      typeof chatHistoryPatch.removeLast === "number" &&
+      Number.isFinite(chatHistoryPatch.removeLast) &&
+      chatHistoryPatch.removeLast > 0
+    ) {
+      const slice = currentMessages.slice(-Math.trunc(chatHistoryPatch.removeLast));
+      for (const message of slice) {
+        if (message?.id) ids.add(message.id);
+      }
+    }
+
+    if (Array.isArray(chatHistoryPatch.removeIds)) {
+      for (const id of chatHistoryPatch.removeIds) {
+        const trimmed = String(id ?? "").trim();
+        if (trimmed) ids.add(trimmed);
+      }
+    }
+
+    const roleSet = new Set(
+      Array.isArray(chatHistoryPatch.removeRoles)
+        ? chatHistoryPatch.removeRoles.map((role) => String(role ?? "").trim()).filter(Boolean)
+        : []
+    );
+    const typeSet = new Set(
+      Array.isArray(chatHistoryPatch.removeTypes)
+        ? chatHistoryPatch.removeTypes.map((type) => String(type ?? "").trim()).filter(Boolean)
+        : []
+    );
+    if (roleSet.size > 0 || typeSet.size > 0) {
+      for (const message of currentMessages) {
+        if (!message?.id) continue;
+        const roleMatch = roleSet.size > 0 && roleSet.has(String(message.role ?? "").trim());
+        const typeMatch = typeSet.size > 0 && typeSet.has(String(message.type ?? "").trim());
+        if (roleMatch || typeMatch) ids.add(message.id);
+      }
+    }
+
+    return [...ids];
+  }
+
+  function applyGodmodeResponse(pack, originalCommand) {
+    const teleport = pack?.teleport && typeof pack.teleport === "object" ? pack.teleport : null;
+    const roomMemoryOps = Array.isArray(pack?.roomMemoryOps) ? pack.roomMemoryOps : [];
+    const chatHistoryPatch =
+      pack?.chatHistoryPatch && typeof pack.chatHistoryPatch === "object" ? pack.chatHistoryPatch : null;
+    const rawEntityUpdates = Array.isArray(pack?.entityUpdates) ? pack.entityUpdates : [];
+    const playerUpdate = buildGodmodePlayerUpdate(pack?.playerPatch);
+    const entityUpdatesForApply = playerUpdate ? [...rawEntityUpdates, playerUpdate] : rawEntityUpdates;
+
+    clearTransientFlowForGodmode();
+
+    let nextRoomId = currentRoomId;
+    let nextSceneName = currentSceneName;
+    let nextScene = currentScene;
+    let nextEntitiesForRef = entities;
+    let nextGameMode = gameMode;
+    let nextCombatOrder = combatOrder;
+    let nextTurnIndex = combatTurnIndex;
+
+    if (teleport?.targetRoomId && teleport.targetRoomId !== currentRoomId) {
+      rememberRoomEntitiesSnapshot(currentRoomId, entities);
+      nextRoomId = teleport.targetRoomId;
+      nextSceneName =
+        String(teleport.targetSceneName ?? "").trim() ||
+        String(GOBLIN_CAVE[nextRoomId]?.title ?? "").trim() ||
+        currentSceneName;
+      nextScene =
+        typeof teleport.targetSceneDescription === "string"
+          ? teleport.targetSceneDescription
+          : String(GOBLIN_CAVE[nextRoomId]?.description ?? currentScene);
+      nextEntitiesForRef = nextRoomId === "scene_journey" ? [] : takeEntitiesForRoom(nextRoomId);
+
+      setCurrentRoomId(nextRoomId);
+      if (nextSceneName) setCurrentSceneName(nextSceneName);
+      if (typeof nextScene === "string") setCurrentScene(nextScene);
+      setCurrentSceneImage("/file.svg");
+      replaceEntities(nextEntitiesForRef);
+      nextGameMode = "exploration";
+      nextCombatOrder = [];
+      nextTurnIndex = 0;
+    }
+
+    if (entityUpdatesForApply.length > 0) {
+      applyEntityUpdates(entityUpdatesForApply);
+    }
+
+    if (roomMemoryOps.length > 0) {
+      const currentAliasRoomId = teleport?.targetRoomId ?? currentRoomId;
+      for (const op of roomMemoryOps) {
+        const rawRoomId = String(op?.roomId ?? "").trim();
+        const roomId = rawRoomId === "current" ? currentAliasRoomId : rawRoomId;
+        if (!roomId) continue;
+        if (op?.mode === "clear") {
+          setRoomMemoryText(roomId, "");
+        } else if (op?.mode === "replace") {
+          setRoomMemoryText(roomId, String(op?.text ?? ""));
+        } else if (op?.mode === "append") {
+          appendRoomMemory(roomId, String(op?.text ?? ""));
+        }
+      }
+    }
+
+    const chatMessageIdsToRemove = resolveGodmodeChatMessageIds(chatHistoryPatch);
+    if (chatMessageIdsToRemove.length > 0) {
+      removeMessagesByIds(chatMessageIdsToRemove);
+    }
+
+    const combatPatch = pack?.combatPatch && typeof pack.combatPatch === "object" ? pack.combatPatch : null;
+    if (combatPatch?.clearCombat === true) {
+      setCombatOrder([]);
+      commitCombatTurnIndex(0);
+      setGameMode("exploration", entities, { force: true });
+      nextCombatOrder = [];
+      nextTurnIndex = 0;
+      nextGameMode = "exploration";
+    }
+    if (combatPatch?.gameMode === "combat") {
+      setGameMode("combat");
+      nextGameMode = "combat";
+    } else if (combatPatch?.gameMode === "exploration") {
+      setGameMode("exploration", entities, { force: true });
+      nextGameMode = "exploration";
+    }
+    if (Array.isArray(combatPatch?.combatOrder)) {
+      const nextOrder = combatPatch.combatOrder
+        .map((entry) => {
+          const id = String(entry?.id ?? "").trim();
+          if (!id) return null;
+          return {
+            id,
+            name: resolveCombatantDisplayName(
+              { id, name: id },
+              gameStateRef.current?.entities ?? entities,
+              player?.name ?? null
+            ),
+            initiative:
+              typeof entry?.initiative === "number" && Number.isFinite(entry.initiative)
+                ? Math.trunc(entry.initiative)
+                : 0,
+          };
+        })
+        .filter(Boolean);
+      setCombatOrder(nextOrder);
+      nextCombatOrder = nextOrder;
+      if (nextOrder.length > 0) {
+        const requestedIndex =
+          typeof combatPatch?.combatTurnIndex === "number" && Number.isFinite(combatPatch.combatTurnIndex)
+            ? Math.max(0, Math.min(nextOrder.length - 1, Math.trunc(combatPatch.combatTurnIndex)))
+            : 0;
+        commitCombatTurnIndex(requestedIndex);
+        nextTurnIndex = requestedIndex;
+      }
+    } else if (
+      typeof combatPatch?.combatTurnIndex === "number" &&
+      Number.isFinite(combatPatch.combatTurnIndex) &&
+      nextCombatOrder.length > 0
+    ) {
+      const requestedIndex = Math.max(
+        0,
+        Math.min(nextCombatOrder.length - 1, Math.trunc(combatPatch.combatTurnIndex))
+      );
+      commitCombatTurnIndex(requestedIndex);
+      nextTurnIndex = requestedIndex;
+    }
+
+    const hpAfterPatch =
+      playerUpdate?.hp?.current ??
+      rawEntityUpdates.find((update) => String(update?.id ?? "").trim() === "player")?.hp?.current;
+    if (typeof hpAfterPatch === "number" && hpAfterPatch > 0) {
+      deathNarrationSentRef.current = false;
+      setIsGameOver(false);
+      isGameOverRef.current = false;
+      playerHpRef.current = hpAfterPatch;
+    }
+
+    addMessage(
+      "ai",
+      String(pack?.narration ?? pack?.summary ?? "Commande godmode appliquée.").trim(),
+      "meta-reply",
+      makeMsgId()
+    );
+    addMessage(
+      "ai",
+      `[DEBUG] Godmode appliqué\n` +
+        safeJson({
+          command: originalCommand,
+          summary: pack?.summary ?? null,
+          teleport: teleport ?? null,
+          entityUpdates: entityUpdatesForApply,
+          roomMemoryOps,
+          chatHistoryPatch,
+          removedMessageIds: chatMessageIdsToRemove,
+          combatPatch,
+        }),
+      "debug",
+      makeMsgId()
+    );
+
+    gameStateRef.current = {
+      ...gameStateRef.current,
+      currentRoomId: nextRoomId,
+      currentScene: nextScene,
+      currentSceneName: nextSceneName,
+      entities: nextEntitiesForRef,
+      gameMode: nextGameMode,
+      combatOrder: nextCombatOrder,
+      combatTurnIndex: nextTurnIndex,
+    };
   }
 
   // Décompte quota 429
@@ -2411,8 +3532,7 @@ export default function ChatInterface() {
       presentNPCs,
     };
 
-    const pendingLabel =
-      `Illustration décidée par le narrateur pour « ${currentSceneName || "la scène"} » — génération en cours…`;
+    const pendingLabel = "Le MJ peint une illustration...";
     const debugBlock =
       `[DEBUG] Contexte visuel envoyé à /api/scene-image (synthèse serveur → prompt image) :\n` +
       safeJson(visualContext);
@@ -2475,12 +3595,45 @@ export default function ChatInterface() {
   async function generateEnemyTurn(enemy, context = {}) {
     try {
       const enemyWeapons = Array.isArray(enemy.weapons) ? enemy.weapons : [];
+      const enemyKnownSpells = getCombatantKnownSpells(enemy);
       const enemyFeaturesText = (Array.isArray(enemy.features) ? enemy.features : [])
         .map((f) => String(f ?? "").toLowerCase())
         .join(" | ");
       const hasCunningEscape =
         enemyFeaturesText.includes("fuite agile") ||
         enemyFeaturesText.includes("nimble escape");
+      const hasSpellSlotForLevel = (spellLevel) => {
+        const level = Number(spellLevel ?? 0);
+        if (!Number.isFinite(level) || level <= 0) return true;
+        const slots = enemy?.spellSlots ?? {};
+        return Object.entries(slots).some(([slotLevel, row]) => {
+          const numericLevel = Number(slotLevel);
+          if (!Number.isFinite(numericLevel) || numericLevel < level) return false;
+          const remaining = Number(row?.remaining ?? row?.max ?? 0);
+          return remaining > 0;
+        });
+      };
+      const enemySpellOptions = enemyKnownSpells
+        .map((spellName) => {
+          const canonicalSpellName = canonicalizeSpellNameAgainstCombatant(enemy, spellName) ?? spellName;
+          const spell = SPELLS?.[canonicalSpellName];
+          if (!spell) return null;
+          const castingTime = normalizeFr(spell.castingTime ?? "");
+          const isActionSpell = castingTime.includes("action") && !castingTime.includes("reaction");
+          const isOffensiveSpell =
+            !!spell.save || !!spell.damage || /attaque|attack/i.test(String(spell.attack ?? ""));
+          if (!isActionSpell || !isOffensiveSpell) return null;
+          return {
+            key: `spell_${normalizeFr(canonicalSpellName).replace(/[^a-z0-9]+/g, "_")}`,
+            label: canonicalSpellName,
+            cost: { action: 1 },
+            available: hasSpellSlotForLevel(spell.level ?? 0),
+            spellName: canonicalSpellName,
+          };
+        })
+        .filter(Boolean);
+      const hasWeaponAttackOption =
+        enemyWeapons.length > 0 || enemy.attackBonus != null || !!enemy.damageDice;
       const body = {
         provider: aiProvider,
         enemy: {
@@ -2523,7 +3676,7 @@ export default function ChatInterface() {
             action: true,
             bonus_action: true,
             movement: !!context?.movementOk,
-            reaction: true,
+            reaction: hasReaction(enemy.id),
           },
           actionCatalog: {
             mainActionOptions: [
@@ -2531,11 +3684,12 @@ export default function ChatInterface() {
                 key: "attack_weapon",
                 label: "Attaquer (arme)",
                 cost: { action: 1 },
-                available: true,
+                available: hasWeaponAttackOption,
                 weaponNames: enemyWeapons
                   .map((w) => String(w?.name ?? "").trim())
                   .filter(Boolean),
               },
+              ...enemySpellOptions,
               {
                 key: "dash",
                 label: "Foncer (Dash)",
@@ -2624,12 +3778,12 @@ export default function ChatInterface() {
         undefined,
         makeMsgId()
       );
-      return;
+      return { performed: false, targetAlive: target?.isAlive !== false };
     }
     const weapon = player?.weapons?.find((w) => !isRangedWeaponName(w?.name ?? "")) ?? player?.weapons?.[0];
     if (!weapon) {
       addMessage("ai", "Aucune arme de mêlée disponible pour l'attaque d'opportunité.", undefined, makeMsgId());
-      return;
+      return { performed: false, targetAlive: target?.isAlive !== false };
     }
     consumeResource(setTurnResources, "combat", "reaction");
     setReactionFor("player", false);
@@ -2663,6 +3817,134 @@ export default function ChatInterface() {
       content = `⚔️ Attaque d'opportunité (${weapon.name} → ${target.name}) — Raté.`;
     }
     addMessage("ai", content, "enemy-turn", makeMsgId());
+    const liveTarget = getRuntimeCombatant(target.id);
+    return { performed: true, targetAlive: liveTarget?.isAlive !== false };
+  }
+
+  function pickCombatantOpportunityWeapon(combatant) {
+    if (!combatant) return null;
+    const combatantWeapons = Array.isArray(combatant.weapons) ? combatant.weapons : [];
+    const meleeWeapon =
+      combatantWeapons.find((weapon) => !isRangedWeaponName(weapon?.name ?? "") && weapon?.kind !== "ranged") ??
+      null;
+    if (meleeWeapon) return meleeWeapon;
+    if (combatant.attackBonus != null || combatant.damageDice || combatant.damageBonus != null) {
+      return {
+        name: "Attaque d'opportunité",
+        attackBonus: combatant.attackBonus ?? 0,
+        damageDice: combatant.damageDice ?? "1d4",
+        damageBonus: combatant.damageBonus ?? 0,
+        kind: "melee",
+      };
+    }
+    return null;
+  }
+
+  async function resolveEnemyOpportunityAttack(reactor, target) {
+    if (!reactor || !target) return { performed: false, targetAlive: target?.isAlive !== false };
+    if (!hasReaction(reactor.id)) {
+      return { performed: false, targetAlive: target?.isAlive !== false };
+    }
+    const chosenWeapon = pickCombatantOpportunityWeapon(reactor);
+    if (!chosenWeapon) {
+      addMessage(
+        "ai",
+        `⚔️ ${reactor.name} ne peut pas profiter de l'ouverture pour porter une attaque d'opportunité.`,
+        "enemy-turn",
+        makeMsgId()
+      );
+      setReactionFor(reactor.id, false);
+      return { performed: false, targetAlive: target?.isAlive !== false };
+    }
+    setReactionFor(reactor.id, false);
+    const result = await resolveCombatantWeaponAttack(
+      reactor,
+      target,
+      chosenWeapon,
+      " (attaque d'opportunité)",
+      null,
+      { type: "reaction", name: chosenWeapon.name, target: target.id }
+    );
+    const liveTarget = getRuntimeCombatant(target.id);
+    return {
+      performed: true,
+      targetAlive:
+        result === "player_dead" ? false : liveTarget?.isAlive !== false,
+    };
+  }
+
+  function promptPlayerOpportunityAttack(reactor, target) {
+    return new Promise((resolve) => {
+      opportunityAttackPromptResolverRef.current = resolve;
+      setOpportunityAttackPrompt({
+        reactorId: reactor?.id ?? "player",
+        targetId: target?.id ?? "",
+        reactorName: reactor?.name ?? player?.name ?? "Vous",
+        targetName: target?.name ?? "la cible",
+      });
+    });
+  }
+
+  async function settlePlayerOpportunityAttackPrompt(choice) {
+    const prompt = opportunityAttackPrompt;
+    const resolver = opportunityAttackPromptResolverRef.current;
+    opportunityAttackPromptResolverRef.current = null;
+    setOpportunityAttackPrompt(null);
+    if (!prompt || typeof resolver !== "function") return;
+
+    const target = getRuntimeCombatant(prompt.targetId);
+    if (choice === "attack" && target?.isAlive !== false) {
+      const result = await resolvePlayerOpportunityAttack(target);
+      resolver(result ?? { performed: false, targetAlive: target?.isAlive !== false });
+      return;
+    }
+
+    addMessage(
+      "ai",
+      `⚔️ ${prompt.reactorName} laisse ${prompt.targetName} quitter le contact sans utiliser de réaction.`,
+      "enemy-turn",
+      makeMsgId()
+    );
+    resolver({ performed: false, targetAlive: target?.isAlive !== false });
+  }
+
+  async function processOpportunityAttacksForLeavingCombatant(movingCombatantId, reactorIds = []) {
+    for (const reactorId of Array.isArray(reactorIds) ? reactorIds : []) {
+      const mover = getRuntimeCombatant(movingCombatantId);
+      const reactor = getRuntimeCombatant(reactorId);
+      if (!mover || mover.isAlive === false) {
+        if (reactorId) removeFromMelee(movingCombatantId, reactorId);
+        return false;
+      }
+      if (!reactor || reactor.isAlive === false) {
+        if (reactorId) removeFromMelee(movingCombatantId, reactorId);
+        continue;
+      }
+
+      let result = { performed: false, targetAlive: mover.isAlive !== false };
+      if (reactor.id === "player" || controllerForCombatantId(reactor.id) === "player") {
+        if (!turnResourcesRef.current?.reaction || !hasReaction("player")) {
+          addMessage(
+            "ai",
+            `⚔️ ${player?.name ?? "Vous"} ne pouvez pas effectuer d'attaque d'opportunité contre ${mover.name} (réaction indisponible).`,
+            "enemy-turn",
+            makeMsgId()
+          );
+        } else {
+          result = await promptPlayerOpportunityAttack(reactor, mover);
+        }
+      } else if (hasReaction(reactor.id)) {
+        result = await resolveEnemyOpportunityAttack(reactor, mover);
+      }
+
+      removeFromMelee(movingCombatantId, reactor.id);
+
+      const liveMover = getRuntimeCombatant(movingCombatantId);
+      if (result.targetAlive === false || liveMover?.isAlive === false) {
+        return false;
+      }
+    }
+    return true;
   }
 
   const ENEMY_TACTICAL_STEP_MS = 800;
@@ -2742,27 +4024,33 @@ export default function ChatInterface() {
     const targetAc = getCombatantArmorClass(target);
     let lastDmgRoll = null;
     let lastDmgTotal = 0;
+    let targetDamageResult = null;
 
     let narrativeOutcome = "miss";
     if (nat === 1) narrativeOutcome = "fumble";
-    else if (nat === 20) narrativeOutcome = "critical_hit";
-    else if (atkTotal >= targetAc) narrativeOutcome = "hit";
+    else if (atkTotal >= targetAc) {
+      const autoCritOnUnconsciousTarget =
+        target.id === "player" &&
+        isPlayerUnconsciousNow() &&
+        !isRangedWeaponName(chosenWeapon.name);
+      narrativeOutcome = nat === 20 || autoCritOnUnconsciousTarget ? "critical_hit" : "hit";
+    }
 
-    if (nat === 20) {
+    if (narrativeOutcome === "critical_hit") {
       const r1 = rollDiceDetailed(dice);
       const r2 = rollDiceDetailed(dice);
       const dmg = Math.max(1, r1.total + r2.total + dmgBonus);
       lastDmgRoll = { crit: true, rolls1: r1.rolls, rolls2: r2.rolls };
       lastDmgTotal = dmg;
-      currentHp = Math.max(0, (currentHp ?? 0) - dmg);
-      applyHpToCombatant(target, currentHp);
-    } else if (atkTotal >= targetAc) {
+      targetDamageResult = applyDamageToCombatant(target, dmg, { critical: true });
+      currentHp = targetDamageResult.hpAfter;
+    } else if (narrativeOutcome === "hit") {
       const r = rollDiceDetailed(dice);
       const dmg = Math.max(1, r.total + dmgBonus);
       lastDmgRoll = { crit: false, rolls: r.rolls };
       lastDmgTotal = dmg;
-      currentHp = Math.max(0, (currentHp ?? 0) - dmg);
-      applyHpToCombatant(target, currentHp);
+      targetDamageResult = applyDamageToCombatant(target, dmg, { critical: false });
+      currentHp = targetDamageResult.hpAfter;
     }
 
     const combatDetailBlock = buildAutoAttackCombatDetail({
@@ -2864,6 +4152,9 @@ export default function ChatInterface() {
       "debug",
       makeMsgId()
     );
+    if (target.id === "player" && targetDamageResult?.dead === true) {
+      return "player_dead";
+    }
     return true;
   }
 
@@ -2923,8 +4214,9 @@ export default function ChatInterface() {
       const baseDmg = Math.max(0, r.total);
       const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
       const hpBefore = getCombatantCurrentHp(target);
-      const hpAfter =
-        hpBefore == null || finalDmg <= 0 ? hpBefore : applyHpToCombatant(target, hpBefore - finalDmg).hpAfter;
+      const damageResult =
+        hpBefore == null || finalDmg <= 0 ? null : applyDamageToCombatant(target, finalDmg, { critical: false });
+      const hpAfter = damageResult ? damageResult.hpAfter : hpBefore;
 
       addMessage(
         "ai",
@@ -2964,6 +4256,9 @@ export default function ChatInterface() {
         "debug",
         makeMsgId()
       );
+      if (target.id === "player" && damageResult?.dead === true) {
+        return "player_dead";
+      }
       return true;
     }
 
@@ -2983,6 +4278,7 @@ export default function ChatInterface() {
 
   async function simulateSingleEnemyTurn(enemy, opts = null) {
     await new Promise((r) => setTimeout(r, 400));
+    if (isPlayerDeadNow() || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
 
     const label = opts?.label ? ` (${opts.label})` : "";
     const playerTarget = getRuntimeCombatant("player");
@@ -3005,7 +4301,7 @@ export default function ChatInterface() {
       let chosenWeapon =
         enemyWeapons.find((w) => !isRangedWeapon(w)) ?? enemyWeapons[0] ?? null;
       if (chosenWeapon && playerTarget) {
-        await resolveCombatantWeaponAttack(
+        const result = await resolveCombatantWeaponAttack(
           enemy,
           playerTarget,
           chosenWeapon,
@@ -3013,6 +4309,7 @@ export default function ChatInterface() {
           null,
           { type: "action", name: chosenWeapon.name, target: "player" }
         );
+        if (result === "player_dead" || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
       }
       return;
     }
@@ -3130,6 +4427,7 @@ export default function ChatInterface() {
             act
           );
         }
+        if (ok === "player_dead" || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
         if (ok) attackPerformed = true;
         await pauseEnemyTacticalStep();
         continue;
@@ -3141,18 +4439,24 @@ export default function ChatInterface() {
           continue;
         }
         enemyMovementAvailable = false;
-        const inMelee = effectiveInMeleeWithPlayer;
-        const canAoO =
-          inMelee && !hasDisengaged && hasReaction("player") && turnResourcesRef.current?.reaction;
-        if (canAoO) {
-          await resolvePlayerOpportunityAttack(enemy);
+        const engagedReactors = getMeleeWith(enemy.id).filter((id) => {
+          const combatant = getRuntimeCombatant(id);
+          return combatant && combatant.isAlive !== false;
+        });
+        const inMelee = engagedReactors.length > 0;
+        if (inMelee && !hasDisengaged) {
+          const moverSurvived = await processOpportunityAttacksForLeavingCombatant(enemy.id, engagedReactors);
           await pauseEnemyTacticalStep();
+          if (!moverSurvived || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
+        } else if (inMelee && hasDisengaged) {
+          for (const reactorId of engagedReactors) {
+            removeFromMelee(enemy.id, reactorId);
+          }
         }
-        clearMeleeFor(enemy.id);
-        effectiveInMeleeWithPlayer = false;
+        effectiveInMeleeWithPlayer = getMeleeWith(enemy.id).includes("player");
         if (inMelee) {
           const fleeMsg =
-            hasDisengaged || canAoO
+            hasDisengaged || engagedReactors.length > 0
               ? `⚔️ ${enemy.name} s'éloigne du corps à corps.`
               : `⚔️ ${enemy.name} s'éloigne du corps à corps sans être inquiété.`;
           addMessage("ai", fleeMsg, "enemy-turn", makeMsgId());
@@ -3173,7 +4477,13 @@ export default function ChatInterface() {
     // on applique un pas de retrait implicite pour refléter l'intention tactique.
     if (hasDisengaged && effectiveInMeleeWithPlayer && enemyMovementAvailable) {
       enemyMovementAvailable = false;
-      clearMeleeFor(enemy.id);
+      const engagedReactors = getMeleeWith(enemy.id).filter((id) => {
+        const combatant = getRuntimeCombatant(id);
+        return combatant && combatant.isAlive !== false;
+      });
+      for (const reactorId of engagedReactors) {
+        removeFromMelee(enemy.id, reactorId);
+      }
       effectiveInMeleeWithPlayer = false;
       addMessage(
         "ai",
@@ -3203,7 +4513,7 @@ export default function ChatInterface() {
         }
         const canAttack = !(!inMelee && !isRangedWeapon(chosenWeapon));
         if (canAttack && chosenWeapon) {
-          await resolveCombatantWeaponAttack(
+          const result = await resolveCombatantWeaponAttack(
             enemy,
             playerTarget,
             chosenWeapon,
@@ -3211,6 +4521,7 @@ export default function ChatInterface() {
             tactical,
             { type: "action", name: chosenWeapon.name, target: "player", fallback: true }
           );
+          if (result === "player_dead" || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
         }
       }
     }
@@ -3228,7 +4539,7 @@ export default function ChatInterface() {
   useEffect(() => {
     if (gameMode !== "combat") return;
     const entry = combatOrder?.[combatTurnIndex];
-    if (!entry || entry.id !== "player") return;
+    if (!entry || controllerForCombatantId(entry.id) !== "player") return;
     setTurnResources((prev) => {
       if (!prev) {
         return {
@@ -3332,12 +4643,13 @@ export default function ChatInterface() {
       i = (i + 1) % order.length;
       const entry = order[i];
       if (!entry) continue;
-      if (entry.id === "player") return i;
-      const ent = currentEntities.find((e) => e.id === entry.id);
-      if (ent && ent.isAlive) return i;
+      if (!isCombatantAliveForTurnOrder(entry.id, currentEntities)) continue;
+      return i;
     }
     return 0;
   }
+
+  const enemyTurnLoopInProgressRef = useRef(false);
 
   /**
    * @param {object} [options]
@@ -3346,6 +4658,9 @@ export default function ChatInterface() {
    * @param {boolean} [options.skipInitialAdvance] — true : le combattant à startIndex agit en premier (début de round / post-initiative). false : on avance d'abord comme après « Fin de tour ».
    */
   async function runEnemyTurnsUntilPlayer(options = {}) {
+    if (enemyTurnLoopInProgressRef.current) return;
+    enemyTurnLoopInProgressRef.current = true;
+    try {
     let order = options.order ?? combatOrder;
     let idx =
       options.startIndex !== undefined && options.startIndex !== null
@@ -3356,6 +4671,10 @@ export default function ChatInterface() {
     // Exécute les tours ennemis selon l'ordre d'initiative jusqu'au tour du joueur.
     // Ne fait agir que les entités hostiles (type "hostile").
     let currentEntities = gameStateRef.current?.entities ?? entities;
+
+    if (!hasLivingPlayerCombatant(currentEntities)) {
+      return;
+    }
 
     // Si combat terminé, sortir
     if (isCombatOver(currentEntities)) {
@@ -3375,16 +4694,31 @@ export default function ChatInterface() {
     // Tant que ce n'est pas au joueur, faire agir le combattant courant et avancer
     for (let guard = 0; guard < 50; guard++) {
       currentEntities = gameStateRef.current?.entities ?? entities;
+      if (!hasLivingPlayerCombatant(currentEntities)) {
+        return;
+      }
       order = gameStateRef.current?.combatOrder ?? order;
       const entry = order[idx];
       if (!entry) break;
 
-      if (entry.id === "player") {
+      if (controllerForCombatantId(entry.id, currentEntities) === "player") {
         commitCombatTurnIndex(idx);
         setHasDisengagedThisTurn(false);
         setSneakAttackArmed(false);
         setSneakAttackUsedThisTurn(false);
-        if (player?.surprised === true) {
+        const arbiterAtPlayerTurnStart = await runCombatTurnStartArbiter({
+          actorId: "player",
+          actorName: player?.name ?? "Vous",
+          actorType: "player",
+        });
+        if (arbiterAtPlayerTurnStart?.awaitingPlayerRoll === true) {
+          return;
+        }
+        if (await preparePlayerTurnStartState()) {
+          return;
+        }
+        const livePlayerAtTurnStart = gameStateRef.current?.player ?? player;
+        if (livePlayerAtTurnStart?.surprised === true) {
           lockPlayerTurnResourcesForSurprise();
           addMessage(
             "ai",
@@ -3400,15 +4734,36 @@ export default function ChatInterface() {
 
       const ent = currentEntities.find((e) => e.id === entry.id);
       if (ent && ent.isAlive && ent.type === "hostile") {
-        const enemyStartsSurprised = ent.surprised === true;
-        setReactionFor(ent.id, !enemyStartsSurprised);
-        await simulateSingleEnemyTurn(ent);
+        // Synchroniser immédiatement le tour actif sur le combattant IA courant.
+        // Sans cela, la boucle peut repartir depuis l'ancien index (souvent celui du joueur)
+        // et faire rejouer le même ennemi en boucle.
+        commitCombatTurnIndex(idx);
+        const arbiterAtEnemyTurnStart = await runCombatTurnStartArbiter({
+          actorId: ent.id,
+          actorName: ent.name,
+          actorType: ent.type ?? null,
+        });
+        if (arbiterAtEnemyTurnStart?.awaitingPlayerRoll === true) {
+          return;
+        }
+        currentEntities = gameStateRef.current?.entities ?? entities;
+        const liveEnemy = currentEntities.find((e) => e.id === entry.id);
+        if (!liveEnemy || !liveEnemy.isAlive || liveEnemy.type !== "hostile") {
+          continue;
+        }
+        const enemyStartsSurprised = liveEnemy.surprised === true;
+        setReactionFor(liveEnemy.id, !enemyStartsSurprised);
+        await simulateSingleEnemyTurn(liveEnemy);
+        currentEntities = gameStateRef.current?.entities ?? entities;
+        if (!hasLivingPlayerCombatant(currentEntities)) {
+          return;
+        }
         if (enemyStartsSurprised) {
-          applyEntityUpdates([{ id: ent.id, action: "update", surprised: false }]);
-          setReactionFor(ent.id, true);
+          applyEntityUpdates([{ id: liveEnemy.id, action: "update", surprised: false }]);
+          setReactionFor(liveEnemy.id, true);
         }
       }
-      if (ent && ent.isAlive && entry.id !== "player") {
+      if (ent && ent.isAlive && controllerForCombatantId(entry.id, currentEntities) !== "player") {
         addMessage(
           "ai",
           `**${ent.name}** met fin à son tour.`,
@@ -3416,14 +4771,6 @@ export default function ChatInterface() {
           makeMsgId()
         );
         addMessage("ai", "", "turn-divider", makeMsgId());
-        const arbiterAfterEnemyTurn = await runCombatTurnEndArbiter({
-          actorId: ent.id,
-          actorName: ent.name,
-          actorType: ent.type ?? null,
-        });
-        if (arbiterAfterEnemyTurn?.awaitingPlayerRoll === true) {
-          return;
-        }
       }
 
       currentEntities = gameStateRef.current?.entities ?? entities;
@@ -3443,6 +4790,9 @@ export default function ChatInterface() {
 
     // fallback
     commitCombatTurnIndex(0);
+    } finally {
+      enemyTurnLoopInProgressRef.current = false;
+    }
   }
 
   const runEnemyTurnsUntilPlayerRef = useRef(() => Promise.resolve());
@@ -3450,7 +4800,7 @@ export default function ChatInterface() {
 
   const handleCommitInitiativeRef = useRef(() => {});
 
-  function handleCommitInitiative() {
+  async function handleCommitInitiative() {
     // Garde anti-race : tant qu'on attend une vraie narration GM
     // (embuscade/entrée en combat), on ne déclenche pas le jet d'initiative côté UI.
     if (waitForGmNarrationForInitiativeLiveRef.current) return;
@@ -3464,12 +4814,7 @@ export default function ChatInterface() {
           `[${rankLabel(idx)}] ${resolveCombatantDisplayName(entry, entities, player?.name)} (${entry.initiative})`
       )
       .join("\n");
-    addMessage(
-      "ai",
-      `🎲 **Jet d'Initiative**\n${orderText}\n\n⚔️ *Le combat commence !*`,
-      "dice",
-      makeMsgId()
-    );
+    addMessage("ai", `🎲 **Jet d'Initiative**\n\n${orderText}\n\n⚔️ *Le combat commence !*`, "dice", makeMsgId());
 
     const playerStartsSurprised = player?.surprised === true;
     if (playerStartsSurprised) {
@@ -3483,23 +4828,40 @@ export default function ChatInterface() {
       }
     }
     const first = merged[0];
-    if (first?.id === "player") {
+    if (controllerForCombatantId(first?.id) === "player") {
       setHasDisengagedThisTurn(false);
       setSneakAttackArmed(false);
       setSneakAttackUsedThisTurn(false);
-      if (playerStartsSurprised) {
-        lockPlayerTurnResourcesForSurprise();
-        addMessage(
-          "ai",
-          `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
-          "turn-end",
-          makeMsgId()
-        );
-      } else {
-        grantPlayerTurnResources();
+      setIsTyping(true);
+      try {
+        const arbiterAtPlayerTurnStart = await runCombatTurnStartArbiter({
+          actorId: "player",
+          actorName: player?.name ?? "Vous",
+          actorType: "player",
+        });
+        if (arbiterAtPlayerTurnStart?.awaitingPlayerRoll === true) {
+          return;
+        }
+        if (await preparePlayerTurnStartState()) {
+          return;
+        }
+        const livePlayerAtTurnStart = gameStateRef.current?.player ?? player;
+        if (livePlayerAtTurnStart?.surprised === true) {
+          lockPlayerTurnResourcesForSurprise();
+          addMessage(
+            "ai",
+            `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
+            "turn-end",
+            makeMsgId()
+          );
+        } else {
+          grantPlayerTurnResources();
+        }
+      } finally {
+        setIsTyping(false);
       }
     }
-    if (first && first.id !== "player") {
+    if (first && controllerForCombatantId(first.id) !== "player") {
       setIsTyping(true);
       queueMicrotask(() => {
         runEnemyTurnsUntilPlayerRef
@@ -3516,10 +4878,71 @@ export default function ChatInterface() {
 
   handleCommitInitiativeRef.current = handleCommitInitiative;
 
+  const lastAiTurnKickoffKeyRef = useRef(null);
+  useEffect(() => {
+    if (gameMode !== "combat") {
+      lastAiTurnKickoffKeyRef.current = null;
+      return;
+    }
+    if (flowBlockedRef.current) return;
+    if (isTyping || isAutoPlayerThinking) return;
+    if (enemyTurnLoopInProgressRef.current) return;
+    if (isGameOverRef.current) return;
+    if (awaitingPlayerInitiative) return;
+    if (waitForGmNarrationForInitiative) return;
+    if (sceneEnteredPipelineDepthRef.current > 0) return;
+    if (apiProcessingDepthRef.current > 0) return;
+    if (pendingRollRef.current) return;
+    if (!Array.isArray(combatOrder) || combatOrder.length === 0) return;
+    if (!hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
+
+    const activeEntry = combatOrder[combatTurnIndex];
+    if (!activeEntry) return;
+
+    const activeController = controllerForCombatantId(activeEntry.id);
+    if (activeController !== "ai") {
+      lastAiTurnKickoffKeyRef.current = null;
+      return;
+    }
+
+    const kickoffKey = `${combatTurnIndex}:${activeEntry.id}:${combatOrder.length}`;
+    if (lastAiTurnKickoffKeyRef.current === kickoffKey) return;
+    lastAiTurnKickoffKeyRef.current = kickoffKey;
+
+    queueMicrotask(() => {
+      const live = gameStateRef.current;
+      if (!hasLivingPlayerCombatant(live?.entities ?? null)) return;
+      const liveOrder = Array.isArray(live?.combatOrder) ? live.combatOrder : combatOrder;
+      const liveEntry = liveOrder[combatTurnIndexLiveRef.current];
+      if (!liveEntry) return;
+      if (controllerForCombatantId(liveEntry.id, live?.entities ?? null) !== "ai") return;
+      if (enemyTurnLoopInProgressRef.current) return;
+      if (flowBlockedRef.current || isGameOverRef.current || pendingRollRef.current) return;
+      if (sceneEnteredPipelineDepthRef.current > 0 || apiProcessingDepthRef.current > 0) return;
+      setIsTyping(true);
+      runEnemyTurnsUntilPlayerRef
+        .current({
+          order: liveOrder,
+          startIndex: combatTurnIndexLiveRef.current,
+          skipInitialAdvance: true,
+        })
+        .catch(() => {})
+        .finally(() => setIsTyping(false));
+    });
+  }, [
+    gameMode,
+    combatOrder,
+    combatTurnIndex,
+    awaitingPlayerInitiative,
+    waitForGmNarrationForInitiative,
+    isTyping,
+    isAutoPlayerThinking,
+  ]);
+
   // Auto-joueur : dès que le brouillon d'initiative PNJ est prêt, lancer le d20 joueur (évite la course setTimeout vs useEffect)
   useEffect(() => {
     if (!autoPlayerEnabled) return;
-    if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
+    if (isPlayerDeadNow()) return;
     if (gameMode !== "combat") return;
     if ((combatOrder?.length ?? 0) > 0) return;
     if (!awaitingPlayerInitiative) return;
@@ -3758,7 +5181,10 @@ export default function ChatInterface() {
     const isPlayerCombatTurn =
       effGameModeForIntent === "combat" &&
       effOrderForIntent.length > 0 &&
-      effOrderForIntent[effTurnIdxForIntent]?.id === "player";
+      controllerForCombatantId(
+        effOrderForIntent[effTurnIdxForIntent]?.id,
+        live?.entities ?? null
+      ) === "player";
 
     if (effGameModeForIntent === "combat" && !isPlayerCombatTurn) {
       // En auto-joueur, l'intention peut arriver avec un léger décalage de tour :
@@ -3776,6 +5202,7 @@ export default function ChatInterface() {
       postEntities,
       player,
       gameMode: effGameModeForIntent,
+      setGameMode,
       turnResources: turnResourcesRef.current,
       setTurnResources: setTurnResourcesSynced,
       setHp,
@@ -3809,14 +5236,6 @@ export default function ChatInterface() {
         makeMsgId()
       );
       addMessage("ai", "", "turn-divider", makeMsgId());
-      const arbiterAfterPlayerTurn = await runCombatTurnEndArbiter({
-        actorId: "player",
-        actorName: player?.name ?? "Vous",
-        actorType: "player",
-      });
-      if (arbiterAfterPlayerTurn?.awaitingPlayerRoll === true) {
-        return;
-      }
       await nextTurn();
       return;
     }
@@ -3850,16 +5269,35 @@ export default function ChatInterface() {
         typeof apiDecision.reason === "string" && apiDecision.reason.trim()
           ? apiDecision.reason.trim()
           : null;
-      addMessage(
-        "ai",
-        reason ?? "Vous balbutiez des propos incohérents... et tout le monde vous regarde.",
-        undefined,
-        makeMsgId()
-      );
+      await callApi("", "meta", false, {
+        hideUserMessage: true,
+        bypassIntentParser: true,
+        skipAutoPlayerTurn: true,
+        skipGmContinue: true,
+        entities: baseEntities,
+        currentRoomId: baseRoomId,
+        currentScene: baseScene,
+        gameMode: baseGameModeForResolve,
+        engineEvent: {
+          kind: "action_unclear",
+          reason: reason ?? "L'intention du joueur reste trop vague pour être résolue telle quelle.",
+          playerText: String(userTextForResolve ?? "").trim(),
+          resolution: "unclear_input",
+        },
+      });
       return;
     }
 
     if (resolution === "combat_intent") {
+      const intentType = String(apiDecision?.intent?.type ?? "").trim();
+      if (intentType === "short_rest") {
+        startShortRest();
+        return;
+      }
+      if (intentType === "long_rest") {
+        startLongRest();
+        return;
+      }
       await processEngineIntent(apiDecision.intent, baseEntities, userTextForResolve, baseRoomId, baseScene);
       return;
     }
@@ -4104,7 +5542,13 @@ export default function ChatInterface() {
         nextRoomId = resolved?.nextRoomId ?? nextRoomId;
         nextScene = resolved?.nextScene ?? nextScene;
         nextSceneName = resolved?.nextSceneName ?? nextSceneName;
-        engineEvent = resolved?.engineEvent ?? engineEvent;
+        const arbiterEngineEvent = resolved?.engineEvent ?? null;
+        const shouldKeepOriginalEngineEvent =
+          resolved?.arbiterResolution === "no_roll_needed" &&
+          engineEvent?.kind === "action_trivial_success" &&
+          !sceneUpdate?.hasChanged &&
+          !isSubstantiveArbiterEngineEvent(arbiterEngineEvent);
+        engineEvent = shouldKeepOriginalEngineEvent ? engineEvent : (arbiterEngineEvent ?? engineEvent);
         if (resolved?.awaitingPlayerRoll === true) {
           return;
         }
@@ -4145,7 +5589,7 @@ export default function ChatInterface() {
       title: room?.title ?? "",
       description: room?.description ?? "",
       secrets: room?.secrets ?? "",
-      exits: Array.isArray(room?.exits) ? room.exits : [],
+      exits: getVisibleExitsForRoom(id, getRoomMemory(id)),
       encounterEntities: Array.isArray(room?.encounterEntities) ? room.encounterEntities : [],
     }));
 
@@ -4158,8 +5602,7 @@ export default function ChatInterface() {
       };
 
       const connectedIds = new Set([effectiveRoomId]);
-      const currentRoomDef = GOBLIN_CAVE?.[effectiveRoomId];
-      const outgoing = Array.isArray(currentRoomDef?.exits) ? currentRoomDef.exits : [];
+      const outgoing = getVisibleExitsForRoom(effectiveRoomId, getRoomMemory(effectiveRoomId));
       for (const ex of outgoing) {
         const id = toExitId(ex);
         if (id) connectedIds.add(id);
@@ -4259,14 +5702,17 @@ export default function ChatInterface() {
     let campaignWorldContext = null;
     let campaignContextScope = null;
     const postArbiter = async (rollResult = null, worldContextOverride = null) => {
+      const visibleExitsForRoom = getVisibleExitsForRoom(roomId, getRoomMemory(roomId));
       const body = {
         provider,
         currentRoomId: roomId,
         currentRoomTitle: room?.title ?? "",
         currentScene: scene ?? "",
         currentRoomSecrets: room?.secrets ?? "",
+        worldTimeMinutes,
+        worldTimeLabel: formatWorldTimeLabel(worldTimeMinutes),
         roomMemory: getRoomMemory(roomId),
-        allowedExits: Array.isArray(room?.exits) ? room.exits : [],
+        allowedExits: Array.isArray(visibleExitsForRoom) ? visibleExitsForRoom : [],
         entities: Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [],
         player: player ?? null,
         messages: [...messagesRef.current],
@@ -4303,6 +5749,10 @@ export default function ChatInterface() {
               Array.isArray(data?.crossRoomEntityUpdates) && data.crossRoomEntityUpdates.length > 0,
             hasCrossRoomMemoryAppend:
               Array.isArray(data?.crossRoomMemoryAppend) && data.crossRoomMemoryAppend.length > 0,
+            timeAdvanceMinutes:
+              typeof data?.timeAdvanceMinutes === "number" && Number.isFinite(data.timeAdvanceMinutes)
+                ? Math.trunc(data.timeAdvanceMinutes)
+                : null,
             arbiterTrigger: arbiterTrigger ?? null,
             rollResultSent: rollResult ?? null,
             roomMemoryAppend: data?.roomMemoryAppend ?? null,
@@ -4316,6 +5766,22 @@ export default function ChatInterface() {
 
     let finalDecision = await postArbiter(rollResultOverride, campaignWorldContext);
     let rollOutcome = rollResultOverride;
+
+    const forceRequestRollFromInconsistentDecision = (decision) => {
+      if (!decision || typeof decision !== "object") return decision;
+      const hasRollRequest = !!decision.rollRequest && typeof decision.rollRequest === "object";
+      const resolution = String(decision.resolution ?? "").trim();
+      if (!hasRollRequest || resolution === "request_roll") return decision;
+      const forced = { ...decision, resolution: "request_roll" };
+      addMessage(
+        "ai",
+        `[DEBUG] GM Arbitre incohérent: rollRequest présent avec resolution="${resolution}". Normalisation moteur -> "request_roll".`,
+        "debug",
+        makeMsgId()
+      );
+      return forced;
+    };
+    finalDecision = forceRequestRollFromInconsistentDecision(finalDecision);
 
     for (let step = 0; step < 3; step++) {
       if (finalDecision?.resolution === "needs_campaign_context") {
@@ -4351,6 +5817,7 @@ export default function ChatInterface() {
           );
         }
         finalDecision = await postArbiter(rollOutcome, campaignWorldContext);
+        finalDecision = forceRequestRollFromInconsistentDecision(finalDecision);
         continue;
       }
 
@@ -4428,18 +5895,32 @@ export default function ChatInterface() {
         makeMsgId()
       );
       finalDecision = await postArbiter(rollOutcome, campaignWorldContext);
+      finalDecision = forceRequestRollFromInconsistentDecision(finalDecision);
     }
 
     let nextEntities = Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [];
+    const sourceRoomEntitiesBeforeTransition = nextEntities;
     let nextRoomId = roomId;
     let nextScene = scene;
     let nextSceneName = sceneName;
     let nextGameMode = baseGameMode;
+    const pendingSceneUpdateTargetId =
+      finalDecision?.sceneUpdate?.hasChanged && typeof finalDecision?.sceneUpdate?.targetRoomId === "string"
+        ? finalDecision.sceneUpdate.targetRoomId.trim()
+        : null;
+    const updatesTargetFutureRoomBase =
+      pendingSceneUpdateTargetId && pendingSceneUpdateTargetId !== roomId && pendingSceneUpdateTargetId !== nextRoomId;
+    const entitiesBaseForPlannedUpdates = updatesTargetFutureRoomBase
+      ? pendingSceneUpdateTargetId === "scene_journey"
+        ? []
+        : takeEntitiesForRoom(pendingSceneUpdateTargetId)
+      : nextEntities;
+    let targetRoomEntitiesFromCurrentDecision = null;
 
     const plannedUpdates = Array.isArray(finalDecision?.entityUpdates) ? finalDecision.entityUpdates : [];
     const plannedEntitiesAfterLocalUpdates = plannedUpdates.length
-      ? applyUpdatesLocally(nextEntities, plannedUpdates)
-      : nextEntities;
+      ? applyUpdatesLocally(entitiesBaseForPlannedUpdates, plannedUpdates)
+      : entitiesBaseForPlannedUpdates;
     const willSpawnHostile = plannedUpdates.some((u) => {
       if (!u || typeof u !== "object") return false;
       if (u.action !== "spawn") return false;
@@ -4458,18 +5939,23 @@ export default function ChatInterface() {
 
     const updates = plannedUpdates;
     if (updates.length) {
-      nextEntities = plannedEntitiesAfterLocalUpdates;
-      applyEntityUpdates(updates);
-      if ((nextGameMode === "combat" || gameStateRef.current?.gameMode === "combat") && combatOrder.length > 0) {
-        const spawnedIds = updates
-          .filter((u) => u && typeof u === "object" && u.action === "spawn")
-          .map((u) => String(u.id ?? "").trim())
-          .filter(Boolean);
-        if (spawnedIds.length > 0) {
-          const spawnedEntities = nextEntities.filter((ent) => spawnedIds.includes(ent.id));
-          insertSpawnedCombatantsIntoInitiative(spawnedEntities, {
-            anchorActorId: arbiterTrigger?.actorId ?? null,
-          });
+      if (updatesTargetFutureRoomBase) {
+        targetRoomEntitiesFromCurrentDecision = plannedEntitiesAfterLocalUpdates;
+        rememberRoomEntitiesSnapshot(pendingSceneUpdateTargetId, targetRoomEntitiesFromCurrentDecision);
+      } else {
+        nextEntities = plannedEntitiesAfterLocalUpdates;
+        applyEntityUpdates(updates);
+        if ((nextGameMode === "combat" || gameStateRef.current?.gameMode === "combat") && combatOrder.length > 0) {
+          const spawnedIds = updates
+            .filter((u) => u && typeof u === "object" && u.action === "spawn")
+            .map((u) => String(u.id ?? "").trim())
+            .filter(Boolean);
+          if (spawnedIds.length > 0) {
+            const spawnedEntities = nextEntities.filter((ent) => spawnedIds.includes(ent.id));
+            insertSpawnedCombatantsIntoInitiative(spawnedEntities, {
+              anchorActorId: arbiterTrigger?.actorId ?? null,
+            });
+          }
         }
       }
     }
@@ -4489,7 +5975,7 @@ export default function ChatInterface() {
       if (tRoom) {
         const isSameRoomTransition = tid === nextRoomId;
         if (!isSameRoomTransition) {
-          rememberRoomEntitiesSnapshot(nextRoomId, nextEntities);
+          rememberRoomEntitiesSnapshot(nextRoomId, sourceRoomEntitiesBeforeTransition);
         }
         nextRoomId = tid;
         nextScene = tRoom.description ?? nextScene;
@@ -4499,7 +5985,10 @@ export default function ChatInterface() {
         // (cas fréquent juste après l'entrée), on ne doit PAS effacer les spawns
         // déjà appliqués via entityUpdates.
         if (!isSameRoomTransition) {
-          nextEntities = tid === "scene_journey" ? [] : takeEntitiesForRoom(tid);
+          nextEntities =
+            tid === "scene_journey"
+              ? []
+              : targetRoomEntitiesFromCurrentDecision ?? takeEntitiesForRoom(tid);
         }
 
         setCurrentRoomId(nextRoomId);
@@ -4508,6 +5997,20 @@ export default function ChatInterface() {
         if (!isSameRoomTransition) {
           replaceEntities(nextEntities);
         }
+      }
+    }
+
+    let appliedTimeAdvanceMinutes = 0;
+    let nextWorldTimeLabel = null;
+    if (
+      typeof finalDecision?.timeAdvanceMinutes === "number" &&
+      Number.isFinite(finalDecision.timeAdvanceMinutes)
+    ) {
+      const clamped = Math.max(0, Math.min(1440, Math.trunc(finalDecision.timeAdvanceMinutes)));
+      if (clamped > 0) {
+        const nextMinute = advanceWorldClock(clamped);
+        appliedTimeAdvanceMinutes = clamped;
+        nextWorldTimeLabel = formatWorldTimeLabel(nextMinute);
       }
     }
 
@@ -4566,29 +6069,53 @@ export default function ChatInterface() {
         ? finalDecision.roomMemoryAppend.trim()
         : "";
     const arbiterDetails = explicitRoomMemory ? explicitRoomMemory.slice(0, 400) : "";
+    const defaultEngineEventKind =
+      arbiterTrigger?.phase === "scene_entered" ? "scene_transition" : "scene_rule_resolution";
+    const resolvedEngineEventKind =
+      typeof finalDecision?.engineEvent?.kind === "string" && finalDecision.engineEvent.kind.trim()
+        ? finalDecision.engineEvent.kind.trim()
+        : defaultEngineEventKind;
+    const narratorSafeReason = narratorSafeArbiterReason(
+      resolvedEngineEventKind,
+      resOut,
+      finalDecision?.reason ?? null,
+      arbiterDetails
+    );
 
     const engineEvent =
       finalDecision?.engineEvent && typeof finalDecision.engineEvent === "object"
         ? {
             ...finalDecision.engineEvent,
-            kind: finalDecision.engineEvent.kind ?? "scene_rule_resolution",
+            kind: resolvedEngineEventKind,
             roomId: nextRoomId,
-            reason: finalDecision?.reason ?? null,
+            reason: narratorSafeReason,
             details:
               typeof finalDecision.engineEvent.details === "string" &&
               finalDecision.engineEvent.details.trim()
                 ? finalDecision.engineEvent.details.trim()
                 : arbiterDetails || null,
             rollResult: rollOutcome,
-          arbiterTrigger: arbiterTrigger ?? null,
+            arbiterTrigger: arbiterTrigger ?? null,
+            ...(appliedTimeAdvanceMinutes > 0
+              ? {
+                  timeAdvanceMinutes: appliedTimeAdvanceMinutes,
+                  worldTimeLabel: nextWorldTimeLabel,
+                }
+              : {}),
           }
         : {
-            kind: "scene_rule_resolution",
+            kind: resolvedEngineEventKind,
             roomId: nextRoomId,
-            reason: finalDecision?.reason ?? null,
+            reason: narratorSafeReason,
             details: arbiterDetails || null,
             rollResult: rollOutcome,
-          arbiterTrigger: arbiterTrigger ?? null,
+            arbiterTrigger: arbiterTrigger ?? null,
+            ...(appliedTimeAdvanceMinutes > 0
+              ? {
+                  timeAdvanceMinutes: appliedTimeAdvanceMinutes,
+                  worldTimeLabel: nextWorldTimeLabel,
+                }
+              : {}),
           };
     if (resOut === "apply_consequences" || resOut === "no_roll_needed") {
       const memLine = explicitRoomMemory ? explicitRoomMemory.slice(0, 400) : "";
@@ -4601,9 +6128,131 @@ export default function ChatInterface() {
       nextScene,
       nextSceneName,
       nextGameMode,
+      arbiterResolution: resOut,
       engineEvent,
+      shouldNarrateResolution: shouldNarrateArbiterOutcome({
+        phase: arbiterTrigger?.phase ?? null,
+        resolution: resOut,
+        engineEvent,
+      }),
       awaitingPlayerRoll: false,
     };
+  }
+
+  function isPurelyProceduralNarratorReason(text) {
+    const t = String(text ?? "").trim().toLowerCase();
+    if (!t) return false;
+    return (
+      /aucun secret|aucun piège|aucun piege|aucune regle|aucune règle|n'est déclenché|n'est declenche|pas de piège|pas de piege/.test(t) ||
+      (/le joueur se déplace|le personnage se déplace|se dirige vers|approche|sans la franchir/.test(t) &&
+        !/découvre|decouvre|révèle|revele|ouvre|entre dans|apparait|apparaît|trouve|voit|aperçoit/.test(t))
+    );
+  }
+
+  function narratorSafeArbiterReason(kind, resolution, reason, details) {
+    const cleanReason = typeof reason === "string" && reason.trim() ? reason.trim() : null;
+    const cleanDetails = typeof details === "string" && details.trim() ? details.trim() : null;
+    if (!cleanReason) return null;
+    if (kind !== "scene_rule_resolution") return cleanReason;
+    if (cleanDetails) return cleanReason;
+    if (resolution === "no_roll_needed" && isPurelyProceduralNarratorReason(cleanReason)) return null;
+    return cleanReason;
+  }
+
+  function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEvent = null }) {
+    const cleanPhase = String(phase ?? "").trim();
+    const cleanResolution = String(resolution ?? "").trim();
+    const kind = String(engineEvent?.kind ?? "").trim();
+    const details = typeof engineEvent?.details === "string" ? engineEvent.details.trim() : "";
+    const reason = typeof engineEvent?.reason === "string" ? engineEvent.reason.trim() : "";
+
+    if (kind === "gm_secret_resolution") return false;
+
+    if (cleanPhase === "combat_turn_end") {
+      return false;
+    }
+
+    if (cleanPhase === "combat_turn_start") {
+      if (cleanResolution !== "apply_consequences") return false;
+      if (details) return true;
+      return !!reason && !isPurelyProceduralNarratorReason(reason);
+    }
+
+    return !!details || !!reason;
+  }
+
+  async function runCombatTurnStartArbiter({
+    actorId,
+    actorName,
+    actorType = null,
+  }) {
+    const latest = gameStateRef.current ?? {};
+    const activeRoomId = latest.currentRoomId ?? currentRoomId;
+    if (!activeRoomId || activeRoomId === "scene_journey") {
+      return { awaitingPlayerRoll: false };
+    }
+
+    const activeScene = latest.currentScene ?? currentScene;
+    const activeSceneName = latest.currentSceneName ?? currentSceneName;
+    const activeEntities = Array.isArray(latest.entities) ? latest.entities : entities;
+    const trigger = {
+      phase: "combat_turn_start",
+      actorId: actorId ?? null,
+      actorName: actorName ?? null,
+      actorType: actorType ?? null,
+      turnIndex: combatTurnIndexLiveRef.current,
+    };
+    const sourceAction = `[COMBAT_TURN_START] ${actorName ?? actorId ?? "unknown"} (${actorId ?? "unknown"})`;
+
+    try {
+      const resolved = await runSceneEntryGmArbiter({
+        roomId: activeRoomId,
+        scene: activeScene,
+        sceneName: activeSceneName,
+        entitiesAtEntry: activeEntities,
+        sourceAction,
+        baseGameMode: "combat",
+        intentDecision: {
+          resolution: "combat_turn_start",
+          reason: `Début de tour de ${actorName ?? actorId ?? "inconnu"}`,
+        },
+        arbiterTrigger: trigger,
+      });
+      if (resolved?.awaitingPlayerRoll === true) {
+        return resolved;
+      }
+      const eventDetails =
+        typeof resolved?.engineEvent?.details === "string" ? resolved.engineEvent.details.trim() : "";
+      const eventReason =
+        typeof resolved?.engineEvent?.reason === "string" ? resolved.engineEvent.reason.trim() : "";
+      if (resolved?.shouldNarrateResolution === true && (eventDetails || eventReason)) {
+        await callApi("", "meta", false, {
+          hideUserMessage: true,
+          bypassIntentParser: true,
+          skipAutoPlayerTurn: true,
+          skipGmContinue: true,
+          entities: resolved?.nextEntities ?? activeEntities,
+          currentRoomId: resolved?.nextRoomId ?? activeRoomId,
+          currentScene: resolved?.nextScene ?? activeScene,
+          currentSceneName: resolved?.nextSceneName ?? activeSceneName,
+          gameMode: resolved?.nextGameMode ?? "combat",
+          engineEvent: resolved?.engineEvent ?? null,
+        });
+      }
+      const visibleReason = String(resolved?.engineEvent?.reason ?? resolved?.reason ?? "").trim();
+      if (debugMode && visibleReason) {
+        addMessage("ai", visibleReason, "meta-reply", makeMsgId());
+      }
+      return resolved;
+    } catch (e) {
+      addMessage(
+        "ai",
+        `[DEBUG] Erreur arbitre début de tour combat : ${String(e?.message ?? e)}`,
+        "debug",
+        makeMsgId()
+      );
+      return { awaitingPlayerRoll: false };
+    }
   }
 
   async function runCombatTurnEndArbiter({
@@ -4650,7 +6299,7 @@ export default function ChatInterface() {
         typeof resolved?.engineEvent?.details === "string" ? resolved.engineEvent.details.trim() : "";
       const eventReason =
         typeof resolved?.engineEvent?.reason === "string" ? resolved.engineEvent.reason.trim() : "";
-      if (eventDetails || eventReason) {
+      if (resolved?.shouldNarrateResolution === true && (eventDetails || eventReason)) {
         await callApi("", "meta", false, {
           hideUserMessage: true,
           bypassIntentParser: true,
@@ -4730,10 +6379,17 @@ export default function ChatInterface() {
     if (!flowBlockedRef.current || overrides?.bypassFailureLock) {
       setError(null);
     }
+    if (tryHandleNaturalLanguageRest(userContent, msgType, isDebug, overrides)) {
+      setIsTyping(false);
+      return;
+    }
 
     // Arbitre universel : tout texte libre joueur passe d'abord par /api/parse-intent
     // (sauf messages système / jets déjà résolus / récursions internes).
-    const gameModeForParser = overrides?.gameMode ?? baseGameMode;
+    const gameModeForParser =
+      (overrides?.gameMode ?? baseGameMode) === "short_rest"
+        ? "exploration"
+        : (overrides?.gameMode ?? baseGameMode);
     const trimmedUserForParser = String(userContent ?? "").trim();
     const trivialParserInput =
       trimmedUserForParser === "" || /^[.\s]+$/.test(trimmedUserForParser);
@@ -4764,6 +6420,7 @@ export default function ChatInterface() {
           return typeof e.id === "string" && !!e.id.trim();
         });
         const parserRoom = baseRoomId && GOBLIN_CAVE[baseRoomId] ? GOBLIN_CAVE[baseRoomId] : null;
+        const parserVisibleExits = getVisibleExitsForRoom(baseRoomId, getRoomMemory(baseRoomId));
         const parseBody = {
           text: userContent,
           messages: updatedMessages,
@@ -4771,8 +6428,8 @@ export default function ChatInterface() {
           currentScene: baseScene,
           currentRoomId: baseRoomId,
           currentRoomSecrets: parserRoom?.secrets ?? "",
-          allowedExits: Array.isArray(parserRoom?.exits)
-            ? parserRoom.exits
+          allowedExits: Array.isArray(parserVisibleExits)
+            ? parserVisibleExits
                 .map((exitDef) => {
                   const exitId =
                     typeof exitDef === "string"
@@ -4816,7 +6473,7 @@ export default function ChatInterface() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(parseBody),
           },
-          60000,
+          PARSE_INTENT_TIMEOUT_MS,
           "parse-intent"
         );
         addMessage(
@@ -4860,10 +6517,20 @@ export default function ChatInterface() {
               makeMsgId()
             );
           }
-          await processArbiterDecision(data, baseEntities, userContent, baseRoomId, baseScene, baseGameMode);
+          await processArbiterDecision(
+            data,
+            baseEntities,
+            userContent,
+            baseRoomId,
+            baseScene,
+            gameModeForParser
+          );
         }
       } catch (e) {
-        console.error("Erreur parse-intent", e);
+        const errMsg = String(e?.message ?? e);
+        if (!/^Timeout\b/i.test(errMsg)) {
+          console.error("Erreur parse-intent", e);
+        }
         addMessage(
           "ai",
           "Erreur réseau ou serveur (parse-intent).",
@@ -4932,6 +6599,8 @@ export default function ChatInterface() {
             gameMode: overrides?.gameMode ?? latest.gameMode,
             provider: latest.aiProvider,
             debugMode: latest.debugMode,
+            worldTimeMinutes,
+            worldTimeLabel: formatWorldTimeLabel(worldTimeMinutes),
             roomMemory: getRoomMemory(effectiveRoomId),
             messages: limitedMessages,
             engineEvent,
@@ -5357,7 +7026,15 @@ export default function ChatInterface() {
           // Tour actif = premier de l'ordre d'initiative (aligné sur le moteur client)
           commitCombatTurnIndex(0);
         }
-        if (typeof safePlayerHpUpdate === "number") setHp(safePlayerHpUpdate);
+        if (typeof safePlayerHpUpdate === "number") {
+          const currentPlayerHp = playerHpRef.current ?? player?.hp?.current ?? safePlayerHpUpdate;
+          if (safePlayerHpUpdate < currentPlayerHp) {
+            applyDamageToPlayer(currentPlayerHp - safePlayerHpUpdate, { critical: false });
+          } else {
+            setHp(safePlayerHpUpdate);
+            playerHpRef.current = safePlayerHpUpdate;
+          }
+        }
 
         // --- Command pattern : actionIntent (combat, tour du joueur) ---
         const effGameModeForIntent = newGameMode ?? baseGameMode;
@@ -5368,7 +7045,7 @@ export default function ChatInterface() {
         const isPlayerCombatTurn =
           effGameModeForIntent === "combat" &&
           effOrderForIntent.length > 0 &&
-          effOrderForIntent[effTurnIdxForIntent]?.id === "player";
+          controllerForCombatantId(effOrderForIntent[effTurnIdxForIntent]?.id, postEntities) === "player";
         const isCombatOpeningWithoutOrder =
           effGameModeForIntent === "combat" &&
           effOrderForIntent.length === 0 &&
@@ -5386,6 +7063,7 @@ export default function ChatInterface() {
             postEntities,
             player,
             gameMode: effGameModeForIntent,
+            setGameMode,
             turnResources: turnResourcesRef.current,
             setTurnResources: setTurnResourcesSynced,
             setHp,
@@ -5948,9 +7626,9 @@ export default function ChatInterface() {
         // on évite que le moteur "déplace" la scène immédiatement (porte forcée != entrée).
         // Utiliser baseRoomId (la salle réellement envoyée au MJ) pour éviter
         // les validations erronées dues à un state React potentiellement stale.
-          const currentRoom = baseRoomId && GOBLIN_CAVE[baseRoomId] ? GOBLIN_CAVE[baseRoomId] : null;
-        const allowedExits = Array.isArray(currentRoom?.exits)
-          ? currentRoom.exits
+        const visibleExits = getVisibleExitsForRoom(baseRoomId, getRoomMemory(baseRoomId));
+        const allowedExits = Array.isArray(visibleExits)
+          ? visibleExits
               .map((exitDef) =>
                 typeof exitDef === "string" ? exitDef : String(exitDef?.id ?? "").trim()
               )
@@ -6263,6 +7941,9 @@ export default function ChatInterface() {
         };
         scheduleAutoPlayerTurn(() => {
           if (!autoPlayerEnabledRef.current) return;
+          if ((gameStateRef.current?.gameMode ?? newGameMode ?? baseGameMode) === "combat" && !isPlayerTurnNow()) {
+            return;
+          }
           runAutoPlayerTurn(overrides);
         });
       }
@@ -6372,8 +8053,7 @@ export default function ChatInterface() {
         if (vc && typeof vc === "object") {
           // Rejoue la génération d'image avec le même contexte.
           const pendingId = makeMsgId();
-          const pendingLabel =
-            `Illustration décidée par le narrateur pour « ${currentSceneName || "la scène"} » — génération en cours…`;
+          const pendingLabel = "Le MJ peint une illustration...";
           const debugBlock =
             `[DEBUG] Retry image → /api/scene-image\n` + safeJson({ model: mdl });
           appendSceneImagePendingSlot(pendingId, pendingLabel, debugBlock);
@@ -6453,54 +8133,49 @@ export default function ChatInterface() {
     }
   }
 
-  // Game Over : 0 PV → arrêt combat + narration finale (une fois)
+  // Game Over : uniquement si le personnage est réellement mort.
   useEffect(() => {
-    const cur = player?.hp?.current;
-    if (typeof cur !== "number") return;
-    if (cur > 0) {
+    const deathState = getPlayerDeathStateSnapshot();
+    if (deathState.dead !== true) {
       deathNarrationSentRef.current = false;
       setIsGameOver(false);
+      isGameOverRef.current = false;
       return;
     }
     if (deathNarrationSentRef.current) return;
     deathNarrationSentRef.current = true;
     setIsGameOver(true);
-    setGameMode("exploration", undefined, { force: true });
-    setCombatOrder([]);
-    commitCombatTurnIndex(0);
-    const deathMsg =
-      "[GAME OVER] Le personnage joueur vient de tomber à 0 PV sous les coups de ses ennemis. Narre sa mort tragique, la chute de son corps sur le sol, et la fin sombre de cette aventure. Ne propose aucune suite.";
-    void callApi(deathMsg, "meta", false, {
-      skipAutoPlayerTurn: true,
-      skipGmContinue: true,
-      hideUserMessage: true,
-    });
+    setIsTyping(false);
+    setIsAutoPlayerThinking(false);
+    setPendingRoll(null);
+    pendingRollRef.current = null;
+    waitForGmNarrationForInitiativeLiveRef.current = false;
+    setWaitForGmNarrationForInitiative(false);
+    autoTurnInProgressRef.current = false;
+    rollResolutionInProgressRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- callApi stable pour cet usage ponctuel
-  }, [player?.hp?.current, setGameMode, setCombatOrder, setCombatTurnIndex]);
+  }, [player?.deathState, setPendingRoll]);
 
   const handleCheatReviveAfterGameOver = useCallback(() => {
     deathNarrationSentRef.current = false;
     setIsGameOver(false);
+    isGameOverRef.current = false;
 
     if (player?.hp?.max) {
-      setHp(player.hp.max);
-      playerHpRef.current = player.hp.max;
-    }
-
-    const survivingNonHostiles = (Array.isArray(entities) ? entities : []).filter(
-      (entity) => entity && entity.type !== "hostile"
-    );
-    replaceEntities(survivingNonHostiles);
-    if (currentRoomId) {
-      rememberRoomEntitiesSnapshot(currentRoomId, survivingNonHostiles);
+      restorePlayerToConsciousness(player.hp.max);
     }
 
     clearMeleeFor("player");
     setHasDisengagedThisTurn(false);
+    if (Array.isArray(combatOrder) && combatOrder.length > 0) {
+      const playerIdx = combatOrder.findIndex((entry) => entry?.id === "player");
+      if (playerIdx >= 0) {
+        commitCombatTurnIndex(playerIdx);
+      }
+      setGameMode("combat");
+    }
     grantPlayerTurnResources();
-    setGameMode("exploration", survivingNonHostiles, { force: true });
-    setCombatOrder([]);
-    commitCombatTurnIndex(0);
+    setReactionFor("player", true);
     setPendingRoll(null);
     setMovementGate(null);
     setWaitForGmNarrationForInitiative(false);
@@ -6518,27 +8193,25 @@ export default function ChatInterface() {
     sceneEnteredPipelineDepthRef.current = 0;
     rollResolutionInProgressRef.current = false;
     autoTurnInProgressRef.current = false;
+    setShortRestState(null);
 
     addMessage(
       "ai",
-      "Un second souffle improbable vous arrache aux ténèbres. Le combat est brisé et le silence retombe autour de vous.",
+      "Un second souffle improbable vous arrache aux ténèbres. Vous vous relevez et le combat reprend aussitôt.",
       "meta",
       makeMsgId()
     );
   }, [
     addMessage,
     clearMeleeFor,
-    currentRoomId,
-    entities,
+    combatOrder,
     grantPlayerTurnResources,
-    rememberRoomEntitiesSnapshot,
-    replaceEntities,
-    setCombatOrder,
+    restorePlayerToConsciousness,
     setError,
     setGameMode,
     setHasDisengagedThisTurn,
-    setHp,
     setPendingRoll,
+    setReactionFor,
   ]);
 
   // ---------------------------------------------------------------------------
@@ -6587,6 +8260,7 @@ export default function ChatInterface() {
 
     const snap0 = gameStateRef.current;
     if (!snap0) return;
+    if (snap0.gameMode === "combat" && !isPlayerTurnNow(snap0)) return;
     // Toujours utiliser l'état courant (snap0.entities) :
     // les overrides peuvent contenir des entités "stales" (ex: gobelin déjà mort),
     // ce qui fait que l'auto-joueur cible des 0 PV.
@@ -6658,7 +8332,7 @@ export default function ChatInterface() {
         let activeEntry = rawActiveEntry;
         // Si l'entrée active pointe encore vers une créature morte (0 PV) à cause
         // d'un lag de state, on la corrige vers le prochain vivant.
-        if (hasOrder && rawActiveEntry && rawActiveEntry.id !== "player") {
+        if (hasOrder && rawActiveEntry && controllerForCombatantId(rawActiveEntry.id, ents) !== "player") {
           const ent = ents.find((x) => x.id === rawActiveEntry.id);
           if (!ent || ent.isAlive !== true) {
             const startIdx = (combatTurnIndex - 1 + co.length) % co.length;
@@ -6673,7 +8347,7 @@ export default function ChatInterface() {
               ? false
               : !hasOrder
                 ? false
-                : activeEntry?.id === "player";
+                : controllerForCombatantId(activeEntry?.id, ents) === "player";
         const engagedIds = getMeleeWith("player").filter((id) => {
           const ent = ents.find((e) => e.id === id);
           return !!ent && ent.isAlive && ent.type === "hostile";
@@ -7140,8 +8814,8 @@ export default function ChatInterface() {
     if (gameMode === "combat") {
       if (!Array.isArray(combatOrder) || combatOrder.length === 0) return;
       const activeEntry = combatOrder[combatTurnIndex];
-      if (!activeEntry || activeEntry.id !== "player") return;
-    } else if (gameMode !== "exploration") {
+      if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
+    } else if (gameMode !== "exploration" && gameMode !== "short_rest") {
       return;
     }
 
@@ -7207,7 +8881,7 @@ export default function ChatInterface() {
         ? false
         : !hasOrder
           ? false
-          : activeEntry?.id === "player");
+          : controllerForCombatantId(activeEntry?.id) === "player");
     if (!trimmed || isTyping || retryCountdown > 0 || pendingRoll || flowBlocked || !isMyTurn) return;
 
     // Théâtre de l'esprit (moteur) : si engagé et tentative de s'éloigner sans Désengagement â†’ gate UX
@@ -7241,7 +8915,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
 
     setIsTyping(true);
     try {
@@ -7253,14 +8927,6 @@ export default function ChatInterface() {
         makeMsgId()
       );
       addMessage("ai", "", "turn-divider", makeMsgId());
-      const arbiterAfterPlayerTurn = await runCombatTurnEndArbiter({
-        actorId: "player",
-        actorName: player?.name ?? "Vous",
-        actorType: "player",
-      });
-      if (arbiterAfterPlayerTurn?.awaitingPlayerRoll === true) {
-        return;
-      }
       // Boucle tour par tour (enregistrée sur le contexte comme nextTurn)
       await nextTurn();
     } finally {
@@ -7272,7 +8938,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
     if (player?.entityClass !== "Guerrier") return;
 
     const remaining = player?.fighter?.resources?.secondWind?.remaining ?? 0;
@@ -7336,7 +9002,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
     if (player?.entityClass !== "Clerc") return;
 
     const cd = player?.cleric?.resources?.channelDivinity ?? null;
@@ -7397,7 +9063,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
     if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     consumeResource(setTurnResources, "combat", "bonus");
@@ -7408,7 +9074,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
     if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     consumeResource(setTurnResources, "combat", "bonus");
@@ -7422,7 +9088,7 @@ export default function ChatInterface() {
     if (isTyping || retryCountdown > 0 || pendingRoll || flowBlocked) return;
     if (gameMode !== "combat") return;
     const activeEntry = combatOrder[combatTurnIndex];
-    if (!activeEntry || activeEntry.id !== "player") return;
+    if (!activeEntry || controllerForCombatantId(activeEntry.id) !== "player") return;
     if (player?.entityClass !== "Roublard" || (player?.level ?? 1) < 2) return;
     if (!turnResourcesRef.current?.bonus) return;
     setHasDisengagedThisTurn(true);
@@ -7511,6 +9177,7 @@ export default function ChatInterface() {
   async function resolveMovementGate(choice) {
     const gate = movementGate;
     if (!gate) return;
+    const hostileIds = gate.hostileIds ?? (gate.enemyId ? [gate.enemyId] : []);
     // Désengagement = Action
     if (choice === "disengage") {
       if (gameMode === "combat" && !turnResourcesRef.current?.action) {
@@ -7519,7 +9186,9 @@ export default function ChatInterface() {
       }
       setHasDisengagedThisTurn(true);
       consumeResource(setTurnResources, "combat", "action");
-      clearMeleeFor("player");
+      for (const hostileId of hostileIds) {
+        removeFromMelee("player", hostileId);
+      }
       setMovementGate(null);
       setInput("");
       await callApi(gate.text);
@@ -7528,17 +9197,12 @@ export default function ChatInterface() {
 
     // Partir quand même â†’ on simule une attaque d'opportunité immédiate (moteur), puis mouvement
     if (choice === "leave_anyway") {
-      const hostileIds = gate.hostileIds ?? (gate.enemyId ? [gate.enemyId] : []);
-      for (const hostileId of hostileIds) {
-        const hostile = entities.find((e) => e.id === hostileId);
-        if (hostile && hostile.isAlive && hostile.type === "hostile" && hasReaction(hostileId)) {
-          await simulateSingleEnemyTurn(hostile, { label: "attaque d'opportunité" });
-          setReactionFor(hostileId, false);
-        }
-      }
-      clearMeleeFor("player");
+      const moverSurvived = await processOpportunityAttacksForLeavingCombatant("player", hostileIds);
       setMovementGate(null);
       setInput("");
+      if (!moverSurvived || (playerHpRef.current ?? player?.hp?.current ?? 0) <= 0) {
+        return;
+      }
       await callApi(gate.text);
     }
   }
@@ -7546,8 +9210,14 @@ export default function ChatInterface() {
   async function handleRoll() {
     const roll = pendingRollRef.current != null ? pendingRollRef.current : pendingRoll;
     if (!roll || isTyping || retryCountdown > 0 || flowBlocked) return;
-    if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
+    if (
+      isGameOver ||
+      ((player?.hp?.current ?? 1) <= 0 && roll.kind !== "death_save" && roll.kind !== "hit_die")
+    ) {
+      return;
+    }
     rollResolutionInProgressRef.current = true;
+    setIsTyping(true);
     try {
     addMessage(
       "ai",
@@ -7563,6 +9233,135 @@ export default function ChatInterface() {
       "debug",
       makeMsgId()
     );
+
+    if (roll.kind === "hit_die") {
+      const hitDieNotation = String(roll?.engineContext?.hitDie ?? player?.hitDie ?? "d8");
+      const dieRoll = rollDiceDetailed(hitDieNotation);
+      const conMod = getPlayerConModifier();
+      const heal = Math.max(0, dieRoll.total + conMod);
+      // Snapshot unique : évite décalage chat / barre (ex. double passage du updater React).
+      const maxHp = player?.hp?.max ?? 0;
+      const currentHp = player?.hp?.current ?? 0;
+      const prevHd = player?.hitDiceRemaining ?? 0;
+      const remainingAfter = Math.max(0, prevHd - 1);
+      const nextHp = Math.min(maxHp, currentHp + heal);
+      setPlayer((prev) => {
+        if (!prev?.hp) return prev;
+        playerHpRef.current = nextHp;
+        return {
+          ...prev,
+          hp: { ...prev.hp, current: nextHp },
+          hitDiceRemaining: remainingAfter,
+        };
+      });
+      setShortRestState((prev) =>
+        prev ? { ...prev, spentDice: Math.max(0, (prev.spentDice ?? 0) + 1) } : prev
+      );
+      pendingRollRef.current = null;
+      setPendingRoll(null);
+      addMessage(
+        "ai",
+        `🎲 Repos court — ${hitDieNotation} [${dieRoll.rolls.join("+")}] ${conMod >= 0 ? "+" : "-"} CON ${Math.abs(conMod)} = **${heal} PV** → Vous : **${nextHp}/${maxHp || nextHp} HP**.`,
+        "dice",
+        makeMsgId()
+      );
+      if (!(remainingAfter > 0 && nextHp < maxHp)) {
+        finishShortRest(
+          remainingAfter > 0
+            ? "Le repos court s'achève. Vous avez récupéré autant que nécessaire."
+            : "Le repos court s'achève. Vous n'avez plus de dés de vie à dépenser."
+        );
+      }
+      return;
+    }
+
+    if (roll.kind === "death_save") {
+      const nat = debugNextRoll ?? (Math.floor(Math.random() * 20) + 1);
+      if (debugNextRoll !== null) setDebugNextRoll(null);
+      const stableHours = Math.floor(Math.random() * 4) + 1;
+      let nextDeathState = getPlayerDeathStateSnapshot();
+      let restoredHp = null;
+
+      if (nat === 1) {
+        nextDeathState = resetPlayerDeathState({
+          ...nextDeathState,
+          failures: Math.min(3, nextDeathState.failures + 2),
+          unconscious: true,
+          stable: false,
+          dead: nextDeathState.failures + 2 >= 3,
+        });
+      } else if (nat === 20) {
+        restoredHp = 1;
+      } else if (nat >= 10) {
+        nextDeathState = resetPlayerDeathState({
+          ...nextDeathState,
+          successes: Math.min(3, nextDeathState.successes + 1),
+          unconscious: true,
+          stable: nextDeathState.successes + 1 >= 3,
+          autoRecoverAtMinute:
+            nextDeathState.successes + 1 >= 3 ? worldTimeMinutes + stableHours * 60 : null,
+        });
+      } else {
+        nextDeathState = resetPlayerDeathState({
+          ...nextDeathState,
+          failures: Math.min(3, nextDeathState.failures + 1),
+          unconscious: true,
+          stable: false,
+          dead: nextDeathState.failures + 1 >= 3,
+        });
+      }
+
+      pendingRollRef.current = null;
+      setPendingRoll(null);
+
+      if (restoredHp != null) {
+        restorePlayerToConsciousness(restoredHp);
+        addMessage(
+          "ai",
+          `🎲 Jet de sauvegarde contre la mort — Nat **20** ! Vous revenez à vous avec **1 PV** et pouvez agir normalement.`,
+          "dice",
+          makeMsgId()
+        );
+        return;
+      }
+
+      updatePlayerDeathState(nextDeathState);
+      addMessage(
+        "ai",
+        `🎲 Jet de sauvegarde contre la mort — Nat ${nat} → ${
+          nat >= 10
+            ? `Succès (${nextDeathState.successes}/3)`
+            : nat === 1
+              ? `Échec critique (${nextDeathState.failures}/3)`
+              : `Échec (${nextDeathState.failures}/3)`
+        }.`,
+        "dice",
+        makeMsgId()
+      );
+
+      if (nextDeathState.dead) {
+        markPlayerDead("Vos derniers sursauts s'éteignent. Vous mourez.");
+        return;
+      }
+
+      if (nextDeathState.stable) {
+        addMessage(
+          "ai",
+          `Vous êtes stabilisé à **0 PV**. Sans aide extérieure, vous récupérerez **1 PV** vers ${formatWorldTimeLabel(
+            nextDeathState.autoRecoverAtMinute ?? worldTimeMinutes
+          )}.`,
+          "meta",
+          makeMsgId()
+        );
+      }
+
+      if (gameMode === "combat" && combatOrder?.[combatTurnIndex]?.id === "player") {
+        addMessage("ai", `**${player?.name ?? "Vous"}** ne peut rien faire d'autre ce tour-ci.`, "turn-end", makeMsgId());
+        addMessage("ai", "", "turn-divider", makeMsgId());
+        await nextTurn();
+      }
+      return;
+    }
 
     // -----------------------------------------------------------------------
     // Cas 1 : Attaque résolue par le moteur (anti-hallucinations)
@@ -8100,12 +9899,8 @@ export default function ChatInterface() {
       const baseDmg = Math.max(0, r.total);
       const finalDmg = success ? Math.floor(baseDmg / 2) : baseDmg;
       const hpBefore = playerHpRef.current;
-      const hpAfter = finalDmg > 0 ? Math.max(0, hpBefore - finalDmg) : hpBefore;
-
-      if (finalDmg > 0) {
-        setHp(hpAfter);
-        playerHpRef.current = hpAfter;
-      }
+      const damageResult = finalDmg > 0 ? applyDamageToPlayer(finalDmg, { critical: false }) : null;
+      const hpAfter = damageResult ? damageResult.hpAfter : hpBefore;
 
       pendingRollRef.current = null;
       setPendingRoll(null);
@@ -8350,15 +10145,68 @@ export default function ChatInterface() {
     });
     } finally {
       rollResolutionInProgressRef.current = false;
+      setIsTyping(false);
     }
   }
 
   async function handleDebugSend() {
     const trimmed = debugInput.trim();
-    if (!trimmed || isTyping || flowBlocked) return;
-    if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
+    if (!trimmed || isTyping) return;
+
+    const requestBody = {
+      command: trimmed,
+      provider: aiProvider === "gemini" ? "gemini" : "openrouter",
+      debugMode: debugMode === true,
+      currentRoomId,
+      currentScene,
+      currentSceneName,
+      currentRoomMemory: getRoomMemory(currentRoomId),
+      gameMode,
+      player,
+      entities,
+      messages,
+      combatOrder,
+      combatTurnIndex,
+    };
+
     setDebugInput("");
-    await callApi(`[HORS_JEU]: ${trimmed}`, "meta", true);
+    setIsTyping(true);
+    setError(null);
+    try {
+      const { res, data } = await fetchJsonWithTimeout(
+        "/api/debug-godmode",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        },
+        PARSE_INTENT_TIMEOUT_MS,
+        "debug-godmode"
+      );
+
+      setApiLog({
+        sent: {
+          route: "/api/debug-godmode",
+          command: trimmed,
+          roomId: currentRoomId,
+          gameMode,
+          provider: requestBody.provider,
+        },
+        received: data,
+      });
+
+      if (!res.ok) {
+        throw new Error(String(data?.details ?? data?.error ?? `Erreur HTTP ${res.status}`));
+      }
+
+      applyGodmodeResponse(data, trimmed);
+    } catch (e) {
+      const msg = String(e?.message ?? e);
+      setError(msg);
+      addMessage("ai", `[DEBUG] Erreur godmode : ${msg}`, "debug", makeMsgId());
+    } finally {
+      setIsTyping(false);
+    }
   }
 
   function handleKeyDown(e) {
@@ -8378,7 +10226,7 @@ export default function ChatInterface() {
       ? false
       : !hasOrder
         ? false
-        : activeEntry?.id === "player");
+        : controllerForCombatantId(activeEntry?.id) === "player");
   // Bandeau jaune « Jet requis » : bloquer saisie (humain + cohérence avec l’auto-joueur)
   const playerDeadOrOver =
     isGameOver || (typeof player?.hp?.current === "number" && player.hp.current <= 0);
@@ -8661,7 +10509,7 @@ export default function ChatInterface() {
                   />
                   <p className="text-center text-sm font-medium text-indigo-100/90">{msg.content}</p>
                   <p className="text-center text-[11px] text-slate-500">
-                    L&apos;image apparaîtra ici dès qu&apos;elle sera prête — le fil du chat continue au-dessous.
+                    L&apos;image apparaîtra ici dès qu&apos;elle sera prête.
                   </p>
                 </div>
               </div>
@@ -8743,13 +10591,13 @@ export default function ChatInterface() {
               <div key={msg.id} className="flex justify-center">
                 {diceKind === "ally-attack" || diceKind === "ally-move" ? (
                   <div className="rounded-xl border border-green-600/50 bg-green-950/60 px-4 py-2.5 text-sm text-green-200 shadow">
-                    <p className="text-center tracking-wide">
+                    <p className="text-center tracking-wide whitespace-pre-wrap">
                       <BoldText text={repairedDice} />
                     </p>
                   </div>
                 ) : (
                   <div className="rounded-xl border border-yellow-500/60 bg-yellow-950/70 px-4 py-2.5 text-sm text-yellow-200 shadow">
-                    <p className="text-center tracking-wide">
+                    <p className="text-center tracking-wide whitespace-pre-wrap">
                       <BoldText text={repairedDice} />
                     </p>
                   </div>
@@ -8761,6 +10609,7 @@ export default function ChatInterface() {
           // Message hors-RP joueur â€” teal
           if (msg.type === "meta") {
             const repaired = repairMojibakeForDisplay(msg.content);
+            const metaText = String(repaired ?? "").replace(/^\[HORS_JEU\]:\s*/, "");
             return (
               <div key={msg.id} className="flex justify-center">
                 <div
@@ -8769,7 +10618,7 @@ export default function ChatInterface() {
                   }
                 >
                   <p className="leading-relaxed whitespace-pre-wrap">
-                    {repaired.replace(/^\[HORS_JEU\]:\s*/, "")}
+                    <BoldText text={metaText} />
                   </p>
                 </div>
               </div>
@@ -8984,7 +10833,7 @@ export default function ChatInterface() {
       {debugMode && (
         <div className="border-t border-teal-700/50 bg-teal-950/30 px-4 py-3 flex flex-col gap-3 shrink-0">
           <p className="text-xs font-semibold text-teal-400">
-            {repairMojibakeForDisplay("ðŸ”§ Debug â€” Communication directe avec l'IA")}
+            {repairMojibakeForDisplay("ðŸ”§ Debug â€” God Mode moteur")}
           </p>
           <div className="flex gap-2">
             <input
@@ -8992,7 +10841,7 @@ export default function ChatInterface() {
               value={debugInput}
               onChange={(e) => setDebugInput(e.target.value)}
               onKeyDown={handleDebugKeyDown}
-              placeholder="Ex : Cet ennemi est mort, correction de la scèneâ€¦"
+              placeholder="Ex : Téléporte-moi en room_4, tue le gobelin ricanant, remets mes PV à 13…"
               disabled={isTyping}
               className="flex-1 rounded-md border border-teal-600/60 bg-teal-900/30 px-4 py-2 text-sm text-teal-100 placeholder-teal-700 outline-none focus:border-teal-400 disabled:opacity-50"
             />
@@ -9281,19 +11130,37 @@ export default function ChatInterface() {
         </div>
       )}
 
+      {opportunityAttackPrompt && gameMode === "combat" && (
+        <div className="border-t border-violet-700/60 bg-violet-950/40 px-4 py-3 flex flex-wrap items-center gap-2 shrink-0">
+          <div className="text-xs text-violet-100 flex-1 min-w-[220px]">
+            <span className="font-semibold text-violet-200">Réaction</span>
+            {" — "}
+            {opportunityAttackPrompt.targetName} quitte votre portée. Voulez-vous porter une attaque d&apos;opportunité ?
+          </div>
+          <button
+            onClick={() => settlePlayerOpportunityAttackPrompt("attack")}
+            disabled={playerDeadOrOver || !turnResourcesRef.current?.reaction || !hasReaction("player")}
+            className="rounded-md bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Utiliser votre réaction pour faire une attaque d'opportunité"
+          >
+            Attaquer (Réaction)
+          </button>
+          <button
+            onClick={() => settlePlayerOpportunityAttackPrompt("skip")}
+            disabled={playerDeadOrOver}
+            className="rounded-md border border-violet-500/50 px-3 py-2 text-xs font-semibold text-violet-100 hover:bg-violet-900/60 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Laisser passer
+          </button>
+        </div>
+      )}
+
       {gameMode === "combat" && awaitingPlayerInitiative && !isTyping && !waitForGmNarrationForInitiative && (
         <div className="border-t border-amber-800/50 bg-amber-950/40 px-4 py-3 flex flex-wrap items-center gap-3 shrink-0">
           <div className="text-xs text-amber-100 flex-1 min-w-[200px]">
             <span className="font-semibold text-amber-200">Initiative</span>
-            {" — "}
-            Les adversaires ont lancé leurs dés. Cliquez pour lancer votre d20 (+DEX).
-            {npcInitiativeDraft.length > 0 && (
-              <span className="block mt-1 text-slate-400 font-mono text-[11px]">
-                {npcInitiativeDraft
-                  .map((e) => `${resolveCombatantDisplayName(e, entities, player?.name)}: ${e.initiative}`)
-                  .join(" · ")}
-              </span>
-            )}
+            {" - "}
+            Cliquez pour lancer votre d20
           </div>
           <button
             type="button"
@@ -9302,6 +11169,46 @@ export default function ChatInterface() {
             className="rounded-md bg-amber-600 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-500 disabled:opacity-40"
           >
             Lancer l&apos;initiative
+          </button>
+        </div>
+      )}
+
+      {gameMode === "short_rest" && (
+        <div className="border-t border-emerald-800/50 bg-emerald-950/40 px-4 py-3 flex flex-wrap items-center gap-3 shrink-0">
+          <div className="text-xs text-emerald-100 flex-1 min-w-[220px]">
+            <span className="font-semibold text-emerald-200">Repos court</span>
+            {" — "}
+            Vous êtes en pause. Il vous reste{" "}
+            <span className="font-semibold text-emerald-200">
+              {player?.hitDiceRemaining ?? 0}
+            </span>{" "}
+            dé(s) de vie.
+            {player?.hp?.max != null && (
+              <>
+                {" "}
+                PV actuels :{" "}
+                <span className="font-semibold text-emerald-200">
+                  {player?.hp?.current ?? 0}/{player.hp.max}
+                </span>
+                .
+              </>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={triggerHitDieRollFromShortRest}
+            disabled={inputBlocked || (player?.hitDiceRemaining ?? 0) <= 0 || (player?.hp?.current ?? 0) >= (player?.hp?.max ?? 0)}
+            className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Lancer un dé de vie
+          </button>
+          <button
+            type="button"
+            onClick={() => finishShortRest("Le repos court prend fin.")}
+            disabled={inputBlocked}
+            className="rounded-md border border-emerald-500/50 px-4 py-2 text-sm font-semibold text-emerald-100 hover:bg-emerald-900/50 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Reprendre l&apos;aventure
           </button>
         </div>
       )}
@@ -9324,6 +11231,8 @@ export default function ChatInterface() {
                         ? "Lancez d'abord le dé demandé par le MJâ€¦"
                         : awaitingPlayerInitiative
                           ? "Lancez d'abord votre initiative (bouton ci-dessus)â€¦"
+                          : gameMode === "short_rest"
+                            ? "Repos court : lancez un dé de vie ou reprenez l'aventureâ€¦"
                     : !isMyTurn
                       ? "Combat : ce n'est pas votre tour (attendez)..."
                       : "Décrivez votre actionâ€¦ (Entrée pour envoyer)"

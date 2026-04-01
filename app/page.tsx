@@ -12,7 +12,7 @@ import {
   type Entity,
   type CombatEntry,
 } from "@/context/GameContext";
-import { SPELLS } from "@/data/srd5";
+import { SPELLS, ARMORS } from "@/data/srd5";
 import { resolveCombatantDisplayName } from "@/lib/combatDisplayName";
 
 // ---------------------------------------------------------------------------
@@ -92,6 +92,32 @@ function proficiencyBonus(level: number) {
   if (level <= 12) return 4;
   if (level <= 16) return 5;
   return 6;
+}
+
+function formatWorldTimeLabel(totalMinutes: number) {
+  const safeMinutes = Math.max(0, Math.trunc(Number(totalMinutes) || 0));
+  const day = Math.floor(safeMinutes / 1440) + 1;
+  const minutesInDay = safeMinutes % 1440;
+  const hours = Math.floor(minutesInDay / 60);
+  const minutes = minutesInDay % 60;
+  return `Jour ${day}, ${String(hours).padStart(2, "0")}h${String(minutes).padStart(2, "0")}`;
+}
+
+function effectivePlayerArmorClass(player: {
+  ac?: number | null;
+  fighter?: { fightingStyle?: string };
+  inventory?: string[];
+} | null): number {
+  const base = Number(player?.ac ?? 10) || 10;
+  const style = player?.fighter?.fightingStyle ?? null;
+  if (style !== "Défense") return base;
+  const inventory = Array.isArray(player?.inventory) ? player.inventory : [];
+  const hasArmor = inventory.some((item) => {
+    const armor = ARMORS?.[item as keyof typeof ARMORS];
+    if (!armor) return false;
+    return String((armor as { type?: string }).type ?? "").toLowerCase() !== "bouclier";
+  });
+  return base + (hasArmor ? 1 : 0);
 }
 
 function HpBar({ current, max, thick = false }: { current: number; max: number; thick?: boolean }) {
@@ -318,6 +344,7 @@ export default function Home() {
   const {
     isGameStarted, startGame, setPlayer, startNewGame,
     player, entities, gameMode, combatOrder, combatTurnIndex, debugMode, currentSceneName, currentSceneImage,
+    worldTimeMinutes,
     turnResources,
     getMeleeWith,
   } = useGame();
@@ -361,6 +388,71 @@ export default function Home() {
     return <CharacterSelection onSelect={setPlayer} />;
   }
 
+  const displayedArmorClass = effectivePlayerArmorClass(player);
+  const resourceRows: Array<{ key: string; label: string; value: string }> = [];
+  if (player.hitDie) {
+    resourceRows.push({
+      key: "hit-dice",
+      label: "Dés de vie",
+      value: `${player.hitDiceRemaining ?? player.level}/${player.hitDiceTotal ?? player.level} (${player.hitDie})`,
+    });
+  }
+  const secondWind = player.fighter?.resources?.secondWind;
+  if (secondWind) {
+    resourceRows.push({
+      key: "second-wind",
+      label: "Second souffle",
+      value: `${secondWind.remaining}/${secondWind.max}`,
+    });
+  }
+  const actionSurge = player.fighter?.resources?.actionSurge;
+  if (actionSurge) {
+    resourceRows.push({
+      key: "action-surge",
+      label: "Sursaut d'action",
+      value: `${actionSurge.remaining}/${actionSurge.max}`,
+    });
+  }
+  const indomitable = player.fighter?.resources?.indomitable;
+  if (indomitable) {
+    resourceRows.push({
+      key: "indomitable",
+      label: "Indomptable",
+      value: `${indomitable.remaining}/${indomitable.max}`,
+    });
+  }
+  const superiorityDice = player.fighter?.resources?.superiorityDice;
+  if (superiorityDice) {
+    resourceRows.push({
+      key: "superiority-dice",
+      label: "Dés de supériorité",
+      value: `${superiorityDice.remaining}/${superiorityDice.dice} (${superiorityDice.die})`,
+    });
+  }
+  const channelDivinity = player.cleric?.resources?.channelDivinity;
+  if (channelDivinity) {
+    resourceRows.push({
+      key: "channel-divinity",
+      label: "Conduit divin",
+      value: `${channelDivinity.remaining}/${channelDivinity.max}`,
+    });
+  }
+  const rogueLuck = player.rogue?.resources?.luck;
+  if (rogueLuck) {
+    resourceRows.push({
+      key: "rogue-luck",
+      label: "Chance (Roublard)",
+      value: `${rogueLuck.remaining}/${rogueLuck.max}`,
+    });
+  }
+  if (player.wizard?.arcaneRecovery) {
+    resourceRows.push({
+      key: "arcane-recovery",
+      label: "Restauration arcanique",
+      value: player.wizard.arcaneRecovery.used ? "Utilisée" : "Disponible",
+    });
+  }
+
   // Si le jeu n'a pas commencé, on affiche UNIQUEMENT le menu
   if (!isGameStarted) {
     return <CampaignMenu onStart={startGame} onBack={() => setPlayer(null)} />;
@@ -374,6 +466,7 @@ export default function Home() {
     ? entities
     : entities.filter((e) => e.visible && e.type !== "object");
   const isInCombat = gameMode === "combat";
+  const isShortRestMode = gameMode === "short_rest";
   const isPlayerTurn =
     isInCombat &&
     combatOrder.length > 0 &&
@@ -421,7 +514,31 @@ export default function Home() {
         </div>
         <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
           <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Classe d&apos;armure</p>
-          <p className="text-3xl font-bold text-blue-300">{player.ac}</p>
+          <p className="text-3xl font-bold text-blue-300">{displayedArmorClass}</p>
+        </div>
+      </div>
+
+      {/* Ressources suivies */}
+      <div>
+        <h4 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">
+          Ressources disponibles
+        </h4>
+        <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
+          {resourceRows.length > 0 ? (
+            <ul className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {resourceRows.map((row) => (
+                <li
+                  key={row.key}
+                  className="rounded-md border border-slate-700 bg-slate-900/60 px-3 py-2 text-sm text-slate-200 flex items-center justify-between gap-3"
+                >
+                  <span className="text-slate-300">{row.label}</span>
+                  <span className="tabular-nums font-semibold text-slate-100">{row.value}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-slate-500 italic">Aucune ressource de classe suivie pour ce personnage.</p>
+          )}
         </div>
       </div>
 
@@ -470,16 +587,16 @@ export default function Home() {
           {player.xp !== undefined && (
             <p className="mt-2 text-slate-500">
               XP : <span className="tabular-nums text-slate-300">{player.xp}</span>
-              {player.hitDie && (
-                <>
-                  {" · "}Dés de vie :{" "}
-                  <span className="tabular-nums text-slate-300">
-                    {player.hitDiceRemaining ?? player.level}/{player.hitDiceTotal ?? player.level} ({player.hitDie})
-                  </span>
-                </>
-              )}
             </p>
           )}
+          {player.deathState?.dead ? (
+            <p className="text-red-400">État : mort</p>
+          ) : player.hp.current <= 0 ? (
+            <p className="text-amber-400">
+              État : {player.deathState?.stable ? "stabilisé" : "inconscient"} ·
+              jets {player.deathState?.successes ?? 0}/3 réussites, {player.deathState?.failures ?? 0}/3 échecs
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -663,7 +780,7 @@ export default function Home() {
         </div>
         <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
           <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Classe d&apos;armure</p>
-          <p className="text-3xl font-bold text-blue-300">{player.ac}</p>
+          <p className="text-3xl font-bold text-blue-300">{displayedArmorClass}</p>
         </div>
       </div>
 
@@ -956,7 +1073,7 @@ export default function Home() {
               </div>
               <div className="flex justify-between text-xs text-slate-400 pt-1">
                 <span>Classe d&apos;Armure</span>
-                <span className="tabular-nums font-semibold text-slate-200">{player.ac}</span>
+                <span className="tabular-nums font-semibold text-slate-200">{displayedArmorClass}</span>
               </div>
             </div>
           </div>
@@ -1093,12 +1210,24 @@ export default function Home() {
             className={`flex items-center justify-center gap-2 rounded-lg border py-2 text-sm font-bold tracking-wide transition-colors ${
               isInCombat
                 ? "border-red-700 bg-red-950/60 text-red-300 cursor-pointer hover:bg-red-900/50"
+                : isShortRestMode
+                  ? "border-emerald-700 bg-emerald-950/60 text-emerald-300"
                 : "border-slate-700 bg-slate-800/60 text-slate-400"
             }`}
           >
-            {isInCombat ? "⚔️ COMBAT" : "🗺️ EXPLORATION"}
+            {isInCombat ? "⚔️ COMBAT" : isShortRestMode ? "🛌 REPOS COURT" : "🗺️ EXPLORATION"}
             {debugMode && <span className="text-teal-400 text-xs font-normal">[Debug]</span>}
             {isInCombat && <span className="text-[10px] text-red-600">↗</span>}
+          </div>
+
+          {/* Horloge de campagne (Jour / Heure) */}
+          <div className="rounded-md border border-slate-700 bg-slate-800/60 px-3 py-2 text-xs text-slate-300">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold uppercase tracking-wider text-slate-500">Temps</span>
+              <span className="tabular-nums font-semibold text-slate-200">
+                {formatWorldTimeLabel(worldTimeMinutes)}
+              </span>
+            </div>
           </div>
 
           {/* Ordre d'initiative (compact) — cliquable */}

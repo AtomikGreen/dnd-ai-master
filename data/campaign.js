@@ -5,12 +5,18 @@ export const CAMPAIGN_CONTEXT = {
   title: "À la Chasse aux Gobs",
   setting: "Fial, un village tranquille niché au creux de la grande vallée du Saril, à l'est de la province d'Egonzasthan. Placé sous l'autorité du chevalier de Saint-Bris.",
 
+  /**
+   * Heure de départ canonique de la campagne (minutes depuis Jour 1, 00h00).
+   * Ex: 13h00 -> 13 * 60 = 780.
+   */
+  startWorldTimeMinutes: 13 * 60,
+
   /** Affiché une fois en tête du chat au lancement de la partie (encadré). */
   chatOpeningContext: {
     title: "Contexte",
     body: `Fial est un village tranquille niché au creux de la grande vallée du Saril, à l'est de la province d'Egonzasthan, et placé sous l'autorité du chevalier de Saint-Bris.
-
-Depuis environ deux semaines, plusieurs villageois ont aperçu sur la colline, à l'ouest, des gobelins. Toutefois, jusque-là, aucun raid de ces petites créatures maléfiques n'est à déplorer. Gérald de Flamberge, le régisseur de Saint-Bris, a été prévenu, mais le chevalier a d'autres chats à fouetter pour le moment, en particulier une bande d'orques qui sévit dans les montagnes au sud-est de Fial et qui représente un danger bien plus important. De Flamberge, pour sa part, n'a que deux soldats à ses ordres, et il préfère les garder au village avec lui plutôt que de les envoyer prendre des risques dans la forêt.`,
+    
+    Depuis environ deux semaines, plusieurs villageois ont aperçu sur la colline, à l'ouest, des gobelins. Toutefois, jusque-là, aucun raid de ces petites créatures maléfiques n'est à déplorer. Gérald de Flamberge, le régisseur de Saint-Bris, a été prévenu, mais le chevalier a d'autres chats à fouetter pour le moment, en particulier une bande d'orques qui sévit dans les montagnes au sud-est de Fial et qui représente un danger bien plus important. De Flamberge, pour sa part, n'a que deux soldats à ses ordres, et il préfère les garder au village avec lui plutôt que de les envoyer prendre des risques dans la forêt.`,
   },
   backstory: "Depuis 2 semaines, des gobelins ont été aperçus. Le régisseur, Gérald de Flamberge, refuse d'envoyer ses 2 seuls soldats car une bande d'orques menace le sud-est. Ce midi, Thron (forgeron et chef du village) a appris par le commis du meunier que des gobelins ont enlevé sa fille, Lanéa.",
   mainQuest: "Aller vérifier si la jeune fille capturée est bien Lanéa, et la délivrer discrètement des mains des gobelins sans alerter la mère de Lanéa.",
@@ -33,23 +39,26 @@ Depuis environ deux semaines, plusieurs villageois ont aperçu sur la colline, �
    * Toujours envoyé si non vide ; une autre campagne peut remplacer tout le fichier avec le même contrat d'export.
    */
   narratorCampaignContext: `
-L'antre des gobelins
+    L'antre des gobelins
 
-Plafonds. Tous les plafonds sont à environ 3 mètres de haut.
+    Plafonds. Tous les plafonds sont à environ 3 mètres de haut.
 
-Lumière. Par défaut les couloirs sont obscurs et les salles éclairées par des torches. Les gobelins possédant la vision dans le noir, ils ne s'embarrassent pas à éclairer les passages, mais la lumière dans les lieux de vie est plus confortable pour eux.
+    Lumière. Par défaut les couloirs sont obscurs et les salles éclairées par des torches. Les gobelins possédant la vision dans le noir, ils ne s'embarrassent pas à éclairer les passages, mais la lumière dans les lieux de vie est plus confortable pour eux.
 
-Le complexe possède deux parties : une grotte naturelle (salles 1 et 2) et un vieux complexe creusé il y a de nombreuses années et que les gobelins ne font qu'occuper temporairement.
-`.trim()
+    Le complexe possède deux parties : une grotte naturelle (salles 1 et 2) et un vieux complexe creusé il y a de nombreuses années et que les gobelins ne font qu'occuper temporairement.
+  `.trim()
 };
+
+// Export direct (utile pour le moteur si besoin d'import ciblé).
+export const CAMPAIGN_START_WORLD_TIME_MINUTES = CAMPAIGN_CONTEXT.startWorldTimeMinutes;
 
 export const GOBLIN_CAVE = {
   // --- SCÈNES D'INTRODUCTION ---
   "scene_village": {
     id: "scene_village",
     title: "Le Village de Fial - La Forge de Thron",
-    description: "Mes enfants, vous êtes les jeunes les plus aguerris du village, et certains d’entre vous sont des amis de ma fille Lanéa. Un commis du vieil Erdrios, le meunier, vient de m’apprendre qu’il vient de voir sur la colline un petit groupe de gobelins portant une jeune femme qui ressemblait beaucoup à ma fille. Or justement Lanéa est partie tôt ce matin dans cette direction, et elle n’est pas revenue à l’heure du repas. Je ne vous cache pas ma préoccupation, et si sa mère l’apprend, elle risque de mourir d’inquiétude. Alors en toute franchise, je voudrais vous demander un énorme service : pourriez-vous aller vérifier si c’est bien ma fille que ces monstres ont attrapée et, si vous le pensez possible, en profiter pour la délivrer des mains de ces créatures ? Si j’y vais moi, ma femme va se douter que quelque chose de grave est en train de se passer.",
-    secrets: "Uniquement si les joueurs interrogent explicitement Thron, le commis du meunier ou d'autres villageois sur des détails supplémentaires : 1. Le commis peut indiquer où se situe l'entrée de l'antre, à environ trois heures de marche à l'ouest, dans les collines, mais il n'ira pas plus loin. 2. D'autres villageois peuvent mentionner qu'un gobelours, bien plus grand et plus fort qu'un gobelin, a été aperçu récemment du même côté. Ces informations ne doivent jamais être données spontanément.",
+    description: "En début d’après-midi, Thron, le forgeron qui fait également office de chef du village, convoque les personnages. 'Mes enfants, vous êtes les jeunes les plus aguerris du village, et certains d’entre vous sont des amis de ma fille Lanéa. Un commis du vieil Erdrios, le meunier, vient de m’apprendre qu’il vient de voir sur la colline un petit groupe de gobelins portant une jeune femme qui ressemblait beaucoup à ma fille. Or justement Lanéa est partie tôt ce matin dans cette direction, et elle n’est pas revenue à l’heure du repas. Je ne vous cache pas ma préoccupation, et si sa mère l’apprend, elle risque de mourir d’inquiétude. Alors en toute franchise, je voudrais vous demander un énorme service : pourriez-vous aller vérifier si c’est bien ma fille que ces monstres ont attrapée et, si vous le pensez possible, en profiter pour la délivrer des mains de ces créatures ? Si j’y vais moi, ma femme va se douter que quelque chose de grave est en train de se passer.'",
+    secrets: "Le commis du meunier, qui a suivi de loin les gobelins, pourra indiquer au groupe où se situe l’entrée de leur antre, à environ trois heures de marche à l’ouest, dans les collines, mais il se gardera bien, personnellement, de s’approcher trop près. De plus, si les personnages posent quelques questions aux autres villageois avant de partir, ils apprennent également qu’un gobelours, un monstre bien plus grand et bien plus fort qu’un gobelin, a également été aperçu du même côté il y a quelques jours.",
     exits: [
       {
         id: "scene_journey",
@@ -62,7 +71,7 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 90% de chance de se faire attaquer à quelques encablures de l’antre par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa.",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer à quelques encablures de l’antre par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa.",
     exits: [
       {
         id: "room_intro",
@@ -93,7 +102,7 @@ export const GOBLIN_CAVE = {
   "room_1": {
     id: "room_1",
     title: "L'Entrée",
-    description: "Une petite grotte naturelle et obscure (plafond à 3m).",
+    description: "Une petite grotte naturelle et obscure (plafond à 3m). Apres l'entre se situe un croisement depuis lequel plusieurs galleries partent dans des directions différentes.",
     secrets: "Deux gobelins sont censés y monter la garde, mais pour le moment… ils somnolent. Ils n'entendront pas si on crochète la serrure et seront surpris (donc n’agiront pas durant le premier round), de même pour une entrée violente et en force dans la pièce. Ils portent une armure de cuir et un cimeterre mais ont peu de chance d’avoir le temps de prendre leur bouclier (baisser leur CA de 2 dans ce cas). L’un possède 12 po, l’autre 16 pc.",
     exits: [
       {
@@ -163,7 +172,7 @@ export const GOBLIN_CAVE = {
       {
         id: "room_2",
         direction: "sud",
-        description: "Au sud, la porte s'ouvre sur des marches descendant vers la salle d'armes."
+        description: "Au sud, une porte."
       }
     ]
   },
@@ -323,7 +332,7 @@ export const GOBLIN_CAVE = {
     id: "room_13",
     title: "La Salle du Trône",
     description: "Au fond de cette vaste salle, la plus grande du complexe jusque-là, se trouve un trône en bois sur lequel est assis celui qui doit assurément être le chef de cette petite tribu de gobelins. Trois autres gobelins sont présents. Deux grands tapis recouvrent des pans de mur.",
-    secrets: "Les trois gobelins attaqueront dès que le groupe entrera. Par contre le chef, à traiter comme un gobelin normal, est un poltron qui fera tout pour ne pas combattre. Dès qu'il verra que le combat tourne mal, il essayera de s'enfuir par le passage secret derrière son trône, qui s’active en faisant tourner ce dernier (Investigation DD 15 par défaut, ou DD 5 si un personnage a vu le chef l’activer). Chaque gobelin porte 24 pa sur lui.",
+    secrets: "Les trois gobelins attaqueront dès que le groupe entrera. Par contre le chef, à traiter comme un gobelin normal, est un poltron qui fera tout pour ne pas combattre. Dès qu'il verra que le combat tourne mal, il essayera de s'enfuir par le passage secret derrière son trône (qui est collé au mur arrière), qui s’active en faisant tourner ce dernier (Investigation DD 15 par défaut, ou DD 5 si un personnage a vu le chef l’activer). Le passage secret se referme derrriere le chef gobelin s'il l'emprunte. Chaque gobelin porte 24 pa sur lui.",
     exits: [
       {
         id: "room_14",
@@ -345,6 +354,27 @@ export const GOBLIN_CAVE = {
         direction: "sud",
         description: "Au sud, le couloir d'accès redescend vers le reste du complexe gobelin."
       }
+    ],
+    secretExits: [
+      {
+        id: "room_secret_chief_tunnel",
+        targetRoomId: "room_secret_chief_tunnel",
+        descriptionWhenDiscovered: "Derrière le trône, un passage secret ouvert s'enfonce dans l'obscurité.",
+        discoveryKey: "room_13_secret_passage_revealed"
+      }
+    ]
+  },
+  "room_secret_chief_tunnel": {
+    id: "c",
+    title: "Le Passage Secret du Chef",
+    description: "Le passage secret s'etend sur 10 mètres dans une cavité souterraine ronde mais ne mene nulle part.",
+    secrets: "Un petit coffre et des vivres sont cachés dans l'obscurité. ",
+    exits: [
+      {
+        id: "room_13",
+        direction: "sud",
+        description: "Au sud, le passage retourne vers la salle du trône."
+      }
     ]
   },
   "room_14": {
@@ -361,7 +391,7 @@ export const GOBLIN_CAVE = {
       {
         id: "room_13",
         direction: "ouest",
-        description: "À l'ouest, la porte verrouillée retourne vers la salle du trône."
+        description: "À l'ouest, la porte retourne vers la salle du trône."
       }
     ]
   },
@@ -405,3 +435,113 @@ export const GOBLIN_CAVE = {
     ]
   }
 };
+
+const SECRET_EXIT_TOKEN_STOPWORDS = new Set([
+  "dans",
+  "avec",
+  "vers",
+  "pour",
+  "cette",
+  "cela",
+  "ceci",
+  "ainsi",
+  "sous",
+  "sans",
+  "entre",
+  "apres",
+  "avant",
+  "ici",
+  "une",
+  "des",
+  "les",
+  "sur",
+  "par",
+  "est",
+  "sont",
+  "du",
+  "de",
+  "la",
+  "le",
+  "un",
+  "en"
+]);
+
+function normalizeSecretExitText(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractSecretExitTokens(value) {
+  return normalizeSecretExitText(value)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4 && !SECRET_EXIT_TOKEN_STOPWORDS.has(token));
+}
+
+function roomMemoryRevealsSecretExit(secretExit, roomMemoryText) {
+  const memory = normalizeSecretExitText(roomMemoryText);
+  if (!memory) return false;
+
+  const discoveryKey = normalizeSecretExitText(secretExit?.discoveryKey);
+  if (discoveryKey && memory.includes(discoveryKey)) return true;
+
+  const discoveredDescription = normalizeSecretExitText(secretExit?.descriptionWhenDiscovered);
+  if (discoveredDescription && memory.includes(discoveredDescription)) return true;
+
+  const memoryWords = new Set(memory.split(" ").filter(Boolean));
+  const descriptionTokens = extractSecretExitTokens(secretExit?.descriptionWhenDiscovered);
+  if (descriptionTokens.length === 0) return false;
+
+  const overlapCount = descriptionTokens.filter((token) => memoryWords.has(token)).length;
+  const minimumTokensRequired = Math.min(3, descriptionTokens.length);
+  return overlapCount >= minimumTokensRequired;
+}
+
+export function getVisibleExitsForRoom(roomId, roomMemoryText = "") {
+  const room = roomId && GOBLIN_CAVE?.[roomId] ? GOBLIN_CAVE[roomId] : null;
+  if (!room) return [];
+
+  const visibleExits = Array.isArray(room.exits)
+    ? room.exits
+        .map((exitDef) => {
+          if (typeof exitDef === "string" && exitDef.trim()) {
+            return { id: exitDef.trim(), direction: "", description: "" };
+          }
+          if (!exitDef || typeof exitDef !== "object") return null;
+          const targetId = String(exitDef.id ?? "").trim();
+          if (!targetId) return null;
+          return {
+            ...exitDef,
+            id: targetId,
+            direction: String(exitDef.direction ?? "").trim(),
+            description: String(exitDef.description ?? "").trim(),
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  const discoveredSecretExits = Array.isArray(room.secretExits)
+    ? room.secretExits
+        .filter((secretExit) => roomMemoryRevealsSecretExit(secretExit, roomMemoryText))
+        .map((secretExit) => {
+          const targetRoomId = String(secretExit?.targetRoomId ?? "").trim();
+          if (!targetRoomId) return null;
+          return {
+            id: targetRoomId,
+            direction: String(secretExit?.direction ?? "").trim(),
+            description: String(secretExit?.descriptionWhenDiscovered ?? "").trim(),
+            isSecret: true,
+            secretSourceId: String(secretExit?.id ?? "").trim() || null,
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  return [...visibleExits, ...discoveredSecretExits];
+}
