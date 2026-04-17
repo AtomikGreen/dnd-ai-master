@@ -7,6 +7,7 @@ import { GoogleAICacheManager } from "@google/generative-ai/server";
 import { NextResponse } from "next/server";
 import { CAMPAIGN_CONTEXT, GOBLIN_CAVE, getVisibleExitsForRoom } from "@/data/campaign";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { logTerminalAiCallEnd, logTerminalAiCallStart } from "@/lib/aiTerminalTimingLog";
 import {
   buildDynamicContext,
   composeFullNarratorSystemInstruction,
@@ -25,7 +26,7 @@ const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
 const GEMINI_MODEL     = "gemini-3-flash-preview";
 const NARRATOR_CACHE_TTL_SECONDS = 3 * 60 * 60;
 /** Incrémenter ou purger le cache Gemini quand getStaticSystemRules() change matériellement. */
-const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v21";
+const NARRATOR_CACHE_DISPLAY_NAME = "dnd-gm-system-prompt-v22";
 let narratorCachePromise = null;
 /** Active le Context Caching : seul getStaticSystemRules() est stocké côté API ; le tour courant passe en JSON (dynamicContext). */
 const USE_GEMINI_CACHE = process.env.USE_GEMINI_CACHE === "true";
@@ -195,7 +196,7 @@ const NARRATOR_JSON_FALLBACK_REPLY =
   "Le narrateur n'a pas pu achever une réponse lisible (sortie interrompue ou mal formée). Tu peux réessayer dans un instant ou reformuler ton action en une courte phrase.";
 
 const GEMINI_RECENT_CHAT_INSTRUCTION =
-  "Utilise recentChat pour le ton et la continuité. Si le dernier message assistant a déjà couvert presque exactement le même lieu, le même danger ou le même constat, sois plus concis et n'en refais pas une description complète. Mais si un vrai nouveau lieu, une vraie découverte, ou un élément marquant apparaît, tu peux reprendre de l'ampleur. Ne tends pas vers une longueur uniforme d'un message à l'autre.";
+  "Utilise recentChat pour le ton, la continuité et la mémoire immédiate du dialogue : chaque extrait est volontairement long pour que tu voies ce que les PNJ ont déjà dit. Ne refais pas répéter au PNJ les mêmes informations (captures, vol, directions, suppliques) si elles figurent déjà dans un message assistant récent ; avance ou varie. Si le dernier message assistant a déjà couvert le même lieu ou le même constat atmosphérique, sois plus concis. Pour un vrai nouveau lieu ou une vraie découverte, tu peux reprendre de l'ampleur. Ne tends pas vers une longueur uniforme d'un message à l'autre.";
 
 function buildNarratorClientResponse(raw) {
   if (!detectFormatIssue(raw)) {
@@ -234,10 +235,11 @@ function previewMessages(msgs, maxMsgs = 10) {
 function buildRecentChatForNarrator(messages, maxMsgs = 12) {
   const filtered = filterMessagesForNarratorModel(messages);
   const tail = filtered.slice(-maxMsgs);
+  // Limite relevée : 500 car. coupait les répliques PNJ → l’IA ne « voyait » pas le dialogue passé et se répétait.
   return tail.map((m) => ({
     role: m.role === "user" ? "user" : "assistant",
     type: m.type ?? null,
-    content: truncateText(m.content, 500),
+    content: truncateText(m.content, 2200),
   }));
 }
 
@@ -688,7 +690,7 @@ export async function POST(request) {
       player,
       currentScene,
       currentRoomId,
-      provider = "openrouter",
+      provider = "gemini",
       entities = [],
       gameMode = "exploration",
       engineEvent = null,
@@ -748,7 +750,11 @@ export async function POST(request) {
       };
     }
     const narratorCampaignContext = String(CAMPAIGN_CONTEXT?.narratorCampaignContext ?? "").trim();
-    if (narratorCampaignContext) {
+    // Prose « antre / plafonds / couloirs » : uniquement pertinent sous terre. Sur scene_village ou
+    // scene_journey elle contredit l'environnement actuel et donne l'impression que la scène n'a pas changé.
+    const outdoorOrSurfaceRoom =
+      roomId === "scene_village" || roomId === "scene_journey";
+    if (narratorCampaignContext && !outdoorOrSurfaceRoom) {
       campaignContext = campaignContext
         ? { ...campaignContext, narratorCampaignContext }
         : { narratorCampaignContext };
@@ -772,7 +778,7 @@ export async function POST(request) {
       staticSystemRules
     );
     const { userMessage } = formatHistoryForGemini(limitedMessages);
-    const recentChat = buildRecentChatForNarrator(limitedMessages, 14);
+    const recentChat = buildRecentChatForNarrator(limitedMessages, 16);
     const geminiDynamicInput = {
       dynamicContext,
       playerMessage: userMessage,
@@ -803,7 +809,12 @@ export async function POST(request) {
     // -----------------------------------------------------------------------
     if (provider === "gemini") {
       if (USE_GEMINI_CACHE) {
+        let cacheNarratorTiming = null;
         try {
+          cacheNarratorTiming = logTerminalAiCallStart("/api/chat", "Narrateur MJ", {
+            provider: "Gemini",
+            model: `${GEMINI_MODEL} (contexte cache)`,
+          });
           const cache = await getNarratorCache();
           const model = genAI.getGenerativeModel({
             model: GEMINI_MODEL,
@@ -865,6 +876,15 @@ export async function POST(request) {
               });
             }
           }
+          if (cacheNarratorTiming) {
+            logTerminalAiCallEnd("/api/chat", "Narrateur MJ", cacheNarratorTiming, {
+              provider: "Gemini",
+              model: `${GEMINI_MODEL} (contexte cache)`,
+              ok: true,
+              status: 200,
+            });
+            cacheNarratorTiming = null;
+          }
           phaseTimestamps.afterModel = nowIso();
           console.info("[/api/chat] after-model", {
             elapsedMs: elapsedMsSince(t0),
@@ -924,6 +944,26 @@ export async function POST(request) {
             },
           });
         } catch (cacheErr) {
+          if (cacheNarratorTiming) {
+            if (isGeminiCacheTooSmallError(cacheErr)) {
+              logTerminalAiCallEnd("/api/chat", "Narrateur MJ", cacheNarratorTiming, {
+                provider: "Gemini",
+                model: `${GEMINI_MODEL} (contexte cache)`,
+                ok: true,
+                status: 200,
+                note: "cache_rejete_fallback_sans_cache",
+              });
+            } else {
+              logTerminalAiCallEnd("/api/chat", "Narrateur MJ", cacheNarratorTiming, {
+                provider: "Gemini",
+                model: `${GEMINI_MODEL} (contexte cache)`,
+                ok: false,
+                status: 500,
+                errorMessage: String(cacheErr?.message ?? cacheErr),
+              });
+            }
+            cacheNarratorTiming = null;
+          }
           if (!isGeminiCacheTooSmallError(cacheErr)) throw cacheErr;
           console.warn("[Gemini] Cache rejeté (prompt trop petit), fallback standard sans cache.");
         }
@@ -932,63 +972,85 @@ export async function POST(request) {
       // Mode Gemini standard sans cache :
       // on envoie EXACTEMENT la même charge dynamique qu'en mode cache,
       // seule la source des règles statiques change (cachedContent vs systemInstruction).
-      const model = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-        systemInstruction: staticSystemRules,
-        generationConfig: {
-          responseMimeType: "application/json",
-          temperature: 0.2,
-        },
+      const geminiNoCacheTiming = logTerminalAiCallStart("/api/chat", "Narrateur MJ", {
+        provider: "Gemini",
+        model: `${GEMINI_MODEL} (sans cache)`,
       });
+      let raw;
       let formatRetryUsed = false;
       let formatRetryReason = null;
       let firstAttemptRaw = null;
       let formatEmergencyUsed = false;
       const geminiAttempts = [];
+      try {
+        const model = genAI.getGenerativeModel({
+          model: GEMINI_MODEL,
+          systemInstruction: staticSystemRules,
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.2,
+          },
+        });
 
-      const pushGeminiDiag = (phase, genResult) => {
-        const d = getGeminiResponseDiagnosticsFromResult(genResult, phase);
-        geminiAttempts.push(d);
-        logGeminiAttemptIfNoteworthy(d);
-      };
-
-      const result = await model.generateContent(JSON.stringify(geminiDynamicInput));
-      pushGeminiDiag("primary_no_cache", result);
-      let raw = safeGeminiResponseText(result);
-      let formatIssue = detectFormatIssue(raw);
-      if (formatIssue) {
-        formatRetryUsed = true;
-        formatRetryReason = formatIssue;
-        firstAttemptRaw = raw;
-        const retryInput = {
-          ...geminiDynamicInput,
-          formatRetryInstruction: buildFormatRetryInstruction(formatIssue, raw),
+        const pushGeminiDiag = (phase, genResult) => {
+          const d = getGeminiResponseDiagnosticsFromResult(genResult, phase);
+          geminiAttempts.push(d);
+          logGeminiAttemptIfNoteworthy(d);
         };
-        const retryResult = await model.generateContent(JSON.stringify(retryInput));
-        pushGeminiDiag("format_retry_no_cache", retryResult);
-        raw = safeGeminiResponseText(retryResult);
-        formatIssue = detectFormatIssue(raw);
-      }
-      if (formatIssue) {
-        formatEmergencyUsed = true;
-        try {
-          const emergResult = await runGeminiNarratorEmergencyRepair(genAI, {
-            useCache: false,
-            cacheName: null,
-            systemInstruction: staticSystemRules,
-            userMessage: geminiDynamicInput.playerMessage,
-            engineEvent,
-            previousRaw: raw,
-          });
-          pushGeminiDiag("emergency_repair_no_cache", emergResult);
-          raw = safeGeminiResponseText(emergResult);
-        } catch (emergErr) {
-          console.error("[/api/chat] Narrateur emergency (sans cache) échouée :", emergErr);
-          geminiAttempts.push({
-            phase: "emergency_repair_no_cache",
-            error: String(emergErr?.message ?? emergErr),
-          });
+
+        const result = await model.generateContent(JSON.stringify(geminiDynamicInput));
+        pushGeminiDiag("primary_no_cache", result);
+        raw = safeGeminiResponseText(result);
+        let formatIssue = detectFormatIssue(raw);
+        if (formatIssue) {
+          formatRetryUsed = true;
+          formatRetryReason = formatIssue;
+          firstAttemptRaw = raw;
+          const retryInput = {
+            ...geminiDynamicInput,
+            formatRetryInstruction: buildFormatRetryInstruction(formatIssue, raw),
+          };
+          const retryResult = await model.generateContent(JSON.stringify(retryInput));
+          pushGeminiDiag("format_retry_no_cache", retryResult);
+          raw = safeGeminiResponseText(retryResult);
+          formatIssue = detectFormatIssue(raw);
         }
+        if (formatIssue) {
+          formatEmergencyUsed = true;
+          try {
+            const emergResult = await runGeminiNarratorEmergencyRepair(genAI, {
+              useCache: false,
+              cacheName: null,
+              systemInstruction: staticSystemRules,
+              userMessage: geminiDynamicInput.playerMessage,
+              engineEvent,
+              previousRaw: raw,
+            });
+            pushGeminiDiag("emergency_repair_no_cache", emergResult);
+            raw = safeGeminiResponseText(emergResult);
+          } catch (emergErr) {
+            console.error("[/api/chat] Narrateur emergency (sans cache) échouée :", emergErr);
+            geminiAttempts.push({
+              phase: "emergency_repair_no_cache",
+              error: String(emergErr?.message ?? emergErr),
+            });
+          }
+        }
+        logTerminalAiCallEnd("/api/chat", "Narrateur MJ", geminiNoCacheTiming, {
+          provider: "Gemini",
+          model: `${GEMINI_MODEL} (sans cache)`,
+          ok: true,
+          status: 200,
+        });
+      } catch (gemNoCacheErr) {
+        logTerminalAiCallEnd("/api/chat", "Narrateur MJ", geminiNoCacheTiming, {
+          provider: "Gemini",
+          model: `${GEMINI_MODEL} (sans cache)`,
+          ok: false,
+          status: 500,
+          errorMessage: String(gemNoCacheErr?.message ?? gemNoCacheErr),
+        });
+        throw gemNoCacheErr;
       }
       phaseTimestamps.afterModel = nowIso();
       console.info("[/api/chat] after-model", {
@@ -1057,48 +1119,16 @@ export async function POST(request) {
       systemInstruction
     );
 
-    const res = await fetch(OPENROUTER_BASE, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "DnD AI Master",
-      },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages: openRouterMessages,
-        response_format: { type: "json_object" },
-      }),
+    const openRouterTiming = logTerminalAiCallStart("/api/chat", "Narrateur MJ", {
+      provider: "OpenRouter",
+      model: OPENROUTER_MODEL,
     });
-
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      if (res.status === 429) {
-        return NextResponse.json(
-          { error: "Quota API dépassé. Veuillez patienter avant de réessayer.", retryAfter: 60 },
-          { status: 429 }
-        );
-      }
-      throw new Error(errData.error?.message ?? `Erreur OpenRouter (${res.status})`);
-    }
-
+    let raw;
     let formatRetryUsed = false;
     let formatRetryReason = null;
     let firstAttemptRaw = null;
-    const data = await res.json();
-    let raw  = data.choices?.[0]?.message?.content ?? "";
-    const formatIssue = detectFormatIssue(raw);
-    if (formatIssue) {
-      formatRetryUsed = true;
-      formatRetryReason = formatIssue;
-      firstAttemptRaw = raw;
-      const retryMessages = [
-        ...openRouterMessages,
-        { role: "assistant", content: raw },
-        { role: "user", content: buildFormatRetryInstruction(formatIssue, raw) },
-      ];
-      const retryRes = await fetch(OPENROUTER_BASE, {
+    try {
+      const res = await fetch(OPENROUTER_BASE, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1108,14 +1138,75 @@ export async function POST(request) {
         },
         body: JSON.stringify({
           model: OPENROUTER_MODEL,
-          messages: retryMessages,
+          messages: openRouterMessages,
           response_format: { type: "json_object" },
         }),
       });
-      if (retryRes.ok) {
-        const retryData = await retryRes.json();
-        raw = retryData.choices?.[0]?.message?.content ?? raw;
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        if (res.status === 429) {
+          logTerminalAiCallEnd("/api/chat", "Narrateur MJ", openRouterTiming, {
+            provider: "OpenRouter",
+            model: OPENROUTER_MODEL,
+            ok: false,
+            status: 429,
+            note: "quota_api",
+          });
+          return NextResponse.json(
+            { error: "Quota API dépassé. Veuillez patienter avant de réessayer.", retryAfter: 60 },
+            { status: 429 }
+          );
+        }
+        throw new Error(errData.error?.message ?? `Erreur OpenRouter (${res.status})`);
       }
+
+      const data = await res.json();
+      raw = data.choices?.[0]?.message?.content ?? "";
+      const formatIssue = detectFormatIssue(raw);
+      if (formatIssue) {
+        formatRetryUsed = true;
+        formatRetryReason = formatIssue;
+        firstAttemptRaw = raw;
+        const retryMessages = [
+          ...openRouterMessages,
+          { role: "assistant", content: raw },
+          { role: "user", content: buildFormatRetryInstruction(formatIssue, raw) },
+        ];
+        const retryRes = await fetch(OPENROUTER_BASE, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "DnD AI Master",
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages: retryMessages,
+            response_format: { type: "json_object" },
+          }),
+        });
+        if (retryRes.ok) {
+          const retryData = await retryRes.json();
+          raw = retryData.choices?.[0]?.message?.content ?? raw;
+        }
+      }
+      logTerminalAiCallEnd("/api/chat", "Narrateur MJ", openRouterTiming, {
+        provider: "OpenRouter",
+        model: OPENROUTER_MODEL,
+        ok: true,
+        status: 200,
+      });
+    } catch (openRouterErr) {
+      logTerminalAiCallEnd("/api/chat", "Narrateur MJ", openRouterTiming, {
+        provider: "OpenRouter",
+        model: OPENROUTER_MODEL,
+        ok: false,
+        status: 500,
+        errorMessage: String(openRouterErr?.message ?? openRouterErr),
+      });
+      throw openRouterErr;
     }
     phaseTimestamps.afterModel = nowIso();
     console.info("[/api/chat] after-model", {

@@ -1,13 +1,24 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, GoogleGenerativeAIAbortError } from "@google/generative-ai";
 import { NextResponse } from "next/server";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { withTerminalAiTiming } from "@/lib/aiTerminalTimingLog";
 import { slimMessagesForArbiterPrompt } from "@/lib/slimMessagesForArbiterPrompt";
 import { GOBLIN_CAVE } from "@/data/campaign";
+import { BESTIARY } from "@/data/bestiary";
+
+/** Vercel / hébergeurs : aligné sur GM_ARBITER_FETCH_TIMEOUT_MS (fenêtre max pour un appel Gemini). */
+export const maxDuration = 900;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
 const GEMINI_MODEL = "gemini-3-flash-preview";
+
+/** Fenêtre max pour l’appel modèle (Gemini ou OpenRouter), alignée sur `GM_ARBITER_FETCH_TIMEOUT_MS` côté client (15 min). */
+const GM_ARBITER_MODEL_CALL_TIMEOUT_MS = 15 * 60 * 1000;
+/** Un seul essai Gemini par requête HTTP : la fenêtre de 15 min s’applique à cet appel unique. */
+const GM_ARBITER_GEMINI_MAX_ATTEMPTS = 1;
+const BESTIARY_TEMPLATE_IDS = Object.keys(BESTIARY ?? {}).sort();
 
 function nowIso() {
   return new Date().toISOString();
@@ -15,6 +26,40 @@ function nowIso() {
 
 function elapsedMsSince(t0) {
   return Date.now() - t0;
+}
+
+function isGeminiTimeoutOrAbort(err) {
+  if (err instanceof GoogleGenerativeAIAbortError) return true;
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
+  return msg.includes("request aborted");
+}
+
+/**
+ * @param {import("@google/generative-ai").GenerativeModel} model
+ * @param {string} userContent
+ */
+async function generateGmArbiterGeminiContent(model, userContent) {
+  let lastErr;
+  for (let attempt = 1; attempt <= GM_ARBITER_GEMINI_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await model.generateContent(userContent, { timeout: GM_ARBITER_MODEL_CALL_TIMEOUT_MS });
+    } catch (e) {
+      lastErr = e;
+      const retryable = isGeminiTimeoutOrAbort(e) && attempt < GM_ARBITER_GEMINI_MAX_ATTEMPTS;
+      if (retryable) {
+        console.warn("[/api/gm-arbiter] Gemini generateContent échec (timeout/abort), nouvel essai", {
+          attempt,
+          maxAttempts: GM_ARBITER_GEMINI_MAX_ATTEMPTS,
+          timeoutMs: GM_ARBITER_MODEL_CALL_TIMEOUT_MS,
+          message: String(e?.message ?? e),
+        });
+        await new Promise((r) => setTimeout(r, 600 * attempt));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr ?? new Error("generateGmArbiterGeminiContent: aucune tentative");
 }
 
 const GM_ARBITER_SYSTEM = `Arbitre de scène D&D : mécaniques du lieu (secrets) uniquement ; aucune narration ; uniquement JSON.
@@ -77,8 +122,15 @@ ATTENTION / PERCEPTION DU JOUEUR :
 - N'utilise gameMode="combat" que si au moins un hostile a réellement repéré le joueur, ou si l'action du joueur déclenche effectivement l'affrontement maintenant.
 - 'surprised' s'utilise pour le début d'un combat déjà engagé ; ce n'est pas un substitut à awareOfPlayer=false.
 
+ENNEMIS OCCUPÉS / PAS ENCORE CONSCIENTS DES PJ (prioritaire — ne pas lancer le combat par défaut) :
+- Lis obligatoirement currentRoomSecrets ET la mémoire de scène (roomMemory / mémoire_de_scène dans le contexte) : dès qu'elles indiquent que des ennemis vivants présents dans la pièce sont occupés (repas, sommeil, conversation, tâche absorbante, etc.) et qu'ils ne sont pas sur leur garde au sens où ils n'ont pas encore identifié des intrus — par ex. ils attribuent les bruits normaux à autre chose, ils ne surveillent pas l'entrée — alors au spawn ou à l'entrée (scene_entered) tu DOIS mettre awareOfPlayer=false sur ces hostiles.
+- Dans ce cas ne mets JAMAIS gameMode="combat" : laisse gameMode à null (le moteur reste en exploration) ou renvoie explicitement gameMode="exploration". Le combat ne commence qu'après prise de conscience réelle (attaque ou menace explicite du joueur, révélation volontaire impossible à ignorer, vacarme ou échec de discrétion déjà résolu par un jet, ou secret qui impose qu'ils repèrent les PJ maintenant).
+- Le simple déplacement du joueur dans la pièce ou une entrée « ordinaire » ne suffit pas à awareOfPlayer=true si les règles/mémoire disent qu'ils ne voient pas encore les personnages ou qu'ils interprètent mal la situation ; n'invente pas une détection totale pour forcer le combat.
+- Quand tu passes enfin à la lutte : awareOfPlayer=true sur les concernés, gameMode="combat", et surprised selon les secrets (ex. encore attablés, boucliers au loin).
+
 Règles :
 - événement unique déjà en mémoire → no_roll_needed sans rejouer.
+- ANTI-REJOUAGE (historique chat / messages) : lis le résumé "messages" (ancien→récent). Si le DERNIER message assistant décrit déjà une réponse PNJ ou une conséquence sociale qui couvre manifestement la même "sourceAction" (même interlocuteur, même type d'info : nombre d'ennemis, armement, direction, durée de trajet, etc.), alors il n'y a aucun nouvel effet mécanique : renvoie resolution="no_roll_needed" avec une reason courte du type "Déjà répondu dans la conversation.", engineEvent=null, roomMemoryAppend=null, entityUpdates=null, timeAdvanceMinutes=null. INTERDIT de renvoyer apply_consequences uniquement pour reformuler ou répéter la même révélation.
 - Si la fiction implique clairement un temps écoulé (trajet, attente, fouille longue, pause), tu peux renseigner timeAdvanceMinutes (entier en minutes). Sinon laisse null.
 - CAS PAR DÉFAUT TRÈS FRÉQUENT : si aucune règle spécifique du lieu n'est à appliquer maintenant, renvoie simplement no_roll_needed avec une reason courte et factuelle, puis laisse le narrateur poursuivre. N'essaie pas de "faire quelque chose quand même".
 - Quand tu hésites entre "aucun effet mécanique spécial" et "petite intervention arbitraire", choisis no_roll_needed.
@@ -97,6 +149,8 @@ Règles :
 - Jet requis sans rollResult → request_roll.
 - gm_secret = "XdY" seul ; player_check = stat+skill+dc+returnToArbiter ; jamais "1d20+bonus" dans roll.
 - rollResult fourni → apply_consequences ou no_roll_needed.
+- Historique mécanique : le prompt peut inclure « Historique mécanique arbitre/moteur » et/ou des messages debug filtrés (jets secrets MJ, JSON /api/gm-arbiter). Si un jet secret MJ requis par les secrets (ex. 1d100 pour une embuscade) y figure déjà comme résolu pour ce passage de jeu, tu ne redemandes JAMAIS le même request_roll gm_secret : tu appliques apply_consequences (ou no_roll_needed) en utilisant ce résultat.
+- Si rollResult est un jet de compétence joueur déjà résolu (Investigation, Perception, etc.) et que les secrets mentionnent aussi un jet secret MJ distinct : vérifie d'abord l'historique mécanique ; ne lance pas une seconde fois un gm_secret déjà tiré dans cette chaîne.
 - Pas d’intention joueur ici.
 - CONTRAINTE D'INTENTION : "sourceAction" (texte joueur) et "intentDecision" décrivent déjà ce que le joueur essaie de faire ; tu ne remplaces jamais cette action par une autre.
 - Hiérarchie stricte pour l'action tentée : 1) texte du joueur / sourceAction, 2) intentDecision, 3) secrets du lieu, 4) inventaire / outils / capacités. Les niveaux 3 et 4 peuvent seulement autoriser, bloquer ou qualifier l'action tentée ; ils ne peuvent jamais en inventer une nouvelle.
@@ -111,6 +165,8 @@ Règles :
 - Si tu fais apparaître une créature via entityUpdates.action="spawn", tu dois lui donner un champ 'name' explicite, utilisable tel quel par le joueur.
 - Si plusieurs créatures proches / du même template apparaissent dans la même scène, donne à chacune un nom distinct et mémorable (ex. 'Gobelin grimaçant', 'Gobelin malade'). Ne laisse jamais le moteur les renommer à ta place.
 - N'utilise pas des noms froids ou ambigus du type 'Gobelin', 'Gobelin 2', 'Créature', 'Créature A'. Donne directement un nom final différenciant.
+- CONTRAINTE TEMPLATE (spawn) : pour toute créature non-joueur, entityUpdates.action="spawn" DOIT inclure un templateId valide présent dans la liste bestiaryTemplateIds fournie dans le prompt utilisateur. N'invente jamais un templateId hors liste.
+- Lors d'un spawn hostile, privilégie templateId + name + états (awareOfPlayer, surprised, visible, looted/lootItems). N'essaie pas de reconstruire manuellement toutes les stats de combat ; le moteur initialise la créature depuis le template.
 - Un entityUpdates.action="update" sur une entité absente n'engendre plus aucun spawn implicite côté moteur. Si tu veux créer une créature, utilise explicitement action="spawn".
 - RELOCALISATION D'UN PNJ DÉJÀ CONNU : si la fiction dit qu'une créature déjà connue fuit, se replie, change de salle, rattrape le groupe ou réapparaît ailleurs, tu dois conserver son identité existante. Réutilise le MÊME id via update / crossRoomEntityUpdates, et au besoin remove depuis l'ancienne salle ; ne crée jamais un nouveau spawn avec un autre id pour le même personnage.
 - Si une créature portant déjà le même nom existe dans entities, dans resume_etat_entites_verite, ou dans le contexte de campagne fourni, considère que c'est le même individu sauf secret explicite de doublon. Dans ce cas, interdiction de renvoyer action="spawn" avec un nouvel id.
@@ -132,7 +188,7 @@ Règles :
 - Exemple correct hors combat : des hobgobelins hostiles occupés à manger peuvent être spawn avec awareOfPlayer=false et gameMode="exploration". Si le joueur les attaque ou se révèle, alors seulement tu peux passer awareOfPlayer=true et éventuellement surprised=true au début du combat.
 - Hiérarchie de vérité obligatoire pour interpréter l'état du lieu :
   1. 'entities' actuel = source la plus fiable pour l'état dynamique réel (PV, vivant/mort, surprise, CA, présence). SAUF SI VIDE, dans ce cas c'est peut etre que les regles de présence d'ennemis n'ont juste pas encore été appliquées.
-  2. 'roomMemory' = mise à jour persistante des faits du lieu ; elle complète ou corrige les secrets de base quand 'entities' ne dit pas le contraire.
+  2. 'roomMemory' = mise à jour persistante des faits du lieu ; elle complète ou corrige les secrets de base quand 'entities' ne dit pas le contraire. Le moteur y ajoute aussi des lignes « [Canon moteur] » (jets MJ/joueur déjà tirés, apparitions mécaniques, temps avancé) : si une telle ligne couvre déjà une règle ou un jet, ne le rejoue pas.
   3. 'currentRoomSecrets' = base initiale seulement si rien de plus récent ne la contredit.
 - La mémoire de scène met à jour les secrets de base. Si 'roomMemory' contredit 'currentRoomSecrets', suis 'roomMemory'.
 - Si 'entities' contredit 'roomMemory', suis 'entities' pour l'état actuel, et n'invente pas de réconciliation narrative au-delà de ce qui est certain.
@@ -161,11 +217,104 @@ Règles :
 - Exemple interdit : joueur = "Je sauverai Lanéa, je le jure." Réponse interdite : "Le joueur apprend où se trouve l'antre et qu'un gobelours rôde."
 - Exemple correct : joueur = "Je sauverai Lanéa, je le jure." Réponse attendue : no_roll_needed ou apply_consequences avec "Le joueur accepte la quête." sans autre révélation.
 - Exemple autorisé : joueur = "Où est l'antre exactement ? Le commis peut-il nous guider ?" Là, tu peux valider la révélation correspondante si elle est cohérente avec les secrets.
+
+Résolution intelligente des secrets (toute campagne, quel que soit le graphe dans campaign.js) :
+- Les secrets décrivent souvent des situations à **plusieurs temps** (ex. trajet, arrivée, scène locale, rencontre). Lis-les comme une **chaîne de conditions** : applique uniquement la partie dont le **déclencheur fictionnel** correspond au moment présent (lieu, scène, action déjà posée dans l'historique, mémoire de salle).
+- Ne **compacte pas** plusieurs temps en une seule réponse parce qu'un jet vient d'être résolu : si la narration récente a déjà réalisé un déplacement, une arrivée ou une mise en place, ne « rejoue » pas ce temps (pas de timeAdvanceMinutes pour un voyage déjà raconté ; pas de sceneUpdate pour une transition déjà vécue sauf nouveau fait mécanique explicite dans les secrets).
+- timeAdvanceMinutes : uniquement pour du temps qui **s'écoule dans la conséquence que tu appliques maintenant**. Pas pour rattraper rétroactivement un trajet ou une attente déjà décrite dans les messages MJ.
+- Un jet de **compétence joueur** résolu (Perception, Investigation, etc.) décrit ce que le PJ remarque ou comprend **dans le cadre de sourceAction / intentDecision** ; il ne remplace pas automatiquement une **autre** procédure prévue par les secrets (table aléatoire, jet secret MJ, seuil distinct) si le texte des secrets distingue clairement ces étapes — sauf si les secrets équivalent explicitement les deux.
+- Si mémoire de scène ou entities portent déjà une rencontre, une escarmouche ou un état, ne duplique pas les mêmes faits : mets à jour les entités existantes, ou no_roll_needed ; n'empile pas des spawns équivalents.
+- Si arbiterTrigger indique scene_entered : harmonise l'état avec le lieu sans **réappliquer** une règle de rencontre déjà résolue dans l'échange précédent (évite les doublons mécaniques).
+- Si contexte_resolution inclut mémoire_salle_origine ou rappel_résolution_moteur_avant_transition : ce sont des faits sur le lieu quitté ou sur une résolution déjà effectuée ; ne redemande pas un jet ou une table équivalente pour ce qui y est déjà accompli. Les secrets d'une salle voisine dans connectedRooms décrivent un autre lieu : ne les confonds pas avec le moment présent (currentRoomId) sauf si les secrets du lieu courant l'exigent explicitement.
+- Pour les salles connectées, applique la hiérarchie de vérité suivante : CONNECTED_ROOM_ENTITY_STATE > CONNECTED_ROOM_MEMORY > connectedRooms.secrets. Si un état vivant/mort diffère entre ces sources, privilégie l'état entités (runtime) et considère les secrets comme potentiellement périmés.
+- **entityUpdates** (spawns, combat) dans une réponse : le moteur les attache toujours à **currentRoomId**, pas à sceneUpdate.targetRoomId. Ne combine pas dans le même apply_consequences une rencontre / embuscade qui se joue encore « ici » avec un sceneUpdate vers une autre salle du graphe : le joueur n'est pas encore dans la salle cible ; la transition peut venir après (autre tour, fin de combat, navigation).
+- Interdit : spawns hostiles + gameMode combat + sceneUpdate vers une autre pièce dans la même réponse quand la fiction place l'affrontement avant l'entrée dans cette pièce (sépare les temps : combat sur le lieu courant, puis plus tard sceneUpdate si les secrets l'exigent).
 JSON seul.`;
 
 function truncate(s, n = 1000) {
   const str = typeof s === "string" ? s : String(s ?? "");
   return str.length > n ? str.slice(0, n) + "…" : str;
+}
+
+/** Aide le modèle à ne pas fusionner plusieurs « temps » de secrets (voyage vs scène locale, etc.). */
+function classifyRollResultForArbiter(rollResult) {
+  if (rollResult == null || typeof rollResult !== "object") return "aucun";
+  if (String(rollResult.kind ?? "").trim() === "gm_secret") return "jet_secret_mj_resolu";
+  if (
+    rollResult.skill != null ||
+    rollResult.nat != null ||
+    rollResult.total != null ||
+    rollResult.success != null
+  ) {
+    return "jet_competence_ou_sauvegarde_joueur_resolu";
+  }
+  return "autre";
+}
+
+/**
+ * Contexte fictionnel explicite pour n'importe quelle campagne : type de jet + derniers fragments MJ hors jets de dés,
+ * plus mémoire du lieu quitté et rappel de résolution lors d'une entrée après transition (évite de rejouer des procédures).
+ */
+function normalizeArbiterMechanicalLog(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((s) => String(s ?? "").trim())
+    .filter(Boolean)
+    .slice(-24);
+}
+
+function buildArbiterResolutionContext({
+  normalizedMessages,
+  rollResult,
+  transitionFromRoomMemory = "",
+  transitionResolutionNote = "",
+  arbiterMechanicalLog = [],
+}) {
+  const lines = [];
+  lines.push(`type_de_jet_pour_cette_resolution: ${classifyRollResultForArbiter(rollResult)}`);
+  const mech = normalizeArbiterMechanicalLog(arbiterMechanicalLog);
+  if (mech.length) {
+    lines.push(
+      "Historique mécanique arbitre/moteur (ordre chronologique — jets secrets MJ et réponses JSON déjà reçues ; NE PAS redemander un jet déjà résolu dans cette liste) :"
+    );
+    mech.forEach((line, i) => {
+      lines.push(`  [${i + 1}] ${truncate(line, 480)}`);
+    });
+  }
+  const fromMem = String(transitionFromRoomMemory ?? "").trim();
+  const resNote = String(transitionResolutionNote ?? "").trim();
+  if (fromMem) {
+    lines.push(
+      "mémoire_salle_origine (lieu quitté juste avant cette entrée — y compris faits / jets déjà joués pour ce lieu) :"
+    );
+    lines.push(`  ${truncate(fromMem, 900)}`);
+  }
+  if (resNote) {
+    lines.push("rappel_résolution_moteur_avant_transition (factuel, toute campagne) :");
+    lines.push(`  ${truncate(resNote, 420)}`);
+  }
+  const msgs = Array.isArray(normalizedMessages) ? normalizedMessages : [];
+  const narrativeFrags = msgs
+    .filter((m) => {
+      if (!m || m.role !== "assistant") return false;
+      const t = m.type ?? null;
+      if (t === "dice" || t === "debug") return false;
+      return String(m.content ?? "").trim().length > 0;
+    })
+    .slice(-3);
+  if (narrativeFrags.length) {
+    lines.push(
+      "Fragments récents de narration MJ (ancrage du moment fictionnel déjà posé — ne pas réécrire un temps déjà joué ici) :"
+    );
+    narrativeFrags.forEach((m, i) => {
+      lines.push(`  [${i + 1}] ${truncate(String(m.content ?? ""), 520)}`);
+    });
+  } else {
+    lines.push(
+      "Fragments récents de narration MJ : (aucun hors dés — se fier à currentScene, mémoires de salle et messages résumés ci-dessous.)"
+    );
+  }
+  return lines.join("\n");
 }
 
 function normalizeMessagesForPrompt(messages) {
@@ -183,6 +332,100 @@ function normalizeMessagesForPrompt(messages) {
       };
     })
     .filter(Boolean);
+}
+
+function normalizeTextForArbiterCompare(s) {
+  return String(s ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+const SKIP_TYPES_ANTI_REPLAY = new Set(["debug", "intent-error", "retry-action", "meta", "turn-divider"]);
+
+function normalizeMessagesForAntiReplay(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .map((m) => {
+      if (!m || typeof m !== "object") return null;
+      const t = m.type ?? null;
+      if (t != null && SKIP_TYPES_ANTI_REPLAY.has(String(t))) return null;
+      const role = m.role === "user" ? "user" : "assistant";
+      const content = String(m.content ?? "").trim();
+      if (!content) return null;
+      return { role, type: t, content };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Historique brut (hors slim) : le dernier message est une réponse MJ après le dernier message
+ * utilisateur qui correspond à sourceAction → la même "tournure" a déjà été traitée.
+ * Utilisé pour appliquer ANTI-REJOUAGE même si le modèle renvoie encore apply_consequences.
+ */
+function messagesAlreadyCoverSourceAction({ sourceAction, messages }) {
+  const norm = normalizeMessagesForAntiReplay(messages);
+  const src = normalizeTextForArbiterCompare(sourceAction);
+  if (!src || norm.length < 2) return false;
+
+  let lastUserIdx = -1;
+  for (let i = norm.length - 1; i >= 0; i--) {
+    if (norm[i].role !== "user") continue;
+    const ut = norm[i].type ?? null;
+    if (ut === "auto-player-nudge" || ut === "continue") continue;
+    lastUserIdx = i;
+    break;
+  }
+  if (lastUserIdx < 0) return false;
+
+  const lastUserContent = normalizeTextForArbiterCompare(norm[lastUserIdx].content);
+  if (!lastUserContent) return false;
+  if (lastUserContent !== src) {
+    const n = Math.min(36, src.length, lastUserContent.length);
+    if (n < 12) return false;
+    if (lastUserContent.slice(0, n) !== src.slice(0, n)) return false;
+  }
+
+  const last = norm[norm.length - 1];
+  if (last.role !== "assistant") return false;
+  const reply = String(last.content ?? "").trim();
+  return reply.length >= 48;
+}
+
+function applyGmArbiterAntiReplayGuard(parsed, { sourceAction, intentDecision, messages, rollResult }) {
+  if (!parsed?.ok || !parsed.parsed) return parsed;
+  if (parsed.parsed.resolution !== "apply_consequences") return parsed;
+  // Important : si un rollResult est présent, on est en train de résoudre une mécanique.
+  // Dans ce cas, il est normal que `sourceAction` ressemble à une action déjà vue (ex: "On part de suite."),
+  // mais la conséquence (ex: embuscade) dépend du jet et NE doit pas être annulée.
+  if (rollResult != null) return parsed;
+  const idRes =
+    intentDecision && typeof intentDecision === "object"
+      ? String(intentDecision.resolution ?? "").trim()
+      : "";
+  if (idRes !== "trivial_success") return parsed;
+  if (!messagesAlreadyCoverSourceAction({ sourceAction, messages })) return parsed;
+
+  console.info("[/api/gm-arbiter] anti-replay-guard: apply_consequences -> no_roll_needed");
+
+  return {
+    ...parsed,
+    parsed: {
+      ...parsed.parsed,
+      resolution: "no_roll_needed",
+      reason: "Déjà répondu dans la conversation (garde-fou anti-rejeu).",
+      rollRequest: null,
+      campaignContextRequest: null,
+      entityUpdates: null,
+      sceneUpdate: null,
+      gameMode: null,
+      timeAdvanceMinutes: null,
+      engineEvent: null,
+      roomMemoryAppend: null,
+      crossRoomEntityUpdates: null,
+      crossRoomMemoryAppend: null,
+    },
+  };
 }
 
 function summarizeEntityTruth(entities, player) {
@@ -311,6 +554,70 @@ function getRoomMemoryFromWorldContext(campaignWorldContext, roomId) {
       : null;
   const state = states && roomId ? states[roomId] : null;
   return typeof state?.roomMemory === "string" ? state.roomMemory : "";
+}
+
+function getRoomEntitiesFromWorldContext(campaignWorldContext, roomId) {
+  if (
+    !campaignWorldContext ||
+    typeof campaignWorldContext !== "object" ||
+    Array.isArray(campaignWorldContext)
+  ) {
+    return [];
+  }
+  const states =
+    campaignWorldContext.roomStates &&
+    typeof campaignWorldContext.roomStates === "object" &&
+    !Array.isArray(campaignWorldContext.roomStates)
+      ? campaignWorldContext.roomStates
+      : null;
+  const state = states && roomId ? states[roomId] : null;
+  return Array.isArray(state?.entities) ? state.entities : [];
+}
+
+function summarizeConnectedRoomEntityState(campaignWorldContext, roomIds) {
+  const ids = Array.isArray(roomIds) ? roomIds : [];
+  if (!ids.length) return "[]";
+  const out = [];
+  for (const roomId of ids) {
+    const id = String(roomId ?? "").trim();
+    if (!id) continue;
+    const entities = getRoomEntitiesFromWorldContext(campaignWorldContext, id);
+    const lines = [];
+    let hostilesAlive = 0;
+    for (const e of entities) {
+      if (!e || typeof e !== "object") continue;
+      const eid = String(e.id ?? "?");
+      const name = String(e.name ?? eid);
+      const alive =
+        e.isAlive === false || (typeof e?.hp?.current === "number" && e.hp.current <= 0)
+          ? "mort"
+          : "vivant";
+      const type = String(e.type ?? "").trim() || "indetermine";
+      if (type === "hostile" && alive === "vivant") hostilesAlive += 1;
+      lines.push(`- ${name} [${eid}] | ${type} | ${alive}`);
+    }
+    out.push({
+      roomId: id,
+      hostilesAlive,
+      summary: lines.length ? lines.join("\n") : "(aucune entité connue)",
+    });
+  }
+  return JSON.stringify(out);
+}
+
+function summarizeConnectedRoomMemory(campaignWorldContext, roomIds) {
+  const ids = Array.isArray(roomIds) ? roomIds : [];
+  if (!ids.length) return "[]";
+  const out = [];
+  for (const roomId of ids) {
+    const id = String(roomId ?? "").trim();
+    if (!id) continue;
+    out.push({
+      roomId: id,
+      roomMemory: truncate(getRoomMemoryFromWorldContext(campaignWorldContext, id), 2000),
+    });
+  }
+  return JSON.stringify(out);
 }
 
 function normalizeEntityName(name) {
@@ -486,6 +793,14 @@ function safeParseGmArbiterJson(raw, context = {}) {
         .map((entity) => normalizeEntityName(entity?.name))
         .filter(Boolean)
     );
+    const bestiaryTemplateIds = Array.isArray(context.bestiaryTemplateIds)
+      ? context.bestiaryTemplateIds
+      : BESTIARY_TEMPLATE_IDS;
+    const bestiaryTemplateIdSet = new Set(
+      bestiaryTemplateIds
+        .map((id) => String(id ?? "").trim())
+        .filter(Boolean)
+    );
     const spawnNamesInBatch = new Set();
 
     const entityUpdates = Array.isArray(data.entityUpdates) ? data.entityUpdates : null;
@@ -496,6 +811,18 @@ function safeParseGmArbiterJson(raw, context = {}) {
         }
         const action = String(update.action ?? "").trim();
         if (action !== "spawn") continue;
+        const spawnType = String(update.type ?? "").trim().toLowerCase();
+        const spawnId = String(update.id ?? "").trim().toLowerCase();
+        const isPlayerSpawn = spawnType === "player" || spawnId === "player";
+        if (!isPlayerSpawn) {
+          const templateId = String(update.templateId ?? "").trim();
+          if (!templateId) {
+            return { ok: false, error: "entityUpdates.spawn.templateId manquant (créature non-joueur)." };
+          }
+          if (!bestiaryTemplateIdSet.has(templateId)) {
+            return { ok: false, error: "entityUpdates.spawn.templateId invalide (hors bestiaryTemplateIds)." };
+          }
+        }
         const name = String(update.name ?? "").trim();
         if (!name) {
           return { ok: false, error: "entityUpdates.spawn.name manquant." };
@@ -603,6 +930,25 @@ function safeParseGmArbiterJson(raw, context = {}) {
       },
     };
   } catch {
+    // Durcissement : certains modèles renvoient des ```json ``` ou du texte autour du JSON.
+    // On tente d'extraire le premier bloc `{ ... }` avant de retomber en erreur.
+    const firstBrace = txt.indexOf("{");
+    const lastBrace = txt.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        const sub = txt.slice(firstBrace, lastBrace + 1);
+        const data = JSON.parse(sub);
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          return { ok: false, error: "Objet JSON racine invalide." };
+        }
+        // On relaie vers le parseur normal en réinjectant le JSON extrait :
+        // (re-sécurité : on évite du copier/coller de validations ici)
+        const resort = safeParseGmArbiterJson(sub, context);
+        return resort.ok ? resort : resort;
+      } catch {
+        // fallthrough
+      }
+    }
     return { ok: false, error: "JSON invalide." };
   }
 }
@@ -615,7 +961,7 @@ export async function POST(request) {
     };
     const body = await request.json().catch(() => ({}));
     const {
-      provider = "openrouter",
+      provider = "gemini",
       currentRoomId = "",
       currentRoomTitle = "",
       currentScene = "",
@@ -632,12 +978,64 @@ export async function POST(request) {
       campaignWorldContext = null,
       worldTimeMinutes = null,
       worldTimeLabel = "",
+      transitionFromRoomMemory = "",
+      transitionResolutionNote = "",
+      arbiterMechanicalLog = [],
     } = body;
-    const normalizedMessages = slimMessagesForArbiterPrompt(normalizeMessagesForPrompt(messages));
+
+    if (rollResult != null) {
+      console.info("[/api/gm-arbiter] jet résolu → renvoyé à l'arbitre (passage avec rollResult)", {
+        roomId: String(currentRoomId ?? ""),
+        rollResult,
+      });
+    }
+
+    // Hooks début/fin de tour combat : par défaut passage par le modèle (règles de lieu, effets spéciaux).
+    // Court-circuit opt-in : GM_ARBITER_COMBAT_HOOK_FAST=true (évite LLM — timeouts / charge en MP).
+    const useFastCombatTurnHooks =
+      process.env.GM_ARBITER_COMBAT_HOOK_FAST === "1" ||
+      String(process.env.GM_ARBITER_COMBAT_HOOK_FAST ?? "").toLowerCase() === "true";
+    const hookPhase = String(arbiterTrigger?.phase ?? "").trim();
+    if (
+      rollResult == null &&
+      (hookPhase === "combat_turn_start" || hookPhase === "combat_turn_end") &&
+      useFastCombatTurnHooks
+    ) {
+      console.info("[/api/gm-arbiter] hook combat rapide (sans modèle)", { roomId: String(currentRoomId ?? ""), hookPhase });
+      return NextResponse.json(
+        {
+          resolution: "no_roll_needed",
+          reason: "Hook combat moteur : aucune règle de lieu à résoudre (court-circuit).",
+          campaignContextRequest: null,
+          rollRequest: null,
+          entityUpdates: null,
+          sceneUpdate: null,
+          gameMode: null,
+          timeAdvanceMinutes: null,
+          engineEvent: null,
+          roomMemoryAppend: null,
+          crossRoomEntityUpdates: null,
+          crossRoomMemoryAppend: null,
+        },
+        { status: 200 }
+      );
+    }
+
+    const normalizedMessages = slimMessagesForArbiterPrompt(normalizeMessagesForPrompt(messages), {
+      // Inclure la narration MJ (type null) : sinon la règle ANTI-REJOUAGE du prompt ne peut pas s'appliquer.
+      keepAssistantNull: true,
+      maxTurns: 16,
+      maxCharsPerMessage: 400,
+      // Debug filtré : jets secrets MJ + réponses JSON arbitre (évite de rejouer un 1d100 déjà tiré).
+      includeGmArbiterDebugTraces: true,
+    });
     const roomMemoryBlock = String(roomMemory ?? "").trim();
     const entityTruthSummary = summarizeEntityTruth(entities, player);
     const hasCampaignWorldContext =
       campaignWorldContext && typeof campaignWorldContext === "object" && !Array.isArray(campaignWorldContext);
+
+    const transitionFromMemBlock = String(transitionFromRoomMemory ?? "").trim();
+    const transitionResNoteBlock = String(transitionResolutionNote ?? "").trim();
 
     const connectedRoomIds = new Set();
     const exitsArr = Array.isArray(allowedExits) ? allowedExits : [];
@@ -655,11 +1053,29 @@ export async function POST(request) {
         return {
           id: String(r.id ?? id),
           title: String(r.title ?? id),
-          description: String(r.description ?? ""),
-          secrets: String(r.secrets ?? ""),
+          description: truncate(String(r.description ?? ""), 1200),
+          // Limite tokens : chaque salle voisine répète souvent de gros secrets ; l’essentiel est dans currentRoomSecrets.
+          secrets: truncate(String(r.secrets ?? ""), 2800),
         };
       })
       .filter(Boolean);
+    const connectedRoomIdsOrdered = connectedRooms.map((r) => String(r?.id ?? "").trim()).filter(Boolean);
+    const connectedRoomMemorySummary = hasCampaignWorldContext
+      ? summarizeConnectedRoomMemory(campaignWorldContext, connectedRoomIdsOrdered)
+      : "[]";
+    const connectedRoomEntityStateSummary = hasCampaignWorldContext
+      ? summarizeConnectedRoomEntityState(campaignWorldContext, connectedRoomIdsOrdered)
+      : "[]";
+
+    const resolutionContextBlock = buildArbiterResolutionContext({
+      normalizedMessages,
+      rollResult,
+      transitionFromRoomMemory: transitionFromMemBlock,
+      transitionResolutionNote: transitionResNoteBlock,
+      arbiterMechanicalLog,
+    });
+
+    const rollKindForConstraint = classifyRollResultForArbiter(rollResult);
 
     const userContent = [
       `worldTime: ${
@@ -670,17 +1086,42 @@ export async function POST(request) {
       `currentRoomId: ${String(currentRoomId ?? "").trim() || "(inconnu)"}`,
       `currentRoomTitle: ${String(currentRoomTitle ?? "").trim() || "(inconnu)"}`,
       `currentScene: ${String(currentScene ?? "").trim() || "(inconnue)"}`,
+      ...(rollResult != null
+        ? [
+            "CONTRAINTE (relance après jet) : rollResult est déjà fourni ci-dessous. Réponds par apply_consequences ou no_roll_needed en t'appuyant sur currentRoomSecrets, connectedRooms et entities. N'utilise PAS needs_campaign_context (pas d'escalade de contexte : inutile ici et coûteux).",
+            ...(rollKindForConstraint === "jet_competence_ou_sauvegarde_joueur_resolu"
+              ? [
+                  "CONTRAINTE (jet joueur déjà résolu dans rollResult) : ce n'est PAS un jet secret MJ. Si les secrets exigent aussi un jet secret MJ (ex. 1d100 embuscade), consulte « Historique mécanique arbitre/moteur » et les messages debug d'arbitre : si ce jet secret figure déjà comme tiré, interdiction de request_roll gm_secret ; applique apply_consequences avec ce tirage.",
+                ]
+              : []),
+            ...(rollKindForConstraint === "jet_secret_mj_resolu"
+              ? [
+                  "CONTRAINTE (jet secret MJ dans rollResult) : consomme ce résultat avec apply_consequences ou no_roll_needed. Ne redemande pas le même gm_secret.",
+                ]
+              : []),
+          ]
+        : []),
+      `contexte_resolution (lecture obligatoire, toute campagne):\n${resolutionContextBlock}`,
       "truthHierarchy: entities_actuel > memoire_de_scene > currentRoomSecrets",
       `currentRoomSecrets: ${String(currentRoomSecrets ?? "").trim() || "(aucun)"}`,
       `mémoire_de_scène: ${roomMemoryBlock || "(aucune)"}`,
       `resume_etat_entites_verite: ${entityTruthSummary}`,
+      `bestiaryTemplateIds: ${JSON.stringify(BESTIARY_TEMPLATE_IDS)}`,
       `allowedExits: ${JSON.stringify(Array.isArray(allowedExits) ? allowedExits : [])}`,
       `connectedRooms (1 saut via exits): ${JSON.stringify(connectedRooms)}`,
+      `CONNECTED_ROOM_MEMORY (prioritaire sur secrets connectés): ${connectedRoomMemorySummary}`,
+      `CONNECTED_ROOM_ENTITY_STATE (priorité absolue runtime sur salles connectées): ${connectedRoomEntityStateSummary}`,
       `entities: ${JSON.stringify(Array.isArray(entities) ? entities : [])}`,
       `player: ${JSON.stringify(player ?? null)}`,
       `sourceAction: ${String(sourceAction ?? "").trim() || "(aucune)"}`,
       `intentDecision: ${JSON.stringify(intentDecision ?? null)}`,
       `arbiterTrigger: ${JSON.stringify(arbiterTrigger ?? null)}`,
+      ...(String(arbiterTrigger?.phase ?? "").trim() === "scene_entered" &&
+      String(arbiterTrigger?.fromRoomId ?? "").trim()
+        ? [
+            "CONTRAINTE (entrée après navigation moteur / parse-intent) : le PJ est DÉJÀ dans currentRoomId. sourceAction peut décrire la sortie déjà utilisée pour ARRIVER depuis fromRoomId (arbiterTrigger) ; ne le lis pas comme une nouvelle tentative de partir dans cette direction depuis la salle actuelle. Interdit : apply_consequences dont engineEvent ou roomMemoryAppend affirment mur / impasse / absence de passage pour cette direction si cela contredit une entrée déjà résolue. Harmonise la salle (spawns légitimes depuis secrets, pièges à l'entrée, jets lieu) ou no_roll_needed.",
+          ]
+        : []),
       `rollResult: ${JSON.stringify(rollResult ?? null)}`,
       `messages (ancien→récent, résumé): ${JSON.stringify(normalizedMessages)}`,
       `campaignWorldContextIncluded: ${hasCampaignWorldContext ? "true" : "false"}`,
@@ -689,6 +1130,11 @@ export async function POST(request) {
         : "campaignWorldContext: null",
       "Un seul objet JSON conforme.",
     ].join("\n");
+    const systemInstructionChars = GM_ARBITER_SYSTEM.length;
+    const promptTotalChars = systemInstructionChars + userContent.length;
+    const promptTotalUtf8Bytes =
+      Buffer.byteLength(GM_ARBITER_SYSTEM, "utf8") + Buffer.byteLength(userContent, "utf8");
+
     const promptMetrics = {
       currentRoomIdChars: String(currentRoomId ?? "").length,
       currentSceneChars: String(currentScene ?? "").length,
@@ -703,61 +1149,90 @@ export async function POST(request) {
       connectedRoomsCount: connectedRooms.length,
       entitiesCount: Array.isArray(entities) ? entities.length : 0,
       userContentChars: userContent.length,
+      resolutionContextChars: resolutionContextBlock.length,
       campaignWorldContextIncluded: hasCampaignWorldContext,
       campaignWorldContextChars: hasCampaignWorldContext
         ? JSON.stringify(campaignWorldContext).length
         : 0,
+      systemInstructionChars,
+      promptTotalChars,
+      promptTotalUtf8Bytes,
     };
     console.info("[/api/gm-arbiter] start", {
       provider,
       roomId: String(currentRoomId ?? ""),
+      hasRollResult: rollResult != null,
       metrics: promptMetrics,
     });
+    console.info("[/api/gm-arbiter] prompt-envoyé", {
+      roomId: String(currentRoomId ?? "").trim() || "(inconnu)",
+      phase: rollResult != null ? "après_jet" : "initial",
+      systemInstructionChars,
+      userContentChars: userContent.length,
+      promptTotalChars,
+      promptTotalUtf8Bytes,
+    });
 
-    let rawOut = "";
-    if (provider === "gemini") {
-      if (!process.env.GEMINI_API_KEY) {
-        return NextResponse.json({ error: "GEMINI_API_KEY manquant." }, { status: 500 });
-      }
-      const model = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-        systemInstruction: GM_ARBITER_SYSTEM,
-        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-      });
-      const result = await model.generateContent(userContent);
-      rawOut = (result.response.text() || "").trim();
-    } else {
-      if (!process.env.OPENROUTER_API_KEY) {
-        return NextResponse.json({ error: "OPENROUTER_API_KEY manquant." }, { status: 500 });
-      }
-      const res = await fetch(OPENROUTER_BASE, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "HTTP-Referer": "http://localhost:3000",
-          "X-Title": "DnD AI Scene Arbiter",
-        },
-        body: JSON.stringify({
-          model: OPENROUTER_MODEL,
-          messages: [
-            { role: "system", content: GM_ARBITER_SYSTEM },
-            { role: "user", content: userContent },
-          ],
-          temperature: 0.2,
-          response_format: { type: "json_object" },
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
-      }
-      const data = await res.json();
-      rawOut =
-        typeof data?.choices?.[0]?.message?.content === "string"
+    if (provider === "gemini" && !process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: "GEMINI_API_KEY manquant." }, { status: 500 });
+    }
+    if (provider !== "gemini" && !process.env.OPENROUTER_API_KEY) {
+      return NextResponse.json({ error: "OPENROUTER_API_KEY manquant." }, { status: 500 });
+    }
+
+    const rawOut = await withTerminalAiTiming(
+      {
+        routePath: "/api/gm-arbiter",
+        agentLabel: "Arbitre de scène (GM)",
+        provider: provider === "gemini" ? "Gemini" : "OpenRouter",
+        model: provider === "gemini" ? GEMINI_MODEL : OPENROUTER_MODEL,
+      },
+      async () => {
+        if (provider === "gemini") {
+          const model = genAI.getGenerativeModel({
+            model: GEMINI_MODEL,
+            systemInstruction: GM_ARBITER_SYSTEM,
+            generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+          });
+          const result = await generateGmArbiterGeminiContent(model, userContent);
+          return (result.response.text() || "").trim();
+        }
+        const orAbort = new AbortController();
+        const orAbortTimer = setTimeout(() => orAbort.abort(), GM_ARBITER_MODEL_CALL_TIMEOUT_MS);
+        let res;
+        try {
+          res = await fetch(OPENROUTER_BASE, {
+            method: "POST",
+            signal: orAbort.signal,
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+              "HTTP-Referer": "http://localhost:3000",
+              "X-Title": "DnD AI Scene Arbiter",
+            },
+            body: JSON.stringify({
+              model: OPENROUTER_MODEL,
+              messages: [
+                { role: "system", content: GM_ARBITER_SYSTEM },
+                { role: "user", content: userContent },
+              ],
+              temperature: 0.2,
+              response_format: { type: "json_object" },
+            }),
+          });
+        } finally {
+          clearTimeout(orAbortTimer);
+        }
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
+        }
+        const data = await res.json();
+        return typeof data?.choices?.[0]?.message?.content === "string"
           ? data.choices[0].message.content.trim()
           : "";
-    }
+      }
+    );
     phaseTimestamps.afterModel = nowIso();
     console.info("[/api/gm-arbiter] after-model", {
       elapsedMs: elapsedMsSince(t0),
@@ -769,6 +1244,14 @@ export async function POST(request) {
       currentRoomMemory: roomMemoryBlock,
       campaignWorldContext,
       entities,
+      bestiaryTemplateIds: BESTIARY_TEMPLATE_IDS,
+    });
+
+    parsed = applyGmArbiterAntiReplayGuard(parsed, {
+      sourceAction,
+      intentDecision,
+      messages,
+      rollResult,
     });
 
     if (parsed.ok && parsed.parsed?.resolution === "request_roll" && parsed.parsed.rollRequest) {
@@ -811,6 +1294,13 @@ export async function POST(request) {
       provider: traceProvider,
       status: responseStatus,
     });
+    if (parsed.ok && parsed.parsed?.resolution === "request_roll" && parsed.parsed.rollRequest) {
+      console.info("[/api/gm-arbiter] demande de jet (request_roll) → le moteur lance le dé puis rappelle l'arbitre avec rollResult", {
+        roomId: String(currentRoomId ?? ""),
+        rollRequest: parsed.parsed.rollRequest,
+      });
+    }
+
     void logInteraction(
       "GM_ARBITER",
       traceProvider,
@@ -820,6 +1310,8 @@ export async function POST(request) {
       parsed.ok ? parsed.parsed : { error: parsed.error, raw: truncate(rawOut, 800) },
       {
         promptMetrics,
+        rollResultInRequest: rollResult ?? null,
+        arbiterCallPhase: rollResult != null ? "after_dice_roll" : "no_roll_in_request",
         timing: {
           phases: phaseTimestamps,
           elapsedMs: {

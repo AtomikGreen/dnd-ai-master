@@ -9,6 +9,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { withTerminalAiTiming } from "@/lib/aiTerminalTimingLog";
 import { slimMessagesForArbiterPrompt } from "@/lib/slimMessagesForArbiterPrompt";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -24,7 +25,7 @@ Sortie obligatoire :
 {
   "resolution": "combat_intent" | "requires_roll" | "trivial_success" | "impossible" | "unclear_input",
   "reason": "texte court",
-  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"short_rest"|"long_rest"|"end_turn"|"loot", "targetId": "", "weapon": "" },
+  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"use_item"|"stabilize"|"short_rest"|"end_short_rest"|"long_rest"|"wait"|"wait_until_recover_1hp"|"end_turn"|"loot", "targetId": "" | null, "weapon": "" },
   "rollRequest": null | { "kind": "check"|"save"|"attack"|"gm_secret", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Athlétisme", "dc": <nombre>, "raison": "...", "roll": "1d100" },
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "..." }
 }
@@ -33,14 +34,41 @@ MODE (entrée) = combat ou exploration : fixé par le moteur ; tu n’inventes p
 
 unclear_input : message vide de sens en jeu, spam/métajeu/hors cadre, incohérent, aucune intention D&D raisonnable. Sinon ne pas l’utiliser : action risquée mais claire → requires_roll ou impossible ; maladroite mais compréhensible → interpréter. Une courte relance de dialogue ou de clarification n'est PAS unclear_input si l'historique récent montre qu'un PNJ vient de parler juste avant (ex: "hein ?", "pardon ?", "comment ça ?", "si quoi ?", "de quoi tu parles ?", "qui ça ?").
 
+PAROLE RP vs DESCRIPTION D'ACTION (obligatoire) :
+- Si le joueur "parle en personnage" (question, réplique, provocation, promesse, exclamation, discours direct/indirect), traite cela comme une intention sociale, pas comme une action physique implicite.
+- Le champ reason doit indiquer clairement qu'il s'agit d'une prise de parole RP / d'une question adressée à un interlocuteur (ex: "Le joueur interpelle les occupants et demande où sont les gobelins.").
+- Ne force PAS automatiquement trivial_success/rollRequest=null pour ces cas : choisis la résolution selon l'enjeu réel (trivial_success si sans enjeu, requires_roll si issue sociale incertaine, impossible si hors sens), afin de laisser la décision mécanique au pipeline arbitre/moteur.
+- N'invente jamais une attaque, un déplacement, un sort, une fouille ou une interaction technique uniquement parce que le ton est agressif : il faut une intention d'action explicite.
+
 RÈGLE ANTI-CHAÎNE (1 SEULE action majeure par tour) :
-- Si le message du joueur décrit plusieurs actions distinctes/étapes (ex: “je fais X puis je part vers Y puis je frappe Z...”), traite UNIQUEMENT la PREMIÈRE action D&D clairement formulée dans l’ordre d’apparition.
-- Ignore le reste pour ce tour : ne renvoie qu’une seule résolution et un seul intent (ou sceneUpdate si c’est une navigation).
-- Si la première action correspond à une navigation (direction/entrée vers une sortie autorisée), privilégie la scèneUpdate associée et ignore les autres actions mentionnées après.
+- Si le message enchaîne plusieurs actions majeures différentes (ex: « j’attaque X puis je pars vers Y puis je fouille Z »), ne traite que la PREMIÈRE dans l’ordre du texte.
+- EXCEPTION OBLIGATOIRE — NAVIGATION + AUTRE CHOSE DANS LE MÊME MESSAGE : si le joueur combine une réaction sociale courte (main sur l’épaule, remerciement, promesse à un PNJ, etc.) ET une formulation claire de départ / trajet / prise de direction vers une zone couverte par les sorties autorisées (voir liste d’indices ci-dessous), tu dois prioriser le changement de lieu pour ce tour : "trivial_success" et sceneUpdate avec "hasChanged": true et "targetRoomId" égal à l’id exact d’une sortie autorisée. Ne réduis pas le message entier au seul geste social : si la partie « je pars / direction / chemin » est présente et matche une sortie, le sceneUpdate est requis.
+- Si la première proposition du message est déjà une navigation vers une sortie autorisée, utilise sceneUpdate et ignore la suite (autres actions).
+- Si la première proposition est sociale mais une clause suivante (souvent après « puis », « et », virgule ou phrase suivante) exprime le départ vers l’ouest/nord/etc. ou « vers les collines / la piste / rattraper » en cohérence avec une sortie listée, applique l’EXCEPTION ci-dessus.
 
-Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée. Capacités/repos : "second souffle" -> combat_intent + type second_wind ; "repos court", "courte pause pour souffler/se ressourcer" -> combat_intent + type short_rest ; "repos long", "dormir 8h/se reposer pour la nuit" -> combat_intent + type long_rest. Ne confonds jamais "courte pause/repos court" avec second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. SÉMANTIQUE DE NAVIGATION À RESPECTER STRICTEMENT : "je me dirige vers", "je vais vers", "je m'approche de", "je me rapproche de", "je marche jusqu'à" une porte / issue / sortie = seulement s'en approcher, jamais l'ouvrir, la franchir, la crocheter ni la forcer. "j'ouvre", "je pousse la porte", "je tente la porte", "j'essaie d'ouvrir", "je crochette", "je force", "j'enfonce" = interaction avec la porte ; si le verrou ou la résistance créent une incertitude, alors seulement requires_roll ou impossible. "j'entre", "je passe", "je franchis", "je traverse", "je vais dedans", "j'y vais" = franchissement / passage vers l'autre salle, mais seulement si l'historique récent montre que le personnage est déjà au seuil ou qu'une seule issue immédiate cohérente est en train d'être suivie ; sinon interpréter "j'y vais" comme trop ambigu plutôt que comme une nouvelle action technique. N'infère jamais de crochetage ou de forçage uniquement parce que les secrets mentionnent une serrure, une clef, un verrou ou un DD : il faut une intention explicite du joueur d'ouvrir malgré l'obstacle ou d'interagir avec la serrure. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason factuelle et procédurale (destinée au moteur/narrateur, pas au joueur) qui résume brièvement l'ambiguïté. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
+INDICES DE DÉPART / CHANGEMENT DE LIEU (exploration, à croiser avec « Sorties autorisées » du contexte) :
+- Formulations typiques : « je prends la direction de », « je pars vers », « je me mets en route », « je quitte [le village / la forge / les lieux] », « sans attendre vers », « en direction de l’ouest / du nord », « je pars à leur suite », « je rattrape », « je longe la piste », « je suis le chemin vers ».
+- Dès qu’une telle intention correspond à une sortie autorisée (même direction ou description compatible), renseigne sceneUpdate avec le targetRoomId de cette sortie. Une seule sortie : choisis-la par correspondance direction/description ; ne pas inventer d’id.
 
-Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, short_rest, long_rest, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind/short_rest/long_rest : targetId peut être "". rollRequest=null et sceneUpdate=null. RÈGLE IMPÉRATIVE : en combat, si l'intention du joueur est d'attaquer, de lancer un sort offensif, de se déplacer pour frapper, ou plus généralement d'accomplir une action de combat standard résolue par le moteur, tu dois répondre "combat_intent" avec intent renseigné, JAMAIS "requires_roll". Le jet d'attaque ou les dégâts seront gérés ensuite par le moteur client ; toi tu ne demandes pas un skillcheck, tu décris seulement l'intention de combat structurée. "requires_roll" en combat est réservé aux cas exceptionnellement hors grammaire de combat standard.
+Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée. EXCEPTION OBLIGATOIRE : "stabiliser / aider / secourir un allié à 0 PV" doit retourner combat_intent (type "stabilize") MEME si MODE=exploration, avec rollRequest=null. Capacités/repos : "second souffle" -> combat_intent + type second_wind ; "repos court", "courte pause pour souffler/se ressourcer" -> combat_intent + type short_rest ; "repos long", "dormir 8h/se reposer pour la nuit" -> combat_intent + type long_rest ; "j'attends Xh / X minutes" sans mention de repos -> combat_intent + type wait (weapon contient les minutes à attendre). Si le joueur dit qu'il attend jusqu'à ce qu'un allié explicitement nommé reprenne connaissance / récupère 1 PV, renvoie combat_intent + type wait_until_recover_1hp avec targetId = id exact de cet allié (si identifiable dans Entités). Ne confonds jamais "courte pause/repos court" avec second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. SÉMANTIQUE DE NAVIGATION À RESPECTER STRICTEMENT : "je me dirige vers", "je vais vers", "je m'approche de", "je me rapproche de", "je marche jusqu'à" une porte / issue / sortie = seulement s'en approcher, jamais l'ouvrir, la franchir, la crocheter ni la forcer. "j'ouvre", "je pousse la porte", "je tente la porte", "j'essaie d'ouvrir", "je crochette", "je force", "j'enfonce" = interaction avec la porte ; si le verrou ou la résistance créent une incertitude, alors seulement requires_roll ou impossible. "j'entre", "je passe", "je franchis", "je traverse", "je vais dedans", "j'y vais" = franchissement / passage vers l'autre salle, mais seulement si l'historique récent montre que le personnage est déjà au seuil ou qu'une seule issue immédiate cohérente est en train d'être suivie ; sinon interpréter "j'y vais" comme trop ambigu plutôt que comme une nouvelle action technique. N'infère jamais de crochetage ou de forçage uniquement parce que les secrets mentionnent une serrure, une clef, un verrou ou un DD : il faut une intention explicite du joueur d'ouvrir malgré l'obstacle ou d'interagir avec la serrure. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason factuelle et procédurale (destinée au moteur/narrateur, pas au joueur) qui résume brièvement l'ambiguïté. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Même logique pour une parole RP adressée à un groupe/ennemi ("Où sont les gobelins ?", "Rendez-vous !", "Qui est là ?") : traiter comme prise de parole, pas comme action physique implicite. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
+
+OBJET (exploration ou combat) : boire / utiliser une potion ou consommable listé dans l'inventaire joueur → resolution="combat_intent", intent.type="use_item", weapon = nom exact ou proche (ex. "Potion de soins"), targetId = id de la créature alliée si le joueur la cible explicitement, sinon "" pour soi-même. En combat, donner une potion à un allié n'est valide que si son id figure dans playerMeleeTargets (contact) ; sinon impossible avec reason courte.
+
+MÉDECINE / STABILISATION (priorité haute) :
+- Si l'intention est de stabiliser / aider / secourir un allié à 0 PV, tu dois répondre "resolution=combat_intent" avec "intent.type=stabilize" et "rollRequest=null".
+- Interdiction de répondre "requires_roll" pour une stabilisation : le moteur déclenche lui-même le jet de Médecine.
+- Cette règle s'applique en combat ET hors combat.
+- En combat, le contact au corps à corps est requis (D&D 5e) ; si pas de contact, renvoie "impossible" (ou "combat_intent" type "move" pour s'approcher), jamais "requires_roll".
+
+Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, use_item, stabilize, short_rest, end_short_rest, long_rest, wait_until_recover_1hp, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind/short_rest/long_rest : targetId peut être "" ou null. rollRequest=null et sceneUpdate=null.
+
+RESSOURCES DE TOUR (Action, bonus, mouvement, réaction) : tu ne reçois pas cet état dans le message joueur. Ne déduis jamais resolution="impossible" du seul fait qu'il « manquerait » une Action, du mouvement ou une action bonus : le moteur client vérifie et affiche les refus. Dès que l'intention de combat est claire, renvoie combat_intent (ou move / attack selon le schéma).
+
+DÉPLACEMENT TACTIQUE (intent.type "move") — rapprochement vs repositionnement sans contact au corps à corps :
+- targetId OBLIGATOIREMENT vide ("" ou null) si le joueur se déplace sans viser l'engagement au contact d'une créature précise : abri, couvert, obstacle, reculer, s'éloigner, prendre de la distance, se placer loin, contourner sans clore, fuir le contact. Même si une créature est nommée (« je m'éloigne du gobelin »), si l'intention est de s'éloigner ou de se repositionner sans aller au contact de cette créature, targetId reste vide. Le moteur déplace sans rapprochement forcé vers une créature.
+- targetId = id EXACT d'une entrée de Entités seulement pour se rapprocher / avancer vers / aller au contact / rejoindre au corps à corps cette créature. Ne mets jamais un targetId de créature pour un déplacement qui vise à s'éloigner d'elle.
+
+Le moteur consomme le mouvement. Ne pas utiliser trivial_success ni sceneUpdate pour le combat tactique. RÈGLE IMPÉRATIVE : en combat, si l'intention du joueur est d'attaquer, de lancer un sort offensif, de se déplacer pour frapper, ou plus généralement d'accomplir une action de combat standard résolue par le moteur, tu dois répondre "combat_intent" avec intent renseigné, JAMAIS "requires_roll". Le jet d'attaque ou les dégâts seront gérés ensuite par le moteur client ; toi tu ne demandes pas un skillcheck, tu décris seulement l'intention de combat structurée. "requires_roll" en combat est réservé aux cas exceptionnellement hors grammaire de combat standard.
 
 Fiabilité : clé intent (pas actionIntent). Jamais de string à la place d’un objet. Utiliser type/stat/dc (pas action/ability/difficultyClass). JSON seul, sans markdown.`;
 
@@ -60,13 +88,39 @@ function normalizeEntitiesForPrompt(entities) {
   if (!Array.isArray(entities)) return [];
   return entities
     .filter((e) => e && e.id != null && String(e.id).trim() !== "")
-    .map((e) => ({
-      id: String(e.id).trim(),
-      name: String(e.name ?? e.id).trim(),
-      type: String(e.type ?? "").trim() || null,
-      visible: e.visible !== false,
-      isAlive: e.isAlive !== false,
-    }));
+    .map((e) => {
+      const hpCurrent =
+        typeof e?.hp?.current === "number" && Number.isFinite(e.hp.current)
+          ? Math.trunc(e.hp.current)
+          : null;
+      const hpMax =
+        typeof e?.hp?.max === "number" && Number.isFinite(e.hp.max)
+          ? Math.trunc(e.hp.max)
+          : null;
+      const ds = e?.deathState && typeof e.deathState === "object" ? e.deathState : null;
+      return {
+        id: String(e.id).trim(),
+        name: String(e.name ?? e.id).trim(),
+        type: String(e.type ?? "").trim() || null,
+        visible: e.visible !== false,
+        isAlive: e.isAlive !== false,
+        hp:
+          hpCurrent != null
+            ? {
+                current: hpCurrent,
+                max: hpMax,
+              }
+            : null,
+        deathState:
+          ds != null
+            ? {
+                stable: ds.stable === true,
+                unconscious: ds.unconscious === true,
+                dead: ds.dead === true,
+              }
+            : null,
+      };
+    });
 }
 
 function normalizeMeleeTargetIds(ids) {
@@ -109,6 +163,46 @@ function normalizeMessagesForPrompt(messages) {
     .filter(Boolean);
 }
 
+function normalizeForIntentPostProcess(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveDownedAllyTargetId(rawText, entities) {
+  const pool = Array.isArray(entities) ? entities : [];
+  const candidates = pool.filter((e) => {
+    if (!e || String(e.type ?? "").toLowerCase() === "hostile") return false;
+    const id = String(e.id ?? "").trim();
+    if (!id) return false;
+    const hp = typeof e?.hp?.current === "number" && Number.isFinite(e.hp.current) ? Math.trunc(e.hp.current) : null;
+    if (hp == null || hp > 0) return false;
+    const ds = e?.deathState && typeof e.deathState === "object" ? e.deathState : null;
+    if (ds?.dead === true) return false;
+    return true;
+  });
+  if (candidates.length === 0) return "";
+  const t = normalizeForIntentPostProcess(rawText);
+  if (t) {
+    const named = candidates
+      .map((e) => ({
+        id: String(e.id ?? "").trim(),
+        nameNorm: normalizeForIntentPostProcess(e.name ?? e.id),
+      }))
+      .filter((x) => x.id && x.nameNorm.length >= 3);
+    const hit = named.find((x) => t.includes(x.nameNorm) || x.nameNorm.includes(t));
+    if (hit?.id) return hit.id;
+  }
+  if (candidates.length === 1) {
+    return String(candidates[0]?.id ?? "").trim();
+  }
+  return "";
+}
+
 function buildUserContent({
   text,
   gameMode,
@@ -119,7 +213,8 @@ function buildUserContent({
   entities,
   weaponNames,
   meleeTargetIds,
-  turnResources,
+  playerInventoryLines,
+  turnResources: _turnResourcesUnused,
   messages,
 }) {
   const entBlock =
@@ -128,7 +223,7 @@ function buildUserContent({
       : entities
           .map(
             (e) =>
-              `- id: "${e.id}", name: "${e.name}", type: "${e.type ?? ""}", visible: ${e.visible}, isAlive: ${e.isAlive}`
+              `- id: "${e.id}", name: "${e.name}", type: "${e.type ?? ""}", visible: ${e.visible}, isAlive: ${e.isAlive}, hp: ${e?.hp?.current ?? "?"}/${e?.hp?.max ?? "?"}, deathState: stable=${e?.deathState?.stable === true}, unconscious=${e?.deathState?.unconscious === true}, dead=${e?.deathState?.dead === true}`
           )
           .join("\n");
   const wBlock =
@@ -137,8 +232,13 @@ function buildUserContent({
       : weaponNames.map((n) => `- ${n}`).join("\n");
   const meleeBlock =
     meleeTargetIds.length === 0
-      ? "(Aucun ennemi au contact.)"
+      ? "(Aucune créature au contact du joueur pour la mêlée.)"
       : meleeTargetIds.map((id) => `- "${id}"`).join("\n");
+  const invLines = Array.isArray(playerInventoryLines) ? playerInventoryLines : [];
+  const invBlock =
+    invLines.length === 0
+      ? "(Inventaire non fourni ou vide.)"
+      : invLines.map((line) => `- ${line}`).join("\n");
   const exitsBlock =
     allowedExits.length === 0
       ? "(Aucune sortie autorisée fournie.)"
@@ -148,10 +248,14 @@ function buildUserContent({
               `- id: "${e.id}", direction: "${e.direction || "(non précisée)"}", description: "${e.description || "(non précisée)"}"`
           )
           .join("\n");
-  const tr = turnResources && typeof turnResources === "object" ? turnResources : null;
-  const trBlock = tr
-    ? `turnResources: action=${!!tr.action}, bonus=${!!tr.bonus}, reaction=${!!tr.reaction}, movement=${!!tr.movement}`
-    : `turnResources: non fournis`;
+  const trBlock =
+    "Ressources de tour : non indiquées dans ce prompt — le moteur client valide Action / bonus / mouvement / réaction ; n'utilise pas resolution=\"impossible\" pour un manque de ressource supposé.";
+  const combatMovementHint =
+    gameMode === "combat"
+      ? `COMBAT — DÉPLACEMENT (move) :
+- Zone libre, abri, couvert, reculer, s'éloigner d'un adversaire (même nommé), prendre du champ : intent.type="move", targetId "" ou null. Ne pas remplir targetId avec l'id d'une créature si le joueur s'éloigne d'elle.
+- Rapprochement / aller au contact d'une créature listée dans Entités : intent.type="move", targetId = id exact (une seule cible de mêlée).`
+      : "";
   const historyBlock =
     messages.length === 0
       ? "(Aucun historique fourni.)"
@@ -165,6 +269,7 @@ function buildUserContent({
     `currentScene: ${String(currentScene ?? "").trim() || "(inconnue)"}`,
     `currentRoomSecrets: ${String(currentRoomSecrets ?? "").trim() || "(aucun)"}`,
     trBlock,
+    combatMovementHint,
     ``,
     `Texte joueur :`,
     `"""`,
@@ -177,7 +282,10 @@ function buildUserContent({
     `Entités :`,
     entBlock,
     ``,
-    `playerMeleeTargets :`,
+    `Inventaire du PJ (lignes empilées) :`,
+    invBlock,
+    ``,
+    `Créatures au contact du joueur (mêlée — alliés et ennemis, pour potion à un allié en combat) :`,
     meleeBlock,
     ``,
     `Armes / sorts connus côté joueur :`,
@@ -185,6 +293,9 @@ function buildUserContent({
     ``,
     `Sorties autorisées :`,
     exitsBlock,
+    allowedExits.length > 0
+      ? `Si le texte joueur exprime un départ / une direction / un trajet qui correspond à une sortie ci-dessus, resolution = trivial_success et sceneUpdate obligatoire avec hasChanged: true et targetRoomId = l’id de cette sortie (y compris si le même message commence par un geste ou un dialogue court).`
+      : ``,
     ``,
     `Réponds par un seul objet JSON valide au format imposé.`,
   ].join("\n");
@@ -239,9 +350,14 @@ function safeParseArbiterJson(raw) {
         "dodge",
         "second_wind",
         "short_rest",
+        "end_short_rest",
         "long_rest",
+        "wait",
+        "stabilize",
+        "wait_until_recover_1hp",
         "end_turn",
         "loot",
+        "use_item",
       ]);
       if (!allowedTypes.has(type)) {
         return { ok: false, error: `intent.type invalide: ${type || "(vide)"}` };
@@ -337,254 +453,8 @@ function tryExtractDcFromSecrets(secrets, regex) {
   return Number.isFinite(n) ? n : null;
 }
 
-function normalizeLoose(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[’']/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isExplicitDoorTraversalIntent(rawText) {
-  const raw = String(rawText ?? "").trim();
-  if (!raw) return false;
-  return /(ouvre|ouvrir|j['’]ouvre|franchi|franchir|je\s+passe(?:\s+la\s+porte)?|passer\s+la\s+porte|je\s+rentre|je\s+rentre|j['’]entre|je\s+vais\s+dedans|j['’]y\s+vais|je\s+traverse)/i.test(raw);
-}
-
-function isApproachOnlyIntent(rawText) {
-  const raw = String(rawText ?? "").trim();
-  if (!raw) return false;
-  const approachVerb =
-    /(je\s+me\s+dirige(?:r)?|je\s+vais\s+vers|je\s+m['’]approche|je\s+me\s+rapproche|je\s+marche\s+vers|je\s+me\s+rends?\s+vers)/i;
-  if (!approachVerb.test(raw)) return false;
-  if (isExplicitDoorTraversalIntent(raw)) return false;
-  if (/(crochet|crocheter|serrure|outils?\s+de\s+voleur|forcer|enfonc|défonc|deverrou|déverrou)/i.test(raw)) {
-    return false;
-  }
-  return true;
-}
-
-function classifyRestIntent(rawText) {
-  const raw = normalizeLoose(String(rawText ?? ""));
-  if (!raw) return null;
-  if (
-    /\b(repos\s+court|short\s+rest|courte?\s+pause|petite?\s+pause|souffler\s+un\s+peu|me\s+ressourcer|recuperer\s+mes\s+forces)\b/.test(
-      raw
-    )
-  ) {
-    return "short_rest";
-  }
-  if (
-    /\b(repos\s+long|long\s+rest|dormir|nuit\s+de\s+repos|pour\s+la\s+nuit|huit\s+heures?)\b/.test(
-      raw
-    )
-  ) {
-    return "long_rest";
-  }
-  return null;
-}
-
-function normalizeParsedRestIntent(rawText, parsedDecision) {
-  if (!parsedDecision || typeof parsedDecision !== "object") return parsedDecision;
-  const restType = classifyRestIntent(rawText);
-  if (!restType) return parsedDecision;
-  if (parsedDecision.sceneUpdate) return parsedDecision;
-  return {
-    resolution: "combat_intent",
-    reason:
-      restType === "short_rest"
-        ? "Demande explicite de repos court"
-        : "Demande explicite de repos long",
-    intent: { type: restType, targetId: "", weapon: "" },
-    rollRequest: null,
-    sceneUpdate: null,
-  };
-}
-
-function buildDeterministicFallback({
-  text,
-  gameMode,
-  currentRoomSecrets,
-  allowedExits,
-}) {
-  const pickExitFromText = (rawText, exits) => {
-    const t = normalizeLoose(rawText);
-    if (!t || !Array.isArray(exits) || exits.length === 0) return null;
-
-    // 1) mention explicite de l'id
-    for (const ex of exits) {
-      const id = String(ex?.id ?? "").trim();
-      if (!id) continue;
-      const idEscaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (new RegExp(`\\b${idEscaped}\\b`, "i").test(rawText)) return ex;
-    }
-
-    // 2) mention explicite d'une direction
-    const byDirection = exits.filter((ex) => {
-      const dir = normalizeLoose(ex?.direction ?? "");
-      return dir && new RegExp(`\\b${dir}\\b`, "i").test(t);
-    });
-    if (byDirection.length === 1) return byDirection[0];
-
-    // 3) heuristique simple sur la description du chemin
-    const byDescription = exits.filter((ex) => {
-      const d = normalizeLoose(ex?.description ?? "");
-      if (!d) return false;
-      if (d.includes("porte") && /\bporte\b/i.test(t)) return true;
-      if (
-        (d.includes("couloir") || d.includes("galerie") || d.includes("passage")) &&
-        /\b(couloir|galerie|passage)\b/i.test(t)
-      ) {
-        return true;
-      }
-      if ((d.includes("ombre") || d.includes("penombre")) && /\b(ombre|penombre)\b/i.test(t)) {
-        return true;
-      }
-      return false;
-    });
-    if (byDescription.length === 1) return byDescription[0];
-
-    return null;
-  };
-
-  const raw = String(text ?? "").trim();
-  if (!raw) return null;
-
-  const restType = classifyRestIntent(raw);
-  if (restType) {
-    return {
-      resolution: "combat_intent",
-      reason:
-        restType === "short_rest"
-          ? "Demande explicite de repos court"
-          : "Demande explicite de repos long",
-      intent: { type: restType, targetId: "", weapon: "" },
-      rollRequest: null,
-      sceneUpdate: null,
-    };
-  }
-
-  // Capacités de classe : doivent toujours devenir une intention mécanique explicite.
-  if (/(second\s+souffle|second\s+wind)/i.test(raw)) {
-    return {
-      resolution: "combat_intent",
-      reason: "Second souffle explicite",
-      intent: { type: "second_wind", targetId: "", weapon: "Second souffle" },
-      rollRequest: null,
-      sceneUpdate: null,
-    };
-  }
-
-  if (gameMode === "combat") {
-    const lower = raw.toLowerCase();
-    if (/(fin\s+de\s+mon\s+tour|je\s+passe(?:r)?\s+mon\s+tour|j['’]attends)/i.test(lower)) {
-      return {
-        resolution: "combat_intent",
-        reason: "Fin de tour explicite",
-        intent: { type: "end_turn", targetId: "", weapon: "" },
-        rollRequest: null,
-        sceneUpdate: null,
-      };
-    }
-    return null;
-  }
-
-  if (/(entre|j['’]?entre|je\s+rentre|je\s+passe\s+la\s+porte|je\s+pénètre|je\s+vais\s+dans|je\s+vais\s+vers|je\s+me\s+dirige|je\s+prends|je\s+m['’]?engage|je\s+continue|je\s+pars\s+vers)/i.test(raw)) {
-    const selectedExit = pickExitFromText(raw, allowedExits);
-    if (selectedExit && isApproachOnlyIntent(raw)) {
-      const dir = String(selectedExit?.direction ?? "").trim();
-      return {
-        resolution: "trivial_success",
-        reason: dir
-          ? `Le joueur s'approche de la porte / sortie vers ${dir} sans tenter de l'ouvrir.`
-          : "Le joueur s'approche d'une porte / sortie sans tenter de l'ouvrir.",
-        intent: null,
-        rollRequest: null,
-        sceneUpdate: null,
-      };
-    }
-    if (!selectedExit && allowedExits.length > 1) {
-      const options = allowedExits
-        .map((e) => {
-          const dir = String(e?.direction ?? "").trim();
-          const desc = String(e?.description ?? "").trim();
-          if (dir && desc) return `${dir} (${desc})`;
-          return dir || desc || String(e?.id ?? "").trim();
-        })
-        .filter(Boolean)
-        .slice(0, 4);
-      return {
-        resolution: "unclear_input",
-        reason:
-          options.length > 0
-            ? `Plusieurs chemins sont possibles: ${options.join(" ; ")}. Lequel choisissez-vous ?`
-            : "Plusieurs chemins sont possibles. Lequel choisissez-vous ?",
-        intent: null,
-        rollRequest: null,
-        sceneUpdate: null,
-      };
-    }
-    const fallbackExit = !selectedExit && allowedExits.length === 1 ? allowedExits[0] : null;
-    const finalExit = selectedExit ?? fallbackExit;
-    if (finalExit?.id) {
-      return {
-        resolution: "trivial_success",
-        reason: "Déplacement explicite vers une sortie autorisée",
-        intent: null,
-        rollRequest: null,
-        sceneUpdate: { hasChanged: true, targetRoomId: finalExit.id },
-      };
-    }
-  }
-
-  if (/(loot|looter|piller|pillage|fouiller|fouille|depouille|dépouille|ramasser|récupérer|recuperer|prendre sur le corps)/i.test(raw)) {
-    return {
-      resolution: "trivial_success",
-      reason: "Fouille/pillage de corps",
-      intent: null,
-      rollRequest: null,
-      sceneUpdate: null,
-    };
-  }
-
-  if (/(enfonc|défonc|forcer?).*(porte)|porte.*(enfonc|défonc|forcer?)|coup d['’]épaule|coup de tête|avec ma tête/i.test(raw)) {
-    const dc = tryExtractDcFromSecrets(currentRoomSecrets, /Force\s+DD\s+(\d+)/i) ?? 15;
-    return {
-      resolution: "requires_roll",
-      reason: "Forcer une porte",
-      intent: null,
-      rollRequest: {
-        kind: "check",
-        stat: "FOR",
-        skill: "Athlétisme",
-        dc,
-        raison: "Tenter d'enfoncer la porte",
-      },
-      sceneUpdate: null,
-    };
-  }
-
-  if (/(crochet|crocheter|serrure|outils?\s+de\s+voleur)/i.test(raw)) {
-    const dc = tryExtractDcFromSecrets(currentRoomSecrets, /Dextérité\s+DD\s+(\d+)/i) ?? 10;
-    return {
-      resolution: "requires_roll",
-      reason: "Crocheter une serrure",
-      intent: null,
-      rollRequest: {
-        kind: "check",
-        stat: "DEX",
-        skill: "Escamotage",
-        dc,
-        raison: "Crocheter la serrure",
-      },
-      sceneUpdate: null,
-    };
-  }
-
-  return null;
-}
+// Aucune heuristique locale basée sur des mots-clés utilisateur ici.
+// Toute l'interprétation d'intention passe par le modèle parse-intent.
 
 export async function POST(request) {
   try {
@@ -594,8 +464,9 @@ export async function POST(request) {
       entities = [],
       playerWeapons = [],
       playerMeleeTargets = [],
+      playerInventory = [],
       turnResources = null,
-      provider = "openrouter",
+      provider = "gemini",
       gameMode = "exploration",
       currentScene = "",
       currentRoomId = "",
@@ -611,9 +482,15 @@ export async function POST(request) {
       );
     }
 
+    // IMPORTANT: aucune interprétation déterministe locale du texte joueur.
+    // L'intention est décidée uniquement par le modèle parse-intent.
+
     const entList = normalizeEntitiesForPrompt(entities);
     const weaponNames = normalizeWeaponList(playerWeapons);
     const meleeIds = normalizeMeleeTargetIds(playerMeleeTargets);
+    const invLines = Array.isArray(playerInventory)
+      ? playerInventory.map((x) => String(x ?? "").trim()).filter(Boolean)
+      : [];
     const exits = normalizeAllowedExits(allowedExits);
     // Parse-intent : on garde surtout le joueur + la narration GM (si présente),
     // en limitant fortement l'historique pour éviter les prompts énormes.
@@ -633,77 +510,103 @@ export async function POST(request) {
       entities: entList,
       weaponNames,
       meleeTargetIds: meleeIds,
+      playerInventoryLines: invLines,
       turnResources,
       messages: normalizedMessages,
     });
 
-    let rawOut = "";
+    if (provider === "gemini" && !process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: "GEMINI_API_KEY manquant." }, { status: 500 });
+    }
+    if (provider !== "gemini" && !process.env.OPENROUTER_API_KEY) {
+      return NextResponse.json({ error: "OPENROUTER_API_KEY manquant." }, { status: 500 });
+    }
 
-    if (provider === "gemini") {
-      if (!process.env.GEMINI_API_KEY) {
-        return NextResponse.json({ error: "GEMINI_API_KEY manquant." }, { status: 500 });
-      }
-      const model = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-        systemInstruction: ARBITER_SYSTEM,
-        generationConfig: {
-          responseMimeType: "application/json",
-          temperature: 0.2,
-        },
-      });
-      const result = await model.generateContent(userContent);
-      rawOut = (result.response.text() || "").trim();
-    } else {
-      if (!process.env.OPENROUTER_API_KEY) {
-        return NextResponse.json({ error: "OPENROUTER_API_KEY manquant." }, { status: 500 });
-      }
-      const messages = [
-        { role: "system", content: ARBITER_SYSTEM },
-        { role: "user", content: userContent },
-      ];
-      const res = await fetch(OPENROUTER_BASE, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "HTTP-Referer": "http://localhost:3000",
-          "X-Title": "DnD AI Arbiter",
-        },
-        body: JSON.stringify({
-          model: OPENROUTER_MODEL,
-          messages,
-          temperature: 0.2,
-          response_format: { type: "json_object" },
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
-      }
-      const data = await res.json();
-      rawOut =
-        typeof data?.choices?.[0]?.message?.content === "string"
+    const rawOut = await withTerminalAiTiming(
+      {
+        routePath: "/api/parse-intent",
+        agentLabel: "Parseur d'intentions",
+        provider: provider === "gemini" ? "Gemini" : "OpenRouter",
+        model: provider === "gemini" ? GEMINI_MODEL : OPENROUTER_MODEL,
+      },
+      async () => {
+        if (provider === "gemini") {
+          const model = genAI.getGenerativeModel({
+            model: GEMINI_MODEL,
+            systemInstruction: ARBITER_SYSTEM,
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.2,
+            },
+          });
+          const result = await model.generateContent(userContent);
+          return (result.response.text() || "").trim();
+        }
+        const messages = [
+          { role: "system", content: ARBITER_SYSTEM },
+          { role: "user", content: userContent },
+        ];
+        const res = await fetch(OPENROUTER_BASE, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "DnD AI Arbiter",
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages,
+            temperature: 0.2,
+            response_format: { type: "json_object" },
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
+        }
+        const data = await res.json();
+        return typeof data?.choices?.[0]?.message?.content === "string"
           ? data.choices[0].message.content.trim()
           : "";
-    }
-
-    let parsed = safeParseArbiterJson(rawOut);
-    if (!parsed.ok) {
-      const fallback = buildDeterministicFallback({
-        text,
-        gameMode,
-        currentRoomSecrets,
-        allowedExits: exits,
-      });
-      if (fallback) {
-        parsed = { ok: true, parsed: fallback };
       }
-    }
-    if (parsed.ok) {
-      parsed = {
-        ok: true,
-        parsed: normalizeParsedRestIntent(text, parsed.parsed),
-      };
+    );
+
+    const parsed = safeParseArbiterJson(rawOut);
+    let parsedDecision = parsed.ok ? parsed.parsed : null;
+    if (parsedDecision) {
+      const skillNorm = normalizeForIntentPostProcess(parsedDecision?.rollRequest?.skill ?? "");
+      const intentTypeNorm = normalizeForIntentPostProcess(parsedDecision?.intent?.type ?? "");
+      const mentionsStabilizeInReason = /stabilis|secour|aide/.test(
+        normalizeForIntentPostProcess(parsedDecision?.reason ?? "")
+      );
+      const isMedicineCheckFallback =
+        parsedDecision.resolution === "requires_roll" &&
+        (
+          (parsedDecision.intent == null &&
+            parsedDecision.rollRequest?.kind === "check" &&
+            skillNorm === "medecine") ||
+          intentTypeNorm === "stabilize" ||
+          mentionsStabilizeInReason
+        );
+      if (isMedicineCheckFallback) {
+        const source = `${String(text ?? "")} ${String(parsedDecision?.rollRequest?.raison ?? "")}`.trim();
+        const targetId = resolveDownedAllyTargetId(source, entList);
+        parsedDecision = {
+          resolution: "combat_intent",
+          reason:
+            parsedDecision?.reason && String(parsedDecision.reason).trim()
+              ? String(parsedDecision.reason).trim()
+              : "Tentative de stabilisation d'un allié à 0 PV.",
+          intent: {
+            type: "stabilize",
+            targetId: targetId || "",
+            weapon: "Médecine",
+          },
+          rollRequest: null,
+          sceneUpdate: null,
+        };
+      }
     }
 
     const traceProvider = provider === "gemini" ? "gemini" : "openrouter";
@@ -738,18 +641,24 @@ export async function POST(request) {
       requestForTrace,
       "",
       rawOut,
-      parsed.ok ? parsed.parsed : { error: parsed.error, raw: truncate(rawOut, 500) }
+      parsed.ok ? parsedDecision : { error: parsed.error, raw: truncate(rawOut, 500) }
     );
 
     if (!parsed.ok) {
       return NextResponse.json(
-        { error: parsed.error, raw: truncate(rawOut, 2000) },
-        { status: 422 }
+        {
+          resolution: "unclear_input",
+          reason: "Réponse parse-intent invalide (sortie modèle non JSON/format incorrect).",
+          intent: null,
+          rollRequest: null,
+          sceneUpdate: null,
+        },
+        { status: 200 }
       );
     }
 
     return NextResponse.json({
-      ...parsed.parsed,
+      ...parsedDecision,
       debugPrompt: {
         provider: provider === "gemini" ? "gemini" : "openrouter",
         model: provider === "gemini" ? GEMINI_MODEL : OPENROUTER_MODEL,

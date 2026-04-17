@@ -105,6 +105,7 @@ Reponds UNIQUEMENT avec un objet JSON valide au format exact :
     "hpMax": 13,
     "hitDiceRemaining": 1,
     "hitDiceTotal": 1,
+    "spellSlotsSet": { "1": { "max": 4, "remaining": 3 } },
     "inventorySet": ["objet"],
     "inventoryAdd": ["objet"],
     "inventoryRemove": ["objet"]
@@ -136,6 +137,7 @@ Regles obligatoires :
 - Si le dev demande de tuer/soigner/deplacer une entite existante, privilegie entityUpdates sur cette id existante.
 - "Remets mes PV a X" -> playerPatch.
 - Des de vie (PJ) : TOUJOURS playerPatch.hitDiceRemaining (et optionnellement hitDiceTotal). Jamais roomMemoryOps pour simuler des des de vie ou des PV. La ligne "player:" du contexte indique des de vie restants/total (des X) : utilise ces nombres pour "rendre 1 de" -> min(total, restants+1), ou "remettre tous les des" -> hitDiceRemaining = hitDiceTotal.
+- Emplacements de sort (PJ) : utiliser playerPatch.spellSlotsSet pour consommer/rendre des slots (ex: niveau 1). Ne pas utiliser roomMemoryOps pour simuler cette depense.
 - "Passe en combat" sans ordre explicite -> combatPatch.gameMode="combat" avec combatOrder=null.
 - "Sors du combat" -> combatPatch.gameMode="exploration" et clearCombat=true.
 - "Teleporte-moi" -> teleport uniquement. N'invente pas un sceneUpdate normal de joueur.
@@ -144,6 +146,8 @@ Regles obligatoires :
 - Pour une memoire de salle, ecris un fait mecanique concis et canonique, pas une narration.
 - Si le dev demande de supprimer des messages du chat, utilise chatHistoryPatch. "efface tout l'historique" -> clearAll=true. "supprime les 3 derniers messages" -> removeLast=3. Si la demande cible seulement des messages IA/debug, utilise removeRoles/removeTypes si pertinent.
 - Ne touche jamais a autre chose que ce qui est explicitement demande.
+- Multijoueur : les PJ dans l ordre d initiative ont souvent un id "mp-player-<clientId>". Pour soigner/revivre un PJ, privilegie "playerPatch" (hpCurrent, etc.) OU "entityUpdates" avec exactement l id de l ordre de combat (jamais inventer un id).
+- En multijoueur hors combat, les PJ du groupe sont listés dans "PJ du groupe (multijoueur)". Pour cibler "Thorin", "Elyndra", etc., utilise l id exact de cette section dans entityUpdates.
 - N'invente pas de commandes unsupported. Pas de markdown. JSON seul.`;
 
 function nowIso() {
@@ -198,6 +202,63 @@ function normalizeHp(value) {
   if (current == null) return { current: Math.min(max, max), max };
   if (max == null) return { current, max: Math.max(1, current) };
   return { current, max: Math.max(max, current) };
+}
+
+function normalizeSpellSlotsShape(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out = {};
+  for (const [lvl, row] of Object.entries(value)) {
+    const key = String(lvl ?? "").trim();
+    if (!/^\d+$/.test(key)) continue;
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const maxRaw = Number((row).max);
+    const remRaw = Number((row).remaining);
+    const max = Number.isFinite(maxRaw) ? Math.max(0, Math.trunc(maxRaw)) : null;
+    const remaining = Number.isFinite(remRaw) ? Math.max(0, Math.trunc(remRaw)) : null;
+    if (max == null && remaining == null) continue;
+    const safeMax = max == null ? Math.max(remaining ?? 0, 0) : max;
+    const safeRemaining =
+      remaining == null ? safeMax : Math.max(0, Math.min(remaining, Math.max(0, safeMax)));
+    out[key] = { max: safeMax, remaining: safeRemaining };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function inferSpellSlotPatchFromCommand(command, playerSnapshot) {
+  const cmd = toPlainString(command).toLowerCase();
+  if (!cmd) return null;
+  const levelMatch = cmd.match(/\b(?:niv(?:eau)?\.?\s*)(\d+)\b/) || cmd.match(/\blevel\s*(\d+)\b/);
+  const level = levelMatch ? Math.max(1, Math.min(9, Math.trunc(Number(levelMatch[1]) || 0))) : null;
+  if (!level) return null;
+  const wantsConsume =
+    /\b(retire|retirer|consomme|consommer|depense|dépenser|utilise|utiliser|use|spend)\b/.test(cmd);
+  const wantsRestore =
+    /\b(rend|rendre|ajoute|ajouter|restore|restaure|recupere|récupère)\b/.test(cmd);
+  if (!wantsConsume && !wantsRestore) return null;
+  const currentSlots = normalizeSpellSlotsShape(playerSnapshot?.spellSlots);
+  if (!currentSlots) return null;
+  const row = currentSlots[String(level)];
+  if (!row || typeof row !== "object") return null;
+  const max = Number(row.max ?? 0) || 0;
+  const remaining = Number(row.remaining ?? max) || 0;
+  const nextRemaining = wantsConsume
+    ? Math.max(0, remaining - 1)
+    : wantsRestore
+      ? Math.min(max, remaining + 1)
+      : remaining;
+  if (nextRemaining === remaining) return null;
+  return {
+    spellSlotsSet: {
+      ...currentSlots,
+      [String(level)]: {
+        max,
+        remaining: nextRemaining,
+      },
+    },
+    level,
+    nextRemaining,
+    action: wantsConsume ? "consume" : "restore",
+  };
 }
 
 function buildRoomCatalog() {
@@ -265,6 +326,34 @@ function normalizeMessagesForPrompt(messages) {
     .slice(-40);
 }
 
+function normalizePartyPcsForPrompt(partyPcs) {
+  if (!Array.isArray(partyPcs)) return [];
+  return partyPcs
+    .map((pc) => {
+      if (!pc || typeof pc !== "object") return null;
+      const combatantId = toPlainString(pc.combatantId);
+      if (!combatantId) return null;
+      const hpCurrent =
+        typeof pc.hpCurrent === "number" && Number.isFinite(pc.hpCurrent) ? Math.trunc(pc.hpCurrent) : null;
+      const hpMax = typeof pc.hpMax === "number" && Number.isFinite(pc.hpMax) ? Math.trunc(pc.hpMax) : null;
+      const ac = typeof pc.ac === "number" && Number.isFinite(pc.ac) ? Math.trunc(pc.ac) : null;
+      return {
+        combatantId,
+        clientId: toPlainString(pc.clientId) || null,
+        name: toPlainString(pc.name || combatantId),
+        hp:
+          hpCurrent != null && hpMax != null
+            ? `${hpCurrent}/${hpMax}`
+            : hpCurrent != null
+              ? `${hpCurrent}/?`
+              : "?",
+        ac,
+        isLocal: pc.isLocal === true,
+      };
+    })
+    .filter(Boolean);
+}
+
 function buildUserContent(payload) {
   const roomCatalog = buildRoomCatalog();
   const templateCatalog = buildTemplateCatalog();
@@ -310,6 +399,16 @@ function buildUserContent(payload) {
         )
         .join("\n")
     : "(aucun message recent)";
+  const partyPcsLines = Array.isArray(payload.partyPcs) && payload.partyPcs.length
+    ? payload.partyPcs
+        .map(
+          (pc) =>
+            `- id="${pc.combatantId}" | name="${pc.name}" | hp=${pc.hp} | ac=${pc.ac ?? "?"}${
+              pc.clientId ? ` | clientId=${pc.clientId}` : ""
+            }${pc.isLocal ? " | local=true" : ""}`
+        )
+        .join("\n")
+    : "(aucun PJ groupe fourni)";
 
   return [
     `Commande dev :`,
@@ -341,6 +440,9 @@ function buildUserContent(payload) {
     ``,
     `Ordre de combat actuel :`,
     combatLines,
+    ``,
+    `PJ du groupe (multijoueur) :`,
+    partyPcsLines,
     ``,
     `Historique chat recent :`,
     messageLines,
@@ -466,6 +568,8 @@ function normalizePlayerPatch(value) {
   if (typeof value.hitDiceTotal === "number" && Number.isFinite(value.hitDiceTotal)) {
     out.hitDiceTotal = Math.max(1, Math.trunc(value.hitDiceTotal));
   }
+  const spellSlotsSet = normalizeSpellSlotsShape(value.spellSlotsSet);
+  if (spellSlotsSet) out.spellSlotsSet = spellSlotsSet;
   return Object.keys(out).length ? out : null;
 }
 
@@ -599,6 +703,25 @@ function normalizeGodmodeResponse(data, payload) {
       .map((entity) => toPlainString(entity?.id))
       .filter(Boolean)
   );
+  if (Array.isArray(payload.combatOrder)) {
+    for (const entry of payload.combatOrder) {
+      const oid = toPlainString(entry?.id);
+      if (oid) existingIds.add(oid);
+    }
+  }
+  if (Array.isArray(payload.partyPcs)) {
+    for (const pc of payload.partyPcs) {
+      const pid = toPlainString(pc?.combatantId);
+      if (pid) existingIds.add(pid);
+    }
+  }
+  existingIds.add("player");
+  const playerIdFromPayload =
+    payload.player && typeof payload.player === "object"
+      ? toPlainString(payload.player.id)
+      : "";
+  if (playerIdFromPayload) existingIds.add(playerIdFromPayload);
+
   const usedSpawnIds = new Set();
   const entityUpdates = Array.isArray(data.entityUpdates)
     ? data.entityUpdates.map((update) =>
@@ -607,7 +730,20 @@ function normalizeGodmodeResponse(data, payload) {
     : null;
   const spawnIds = [...usedSpawnIds];
 
-  const playerPatch = normalizePlayerPatch(data.playerPatch);
+  let playerPatch = normalizePlayerPatch(data.playerPatch);
+  const hasSpellSlotMutation =
+    !!playerPatch?.spellSlotsSet ||
+    (Array.isArray(entityUpdates) &&
+      entityUpdates.some((u) => u && typeof u === "object" && u.action === "update" && u.spellSlots));
+  if (!hasSpellSlotMutation) {
+    const inferred = inferSpellSlotPatchFromCommand(payload.command, payload.player);
+    if (inferred?.spellSlotsSet) {
+      playerPatch = {
+        ...(playerPatch ?? {}),
+        spellSlotsSet: inferred.spellSlotsSet,
+      };
+    }
+  }
   const teleport = normalizeTeleport(data.teleport);
   const roomMemoryOps = normalizeRoomMemoryOps(data.roomMemoryOps);
   const chatHistoryPatch = normalizeChatHistoryPatch(data.chatHistoryPatch, {
@@ -678,7 +814,7 @@ export async function POST(req) {
   try {
     const body = await req.json();
     const command = toPlainString(body?.command);
-    const provider = body?.provider === "gemini" ? "gemini" : "openrouter";
+    const provider = body?.provider === "openrouter" ? "openrouter" : "gemini";
     const payload = {
       command,
       debugMode: body?.debugMode === true,
@@ -688,6 +824,7 @@ export async function POST(req) {
       currentRoomMemory: String(body?.currentRoomMemory ?? ""),
       player: body?.player && typeof body.player === "object" ? body.player : null,
       entities: normalizeEntitiesForPrompt(body?.entities),
+      partyPcs: normalizePartyPcsForPrompt(body?.partyPcs),
       messages: normalizeMessagesForPrompt(body?.messages),
       combatOrder: Array.isArray(body?.combatOrder) ? body.combatOrder : [],
       combatTurnIndex:

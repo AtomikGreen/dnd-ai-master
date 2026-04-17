@@ -71,19 +71,19 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer à quelques encablures de l’antre par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa.",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
     exits: [
       {
         id: "room_intro",
         direction: "ouest",
-        description: "Après plusieurs heures de marche, la piste débouche face à l'entrée d'une grotte sur le flanc de la colline."
+        description: "La piste débouche face à l'entrée d'une grotte sur le flanc de la colline."
       }
     ]
   },
   // --- LE DONJON ---
   "room_intro": {
     id: "room_intro",
-    title: "Chemin vers la grotte",
+    title: "Entrée de la grotte",
     description: "Après tout ce chemin, vous arrivez enfin en vue de la grotte. L’entrée est bloquée par une grosse porte en bois fermée à clef, avec des montants en fer et une grosse serrure.",
     secrets: "La porte est plutôt solide (Force DD 15 pour l’enfoncer) mais la serrure est particulièrement grossière (Dextérité DD 10 pour l’ouvrir, à condition d’avoir des outils de voleur).",
     exits: [
@@ -143,7 +143,7 @@ export const GOBLIN_CAVE = {
   "room_2": {
     id: "room_2",
     title: "La Salle d'armes",
-    description: "Cette grotte semble servir de râtelier. On y trouve adossées le long de la paroi un certain nombre d'armes qui ne sont pas d'une facture exceptionnelle : 1 fronde et 20 pierres, 4 javelines, 2 marteaux de guerre, 1 épée longue, 1 arbalète lourde et 10 carreaux, 3 morgensterns, ainsi qu’une cuirasse de taille humaine, une cotte de mailles de la taille d’un nain et 8 boucliers en bois. À droite, en contre bas, on observe une porte en bois entrouverte.",
+    description: "Cette grotte semble servir de râtelier. On y trouve adossées le long de la paroi un certain nombre d'armes qui ne sont pas d'une facture exceptionnelle : 1 fronde et 20 pierres, 4 javelines, 2 marteaux de guerre, 1 épée longue, 1 arbalète lourde et 10 carreaux, 3 morgensterns, ainsi qu’une cuirasse de taille humaine, une cotte de mailles de la taille d’un nain et 8 boucliers en bois. À droite, en contre bas, on observe une porte en bois fermée.",
     secrets: "Il n’y a pas de lumière dans cette salle qui est peu utilisée.",
     exits: [
       {
@@ -162,7 +162,7 @@ export const GOBLIN_CAVE = {
     id: "room_3",
     title: "L'Entrepôt",
     description: "L’intérieur de cette salle comporte des rouleaux de tissus, des poteries, une selle de cheval, des outils de paysans, mais rien de grande valeur. Sur chacun des quatre piliers en bois est accrochée une torche, mais aucune n’est allumée.",
-    secrets: "La porte dans cette salle est fermée à clef, mais là encore la serrure est des plus sommaires. Réussir un jet de Dextérité DD 10 si le personnage possède des outils de voleur est suffisant pour la crocheter. Cette salle sert en fait à entasser le résultat des différents vols effectués par la tribu.",
+    secrets: "La porte dans cette salle est fermée à clef (celle connectant la salle 2 au sud), mais là encore la serrure est des plus sommaires. Réussir un jet de Dextérité DD 10 si le personnage possède des outils de voleur est suffisant pour la crocheter. Cette salle sert en fait à entasser le résultat des différents vols effectués par la tribu.",
     exits: [
       {
         id: "room_4",
@@ -198,7 +198,7 @@ export const GOBLIN_CAVE = {
       {
         id: "room_6",
         direction: "est",
-        description: "Au nord, une large ouverture mène vers une zone dégageant une forte odeur de cuisson."
+        description: "A l'est, une large ouverture mène vers une zone dégageant une forte odeur de cuisson."
       },
       {
         id: "room_1",
@@ -216,7 +216,7 @@ export const GOBLIN_CAVE = {
       {
         id: "room_5",
         direction: "ouest",
-        description: "L'unique sortie est l'ouverture au sud, redescendant vers la réserve de nourriture."
+        description: "L'unique sortie est l'ouverture a l'ouest, redescendant vers la réserve de nourriture."
       },
       {
         id: "room_9",
@@ -234,17 +234,17 @@ export const GOBLIN_CAVE = {
       {
         id: "room_10",
         direction: "nord",
-        description: "Au nord, une simple porte mène à ce qui ressemble à un dortoir."
+        description: "Sur la gauche du mur nord, un passage rejoint une intersection de couloirs."
       },
       {
         id: "room_7",
-        direction: "sud-ouest",
-        description: "Dans le mur ouest, une autre porte donne accès à des chambrées."
+        direction: "sud",
+        description: "Dans le mur ouest, une autre porte se trouve au bout d'un couloir."
       },
       {
         id: "room_6",
-        direction: "",
-        description: ""
+        direction: "sud",
+        description: "Une porte simple qui donne accès à la cuisine."
       }
     ]
   },
@@ -262,7 +262,7 @@ export const GOBLIN_CAVE = {
       {
         id: "room_9",
         direction: "est",
-        description: "À l'est, une porte s'ouvre directement sur une grande salle bruyante."
+        description: "Une porte."
       }
     ]
   },
@@ -273,20 +273,20 @@ export const GOBLIN_CAVE = {
     secrets: "C’est bien entendu là que dorment les deux hobgobelins, mais pour le moment ils sont en train de manger dans la salle commune. La bourse contient 11 po et 1 pp.",
     exits: [
       {
-        id: "room_9",
-        direction: "est",
-        description: "À l'est, une porte donne sur la vaste salle commune."
+        id: "intersection_1",
+        direction: "nord",
+        description: "Une porte ouverte donne sur une intersection de couloirs."
       },
       {
         id: "room_7",
         direction: "sud",
-        description: "Au sud, le passage mène à la chambre des gobelins joueurs de dés."
+        description: "Une porte"
       }
     ]
   },
   "room_10": {
     id: "room_10",
-    title: "Chambre de Gobelins (Sommeil)",
+    title: "Chambre de Gobelins",
     description: "Il y a dans cette pièce six paillasses et deux gobelins y sont allongés, en train de dormir.",
     secrets: "Ces gobelins ont le sommeil profond et un simple combat dans la salle 9 ne devrait pas les réveiller. Mais en cas de cris d’un hobgobelin, ils accourront voir ce qu’il se passe.",
     exits: [
@@ -294,6 +294,57 @@ export const GOBLIN_CAVE = {
         id: "room_9",
         direction: "sud",
         description: "La seule issue est la porte au sud, qui retourne dans la salle commune."
+      },
+      {
+        id: "intersection_1",
+        direction: "ouest",
+        description: "Une porte."
+      }
+    ]
+  },
+  "intersection_1": {
+    id: "intersection_1",
+    title: "Intersection est du grand couloir",
+    description: "Un couloir horizontal reliant l'ouest à l'est. Les murs sont bruts et les sons résonnent facilement ici.",
+    secrets: "",
+    exits: [
+      {
+        id: "intersection_2",
+        direction: "ouest",
+        description: "Le long couloir continue sur quelques metres avant d'arriver a une autre intersection."
+      },
+      {
+        id: "room_10",
+        direction: "est",
+        description: "Le couloir se termine sur une porte usée"
+      },
+      {
+        id: "room_8",
+        direction: "sud",
+        description: "Un petit passage mene a une porte."
+      }
+    ]
+  },
+  "intersection_2": {
+    id: "intersection_2",
+    title: "Intersection ouest du grand couloir",
+    description: "Un couloir horizontal relie l'ouest à l'est. Les murs sont bruts et les sons résonnent facilement ici.",
+    secrets: "",
+    exits: [
+      {
+        id: "room_11",
+        direction: "ouest",
+        description: "Le couloir se termine sur une porte sombre."
+      },
+      {
+        id: "intersection_1",
+        direction: "est",
+        description: "Le long couloir s'étend sur quelques metres avant d'arriver a une autre intersection."
+      },
+      {
+        id: "room_9",
+        direction: "nord",
+        description: "Un passage monte vers une porte fermée."
       }
     ]
   },
@@ -306,12 +357,12 @@ export const GOBLIN_CAVE = {
       {
         id: "room_12",
         direction: "ouest",
-        description: "Un mur de pierre brut à l'ouest (si le passage secret est découvert, il pivote)."
+        description: "Un mur de pierre brut à l'ouest."
       },
       {
-        id: "room_9",
+        id: "intersection_1",
         direction: "est",
-        description: "À l'est, le couloir ramène vers la zone de la salle commune."
+        description: "À l'est, la porte donne sur une intersection de couloirs."
       }
     ]
   },

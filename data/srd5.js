@@ -891,7 +891,9 @@ export const ARMORS = {
 export const ADVENTURING_GEAR = {
   "Potion de soins": { type: "Consommable", effect: "Rend 2d4+2 PV" },
   "Outils de voleur": { type: "Outil", effect: "Permet de crocheter serrures et désamorcer pièges" },
+  "Sacoche à composantes": { type: "Magie", effect: "Contient les composantes matérielles courantes (sans coût en po)" },
   "Focaliseur arcanique": { type: "Magie", effect: "Remplace composantes matérielles" },
+  "Focaliseur druidique": { type: "Magie", effect: "Focaliseur pour les druides (mistletoe, totem, etc.)" },
   "Symbole sacré": { type: "Magie", effect: "Focaliseur pour Clercs et Paladins" }
 };
 

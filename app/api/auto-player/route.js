@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { withTerminalAiTiming } from "@/lib/aiTerminalTimingLog";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free";
@@ -12,6 +13,14 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 function truncate(s, n = 800) {
   const str = typeof s === "string" ? s : String(s ?? "");
   return str.length > n ? str.slice(0, n) + "…" : str;
+}
+
+function normFr(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
 }
 
 const SKIP_MESSAGE_TYPES = new Set([
@@ -34,6 +43,13 @@ function formatRecentChatScript(rawMessages, playerName = "Joueur") {
   }
   const cleaned = rawMessages.filter((m) => {
     const t = m?.type;
+    const c = String(m?.content ?? "");
+    if (
+      t === "meta" &&
+      /action impossible|vous ne possédez pas l'arme ou le sort/i.test(c)
+    ) {
+      return true;
+    }
     return !(t && SKIP_MESSAGE_TYPES.has(t));
   });
   const lines = cleaned
@@ -143,6 +159,11 @@ function formatBattleSnapshotForPrompt(snapshot) {
   }
   if (p) {
     lines.push(`Réaction du PJ encore disponible ce round (AoO, etc.) : ${p.reactionAvailable ? "oui" : "non"}.`);
+    if (p.hiddenFromOpponents === true) {
+      lines.push(
+        "Le PJ est **caché** (discrétion active, moteur) : les adversaires peuvent avoir du mal à le cibler ; utile pour se repositionner ou frapper à distance avant d'être révélé."
+      );
+    }
   }
 
   const actionCatalog =
@@ -202,19 +223,35 @@ function formatBattleSnapshotForPrompt(snapshot) {
   }
 
   if (hostileList.length > 0) {
-    lines.push("Hostiles présents (vivants / visibles, côté moteur) :");
+    lines.push(
+      "Hostiles présents (état tactique moteur — PV, contact, discrétion ; ne pas ignorer pour choisir mêlée vs distance, Perception, ou cibles difficiles) :"
+    );
     for (const h of hostileList) {
       if (!h || typeof h !== "object") continue;
       const o = /** @type {Record<string, unknown>} */ (h);
       const id = typeof o.id === "string" ? o.id : "?";
       const name = typeof o.name === "string" ? o.name : id;
       const meleePj = o.inMeleeWithPlayer === true ? "AU CONTACT du joueur" : "pas au contact du joueur (à distance selon le moteur)";
+      const hpTxt =
+        typeof o.hpCurrent === "number" && typeof o.hpMax === "number"
+          ? ` PV ${o.hpCurrent}/${o.hpMax}.`
+          : "";
+      const hid = o.hiddenFromPlayer === true;
+      const hideTxt = hid
+        ? " — **Caché / camouflé** (moteur : cible non dégagée ; souvent désavantage ou jet de Perception pour localiser)."
+        : "";
+      const stTxt =
+        hid &&
+        typeof o.stealthPassiveVsPerception === "number" &&
+        Number.isFinite(o.stealthPassiveVsPerception)
+          ? ` Réf. Discrétion (repérage Perception) : ${o.stealthPassiveVsPerception}.`
+          : "";
       const ew = Array.isArray(o.engagedWithIds) ? o.engagedWithIds.filter((x) => typeof x === "string" && x !== "player") : [];
       const extra =
         ew.length > 0
           ? ` ; au contact aussi de : ${ew.map((x) => idToName[x] || x).join(", ")}`
           : "";
-      lines.push(`- ${name} [id=${id}] — ${meleePj}${extra}`);
+      lines.push(`- ${name} [id=${id}] — ${meleePj}.${hpTxt}${hideTxt}${stTxt}${extra}`);
     }
   } else {
     lines.push("Aucun hostile listé dans ce snapshot.");
@@ -250,10 +287,43 @@ function formatBattleSnapshotForPrompt(snapshot) {
 }
 
 /**
+ * @param {Array<Record<string, unknown>>} [partyPcs]
+ */
+function formatPartyPcsForPrompt(partyPcs) {
+  if (!Array.isArray(partyPcs) || partyPcs.length === 0) return "";
+  const lines = partyPcs
+    .map((row) => {
+      if (!row || typeof row !== "object") return null;
+      const o = /** @type {Record<string, unknown>} */ (row);
+      const name = typeof o.name === "string" && o.name.trim() ? o.name.trim() : "PJ";
+      const who = o.isLocal === true ? "toi (personnage que tu joues)" : "camarade PJ";
+      const cls = typeof o.entityClass === "string" && o.entityClass.trim() ? o.entityClass : "?";
+      const race = typeof o.race === "string" && o.race.trim() ? o.race : "?";
+      const lvl = typeof o.level === "number" && Number.isFinite(o.level) ? o.level : "?";
+      const hpC = typeof o.hpCurrent === "number" && Number.isFinite(o.hpCurrent) ? o.hpCurrent : "?";
+      const hpM = typeof o.hpMax === "number" && Number.isFinite(o.hpMax) ? o.hpMax : "?";
+      const ac = typeof o.ac === "number" && Number.isFinite(o.ac) ? o.ac : "?";
+      const cid = typeof o.combatantId === "string" && o.combatantId.trim() ? o.combatantId.trim() : "";
+      const tagUncon = o.unconscious === true ? " — **inconscient / 0 PV**" : "";
+      const tagStab = o.stabilized === true ? " — stabilisé (jets contre la mort terminés)" : "";
+      const idPart = cid ? ` [id=${cid}]` : "";
+      return `- ${name}${idPart} (${who}) : ${race} ${cls} niv.${lvl}, PV ${hpC}/${hpM}, CA ${ac}${tagUncon}${tagStab}`;
+    })
+    .filter(Boolean);
+  if (!lines.length) return "";
+  return [
+    `=== GROUPE — PERSONNAGES JOUEURS PRÉSENTS ===`,
+    `Tu n'es pas seul au monde : voici les PJ de la partie (noms et état utiles pour coopérer, les aider, ou éviter de les ignorer).`,
+    lines.join("\n"),
+    ``,
+  ].join("\n");
+}
+
+/**
  * Prompt auto-joueur : uniquement ce qu'un PJ pourrait percevoir.
  * Jamais secrets MJ, encounterEntities, règles d'embuscade, DD, etc.
  */
-function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot) {
+function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot, partyPcs = []) {
   const stats = player?.stats ?? {};
   const langs = Array.isArray(player?.languages) ? player.languages : [];
   const skills = Array.isArray(player?.skillProficiencies)
@@ -273,9 +343,20 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
     })
     .join("\n");
 
-  const weaponList = Array.isArray(player?.weapons)
+  const allWeapons = Array.isArray(player?.weapons)
     ? player.weapons.map((w) => (typeof w?.name === "string" ? w.name.trim() : "")).filter(Boolean)
     : [];
+  const mainHand = String(player?.equipment?.mainHand ?? "").trim();
+  const offHand = String(player?.equipment?.offHand ?? "").trim();
+  const hasAnyEquippedHand = !!mainHand || !!offHand;
+  const equippedWeaponList = hasAnyEquippedHand
+    ? allWeapons.filter((name) => {
+        const wn = normFr(name);
+        return (mainHand && normFr(mainHand) === wn) || (offHand && normFr(offHand) === wn);
+      })
+    : allWeapons;
+  const weaponList = equippedWeaponList;
+  const unequippedWeaponList = allWeapons.filter((name) => !weaponList.includes(name));
   const weaponLines =
     weaponList.length > 0
       ? weaponList.map((n) => `- ${n}`).join("\n")
@@ -315,11 +396,23 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
       ? `Description RP courte: ${truncate(player.description, 300)}`
       : ``,
     ``,
+    formatPartyPcsForPrompt(partyPcs),
+    `=== REPOS, SOINS DE GROUPE & CAMARADES À TERRE (D&D 5e — à utiliser quand c'est pertinent) ===`,
+    `- **Repos court** : environ 1 h, hors danger immédiat ; récupère des PV (dés de vie) et certaines ressources. Tu peux le proposer si le groupe est en sécurité (pas de combat en cours).`,
+    `- **Repos long** : 8 h, lieu sûr et calme ; récupération complète des PV et emplacements de sorts, etc. À proposer quand la situation le permet (nuit, campement, etc.).`,
+    `- **Camarade à 0 PV** (inconscient) : tu peux tenter de **stabiliser** un allié (action en combat : test de **Médecine** DD 10, ou **trousse de soins** qui consomme une utilisation), ou de **soigner** : sort, **potion**, objet, ou autre moyen légitime sur ta fiche.`,
+    `- **Allié stabilisé à 0 PV** : sans soin magique, la récupération peut être **lente** ; à la table de cette campagne, on peut **narrer** qu'un PJ stabilisé regagne **1 PV** après **1d4 heures** de surveillance — tu peux **patienter**, monter la garde, ou chercher des soins plutôt que de presser le groupe à partir tout de suite.`,
+    `- **Priorité** : si un allié est à terre ou critique, considère **stabiliser / soigner** (mécaniques réelles : Médecine, trousse, sort, potion) avant d'ignorer la situation. Évite le rôleplay « je me mets devant lui comme bouclier » : le moteur ne donne pas de règle de protection par simple déplacement narratif — ça gaspille souvent le mouvement sans rien changer au combat.`,
+    ``,
     weaponLines
       ? [
           `=== ARMES ET TIRS (noms EXACTS reconnus par le jeu) ===`,
-          `Tu dois utiliser ces libellés tels quels (orthographe incluse) quand tu annonces une attaque ou un tir :`,
+          `Tu dois utiliser ces libellés tels quels (orthographe incluse) quand tu annonces une attaque ou un tir.`,
+          `IMPORTANT: n'utilise QUE des armes actuellement équipées en main principale/secondaire :`,
           weaponLines,
+          unequippedWeaponList.length > 0
+            ? `Interdit (non équipées pour l'instant): ${unequippedWeaponList.join(", ")}.`
+            : ``,
           ``,
         ].join("\n")
       : ``,
@@ -327,6 +420,7 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
       ? [
           `=== COMBAT — ANNONCER UNE ATTAQUE (CRITIQUE) ===`,
           `Pour frapper ou tirer sur une créature, cite OBLIGATOIREMENT le nom d'UNE arme listée ci-dessus (ex: « épée longue », « arbalète légère »).`,
+          `Interdiction stricte: ne propose jamais une arme non équipée (même si elle est dans l'inventaire).`,
           `INTERDIT : « arme de corps à corps », « arme à distance », « mon arme », « ma lame », « mon épée » sans nom complet, « coup puissant » sans nom d'arme, ou toute catégorie générique — le moteur les rejette.`,
           `BON : « Je porte un coup d'épée longue au gobelin teigneux. » ou « Je tire à l'arbalète légère sur le gobelin chétif. » (adapte au nom exact de ta liste).`,
           `MAUVAIS : « ...avec mon arme de corps à corps. »`,
@@ -354,14 +448,16 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
     `- INTERDIT de jouer un PNJ ou de parler à sa place.`,
     `- INTERDIT de donner des informations au nom d'un PNJ (ex: direction, révélation, explication) si ce PNJ ne les a pas encore dites dans le dernier message MJ.`,
     `- Tu peux parler À un PNJ visible, mais jamais parler COMME lui.`,
+    `- **Autres PJ (multijoueur)** : INTERDIT de t'adresser par la parole à un autre personnage joueur (celui d'un autre humain à la table) : pas de « Hé, [nom du camarade]… », pas de questions à son intention, pas de dialogue en supposant qu'il répondra. Chaque PJ est joué par son joueur. Tu incarnes uniquement ton personnage : tu peux agir pour aider/soigner un camarade ou décrire ton attitude, mais sans inventer une conversation entre personnages joueurs.`,
     `- INTERDIT de décrire le décor, les résultats, ou les conséquences (rôle du MJ uniquement).`,
     `- INTERDIT de faire des jets, de résoudre une action, ou d'affirmer "ce qui se passe".`,
     `- INTERDIT de demander un jet de dé, un d100, ou d'invoquer des mécaniques/règles cachées du MJ (tu n'y as pas accès).`,
     `- Interagis seulement avec les entités visibles listées plus haut.`,
     isCombat
       ? [
-          `- MODE COMBAT : tu es en situation de danger ; priorité au combat tactique (frapper avec une arme nommée, te rapprocher si tu es à distance et veux la mêlée, te désengager, intimider brièvement un adversaire). Évite les longues scènes sociales ou « calmes » tant que le mode moteur est COMBAT et qu'il reste des hostiles.`,
-          `- La section « ÉTAT DU MOTEUR » indique qui est au corps à corps avec qui : sers-toi-en pour choisir une attaque de mêlée vs à distance (ex. arc si hors contact).`,
+          `- MODE COMBAT : tu es en situation de danger ; priorité au combat utile : **attaquer** un hostile visible (arme nommée), **te rapprocher pour être en mêlée avec un ennemi** si tu es à distance, **Aider** un allié au contact d'un ennemi (action Aider), **stabiliser/soigner** un allié à 0 PV si tu peux. Évite de « protéger » un camarade uniquement par du déplacement théâtral (« je me poste devant lui ») : ce n'est en général **pas** une action mécanique de couverture ici et ça mène souvent à **perdre le mouvement puis terminer le tour sans avoir menacé l'ennemi**.`,
+          `- INTERDIT de gaspiller tout le tour sur un simple repositionnement « bouclier humain » sans attaque, sans Aider, sans soin — si tu n'as plus de ressources utiles, **termine le tour** plutôt que de décrire un déplacement vide.`,
+          `- La section « ÉTAT DU MOTEUR » indique pour chaque hostile : PV, contact avec toi, et s'il est caché ; sers-toi-en pour mêlée vs distance, Perception, et cibles difficiles.`,
           ``,
           `=== COMBAT — ACTIONS POSSIBLES (CONCEPTS D&D) ===`,
           `Tu ne fais PAS de jets : tu annonces seulement UNE intention ("Je ..."). Le moteur résout la mécanique.`,
@@ -378,6 +474,8 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot)
           `- Se tenir prêt (Ready) : préparer une réaction conditionnelle. Exemple: "Je me tiens prêt: si le gobelin avance, je tire."`,
           `- Repos court (Short Rest) : seulement hors danger immédiat et hors combat actif. Exemple: "Je prends un repos court pour récupérer."`,
           `- Repos long (Long Rest) : seulement hors danger immédiat, hors combat actif, et quand c'est narrativement plausible. Exemple: "Je prends un repos long pour la nuit."`,
+          `- Stabiliser un allié à 0 PV : action — test de Médecine ou trousse de soins (voir section REPOS & SOINS).`,
+          `- Soigner un allié : sort, potion, objet — si tu en as un sur ta fiche.`,
           ``,
           `Déplacement : tu peux dire "je m'approche", "je recule", "je me mets à couvert", etc. Le moteur gère la distance. Mais ne combine pas déplacement + attaque dans la même phrase (une seule intention).`,
           `Action bonus : n'annonce une action bonus que si ton personnage a réellement une capacité qui le justifie. Sinon, n'en parle pas.`,
@@ -463,8 +561,9 @@ export async function POST(request) {
       gameMode = "exploration",
       history: historyBody = [],
       messages: messagesBody = [],
-      provider = "openrouter",
+      provider = "gemini",
       battleSnapshot = null,
+      partyPcs = [],
     } = body;
 
     const rawHistory = Array.isArray(historyBody) && historyBody.length
@@ -480,7 +579,8 @@ export async function POST(request) {
       player,
       entities,
       gameMode,
-      battleSnapshot
+      battleSnapshot,
+      Array.isArray(partyPcs) ? partyPcs : []
     );
     const systemPrompt =
       `${basePrompt}\n\n` +
@@ -490,13 +590,25 @@ export async function POST(request) {
       `Ne répète pas une question à laquelle le MJ a déjà répondu.`;
 
     if (provider === "gemini") {
-      const model = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-        systemInstruction: systemPrompt,
-        generationConfig: { temperature: 0.9 },
-      });
-      const result = await model.generateContent(ZERO_SHOT_USER_PROMPT);
-      const textRaw = (result.response.text() || "").trim();
+      const textRaw = (
+        await withTerminalAiTiming(
+          {
+            routePath: "/api/auto-player",
+            agentLabel: "Auto-joueur",
+            provider: "Gemini",
+            model: GEMINI_MODEL,
+          },
+          async () => {
+            const model = genAI.getGenerativeModel({
+              model: GEMINI_MODEL,
+              systemInstruction: systemPrompt,
+              generationConfig: { temperature: 0.9 },
+            });
+            const result = await model.generateContent(ZERO_SHOT_USER_PROMPT);
+            return (result.response.text() || "").trim();
+          }
+        )
+      ).trim();
       const contentOut = truncate(textRaw, 400);
       const parsedOut = { content: contentOut };
       await logInteraction(
@@ -509,6 +621,7 @@ export async function POST(request) {
           messagesOrdered: rawHistory,
           recentChatScript,
           battleSnapshot: battleSnapshot ?? null,
+          partyPcsCount: Array.isArray(partyPcs) ? partyPcs.length : 0,
         },
         systemPrompt,
         textRaw,
@@ -530,32 +643,41 @@ export async function POST(request) {
       { role: "user", content: ZERO_SHOT_USER_PROMPT },
     ];
 
-    const res = await fetch(OPENROUTER_BASE, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "DnD AI Auto Player",
-      },
-      body: JSON.stringify({
+    const textRaw = await withTerminalAiTiming(
+      {
+        routePath: "/api/auto-player",
+        agentLabel: "Auto-joueur",
+        provider: "OpenRouter",
         model: OPENROUTER_MODEL,
-        messages,
-        temperature: 0.9,
-      }),
-    });
+      },
+      async () => {
+        const res = await fetch(OPENROUTER_BASE, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "DnD AI Auto Player",
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages,
+            temperature: 0.9,
+          }),
+        });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
-    }
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error?.message ?? `Erreur OpenRouter (${res.status})`);
+        }
 
-    const data = await res.json();
-    const textRaw =
-      data.choices?.[0]?.message?.content &&
-      typeof data.choices[0].message.content === "string"
-        ? data.choices[0].message.content.trim()
-        : "";
+        const data = await res.json();
+        return data.choices?.[0]?.message?.content &&
+          typeof data.choices[0].message.content === "string"
+          ? data.choices[0].message.content.trim()
+          : "";
+      }
+    );
     const contentOut = truncate(textRaw, 400);
     const parsedOut = { content: contentOut };
     await logInteraction(
@@ -569,6 +691,7 @@ export async function POST(request) {
         messagesOrdered: rawHistory,
         recentChatScript,
         battleSnapshot: battleSnapshot ?? null,
+        partyPcsCount: Array.isArray(partyPcs) ? partyPcs.length : 0,
       },
       systemPrompt,
       textRaw,

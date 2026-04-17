@@ -1,19 +1,47 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { Suspense, useState, useEffect, useCallback, useMemo } from "react";
 import Image from "next/image";
+import { useRouter, useSearchParams } from "next/navigation";
 import ChatInterface from "@/components/ChatInterface";
 import CampaignMenu from "@/components/CampaignMenu";
 import CharacterSelection from "@/components/CharacterSelection";
 import {
   useGame,
+  normalizeMultiplayerSessionId,
   type PlayerStats,
   type Weapon,
   type Entity,
   type CombatEntry,
 } from "@/context/GameContext";
-import { SPELLS, ARMORS } from "@/data/srd5";
+import { SPELLS } from "@/data/srd5";
+import {
+  computePlayerArmorClass,
+  tryEquipFromInventory,
+  tryUnequipAttunement,
+  emptyEquipment,
+  inventoryCandidatesForSlot,
+  inventoryExcludingEquipped,
+  listEquippedItemsDisplayOrder,
+  MAX_ATTUNED_ITEMS,
+  type EquipSlot,
+} from "@/lib/playerEquipment";
 import { resolveCombatantDisplayName } from "@/lib/combatDisplayName";
+import { resolveLocalPlayerCombatantId } from "@/lib/combatLocalPlayerId";
+import { formatSpellComponentsAbbrev, getSpellComponents } from "@/lib/spellCastingComponents";
+import {
+  resourceKindForCastingTime,
+  spellAttackOrSaveSummary,
+  spellCastingTimeLine,
+  spellConsumesLabelFr,
+  spellDamageSummary,
+  spellDescriptionText,
+  spellDurationLine,
+  spellRangeCategoryLine,
+} from "@/lib/spellDisplayMeta";
+
+// Next.js 16 : évite l'échec de prerender quand `useSearchParams()` est utilisé.
+export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -53,7 +81,74 @@ function normalizeCombatOrderEntry(raw: unknown): CombatEntry | null {
   return { id, name, initiative };
 }
 
-type ModalType = "player" | "stats" | "weapons" | "spells" | "inventory" | "entities" | "scene" | "combat" | null;
+type ModalType =
+  | "player"
+  | "stats"
+  | "weapons"
+  | "spells"
+  | "inventory"
+  | "equipment"
+  | "entities"
+  | "scene"
+  | "combat"
+  | null;
+
+/** Carte sort : temps d'incantation, ressource de tour, portée, composantes, dégâts, attaque/sauvegarde, effet. */
+function SpellBookCard({ name }: { name: string }) {
+  const spell: Record<string, unknown> | undefined = (SPELLS as Record<string, Record<string, unknown>>)[name];
+  if (!spell) return null;
+  const comp = getSpellComponents(name);
+  const ct = typeof spell.castingTime === "string" ? spell.castingTime : "";
+  const rk = resourceKindForCastingTime(ct);
+  const desc = spellDescriptionText(spell as { description?: string; effect?: string });
+  const metaLines = [
+    spellCastingTimeLine(spell as { castingTime?: string }),
+    spellConsumesLabelFr(rk),
+    typeof spell.school === "string" && spell.school.trim()
+      ? `École : ${spell.school}`
+      : null,
+    spellRangeCategoryLine(spell as { range?: string }),
+    spellDurationLine(spell as { duration?: string }),
+    spellDamageSummary(spell as { damage?: string; damageType?: string }),
+    spellAttackOrSaveSummary(spell as { attack?: string; save?: string; damage?: string }),
+  ].filter(Boolean) as string[];
+
+  return (
+    <div className="rounded-md border border-slate-700 bg-slate-900/60 px-3 py-2">
+      <p className="text-sm font-semibold text-slate-100">{name}</p>
+      <p
+        className="text-[10px] text-slate-500 mt-0.5 font-mono tracking-wide"
+        title={
+          comp.materialCostly
+            ? "M* : composante matérielle coûteuse (le focaliseur ne suffit pas)"
+            : "Composantes d'incantation (SRD 2014)"
+        }
+      >
+        {formatSpellComponentsAbbrev(name)}
+      </p>
+      {metaLines.map((line, i) => (
+        <p key={i} className="text-[11px] text-slate-400 mt-0.5">
+          {line}
+        </p>
+      ))}
+      {desc ? <p className="text-[11px] text-slate-500 mt-1 border-t border-slate-700/80 pt-1 leading-snug">{desc}</p> : null}
+    </div>
+  );
+}
+
+function extractSessionIdFromJoinInput(raw: string): string {
+  const t = String(raw ?? "").trim();
+  if (!t) return "";
+  const queryIdx = t.toLowerCase().indexOf("session=");
+  if (queryIdx >= 0) {
+    const after = t.slice(queryIdx + "session=".length);
+    const end = after.search(/[&\s#]/);
+    const token = (end >= 0 ? after.slice(0, end) : after).trim();
+    const fromQuery = normalizeMultiplayerSessionId(token);
+    if (fromQuery) return fromQuery;
+  }
+  return normalizeMultiplayerSessionId(t);
+}
 
 // ---------------------------------------------------------------------------
 // Sous-composants utilitaires
@@ -103,23 +198,6 @@ function formatWorldTimeLabel(totalMinutes: number) {
   return `Jour ${day}, ${String(hours).padStart(2, "0")}h${String(minutes).padStart(2, "0")}`;
 }
 
-function effectivePlayerArmorClass(player: {
-  ac?: number | null;
-  fighter?: { fightingStyle?: string };
-  inventory?: string[];
-} | null): number {
-  const base = Number(player?.ac ?? 10) || 10;
-  const style = player?.fighter?.fightingStyle ?? null;
-  if (style !== "Défense") return base;
-  const inventory = Array.isArray(player?.inventory) ? player.inventory : [];
-  const hasArmor = inventory.some((item) => {
-    const armor = ARMORS?.[item as keyof typeof ARMORS];
-    if (!armor) return false;
-    return String((armor as { type?: string }).type ?? "").toLowerCase() !== "bouclier";
-  });
-  return base + (hasArmor ? 1 : 0);
-}
-
 function HpBar({ current, max, thick = false }: { current: number; max: number; thick?: boolean }) {
   const pct = Math.max(0, Math.min(100, Math.round((current / max) * 100)));
   const color = pct > 60 ? "bg-green-500" : pct > 30 ? "bg-yellow-500" : "bg-red-500";
@@ -145,7 +223,18 @@ function StatPill({ label, value }: { label: string; value: number }) {
 }
 
 /** Carte entité compacte (colonne droite) */
-function EntityCard({ entity, godMode, onClick }: { entity: Entity; godMode: boolean; onClick?: () => void }) {
+function EntityCard({
+  entity,
+  godMode,
+  onClick,
+  combatStealthHidden,
+}: {
+  entity: Entity;
+  godMode: boolean;
+  onClick?: () => void;
+  /** Créature hostile camouflée (moteur : jet de Discrétion vs Perception passive). */
+  combatStealthHidden?: boolean;
+}) {
   const meta = ENTITY_TYPE_META[entity.type] ?? { icon: "?", color: "text-slate-400", label: "" };
   const isHidden = !entity.visible;
   return (
@@ -162,7 +251,18 @@ function EntityCard({ entity, godMode, onClick }: { entity: Entity; godMode: boo
       }`}
     >
       <div className="flex items-start justify-between gap-1">
-        <span className={`text-sm ${meta.color}`}>{meta.icon}</span>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {combatStealthHidden && entity.type === "hostile" && entity.isAlive && (
+            <span
+              className="text-xs leading-none text-slate-400"
+              title="Caché — jet de Discrétion réussi (tant que non repéré)"
+              aria-label="Caché (discrétion)"
+            >
+              🥷
+            </span>
+          )}
+          <span className={`text-sm ${meta.color}`}>{meta.icon}</span>
+        </div>
         <div className="flex-1 min-w-0">
           <p className={`font-semibold truncate ${entity.isAlive ? "text-slate-200" : "text-slate-500 line-through"}`}>
             {entity.name}
@@ -186,7 +286,15 @@ function EntityCard({ entity, godMode, onClick }: { entity: Entity; godMode: boo
 }
 
 /** Carte entité détaillée (modal) */
-function EntityCardFull({ entity, godMode }: { entity: Entity; godMode: boolean }) {
+function EntityCardFull({
+  entity,
+  godMode,
+  combatStealthHidden,
+}: {
+  entity: Entity;
+  godMode: boolean;
+  combatStealthHidden?: boolean;
+}) {
   const meta = ENTITY_TYPE_META[entity.type] ?? { icon: "?", color: "text-slate-400", label: "Inconnu" };
   const isHidden = !entity.visible;
 
@@ -200,7 +308,18 @@ function EntityCardFull({ entity, godMode }: { entity: Entity; godMode: boolean 
     }`}>
       {/* Header */}
       <div className="flex items-center gap-3 mb-3">
-        <span className={`text-2xl ${meta.color}`}>{meta.icon}</span>
+        <div className="flex shrink-0 items-center gap-1">
+          {combatStealthHidden && entity.type === "hostile" && entity.isAlive && (
+            <span
+              className="text-lg leading-none text-slate-400"
+              title="Caché — jet de Discrétion réussi (tant que non repéré)"
+              aria-hidden
+            >
+              🥷
+            </span>
+          )}
+          <span className={`text-2xl ${meta.color}`}>{meta.icon}</span>
+        </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className={`text-base font-bold ${entity.isAlive ? "text-slate-100" : "text-slate-500 line-through"}`}>
@@ -340,18 +459,106 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
 // Composant principal
 // ---------------------------------------------------------------------------
 
-export default function Home() {
+function HomeContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const {
-    isGameStarted, startGame, setPlayer, startNewGame,
+    isGameStarted, startGame, setPlayer, startNewGame, updatePlayer,
     player, entities, gameMode, combatOrder, combatTurnIndex, debugMode, currentSceneName, currentSceneImage,
     worldTimeMinutes,
-    turnResources,
     getMeleeWith,
+    engagedWithId,
+    combatHiddenIds,
+    messages,
+    clientId,
+    multiplayerSessionId,
+    multiplayerConnected,
+    multiplayerParticipants,
+    multiplayerParticipantProfiles,
+    createMultiplayerSession,
+    joinMultiplayerSession,
+    leaveMultiplayerSession,
+    pendingRoll,
   } = useGame();
 
-  /** Créature au corps à corps avec le PJ (état mêlée du moteur). */
-  const isInMeleeWithPlayer = (combatantId: string) =>
-    combatantId !== "player" && getMeleeWith("player").includes(combatantId);
+  const localPlayerCombatantId = useMemo(
+    () => resolveLocalPlayerCombatantId({ player, entities, multiplayerSessionId, clientId }),
+    [player, entities, multiplayerSessionId, clientId]
+  );
+
+  const combatHiddenSet = useMemo(
+    () => new Set((combatHiddenIds ?? []).map((x) => String(x ?? "").trim()).filter(Boolean)),
+    [combatHiddenIds]
+  );
+  const combatOrderIdSet = useMemo(() => {
+    const out = new Set<string>();
+    for (const raw of Array.isArray(combatOrder) ? combatOrder : []) {
+      const entry = normalizeCombatOrderEntry(raw);
+      if (!entry?.id) continue;
+      out.add(String(entry.id).trim());
+    }
+    return out;
+  }, [combatOrder]);
+
+  const resolveEngagementPeerName = useCallback(
+    (id: string) => {
+      if (id === "player" || id === localPlayerCombatantId) return player?.name ?? "PJ";
+      if (String(id).startsWith("mp-player-")) {
+        const cid = String(id).slice("mp-player-".length);
+        const prof = multiplayerParticipantProfiles.find(
+          (p) => String(p?.clientId ?? "").trim() === String(cid).trim()
+        );
+        return prof?.name ?? "PJ";
+      }
+      const ent = entities.find((e) => e.id === id);
+      return ent?.name ?? id;
+    },
+    [entities, localPlayerCombatantId, multiplayerParticipantProfiles, player?.name]
+  );
+
+  /** Icône ⚔ Initiative : getMeleeWith + engagedWithId (rétrocompat moteur). */
+  const initiativeRowMeleeEngage = useCallback(
+    (
+      entryId: string,
+      isPlayerRow: boolean,
+      meleePeers: string[]
+    ): { showIcon: boolean; tooltip: string } => {
+      const validPeers = (Array.isArray(meleePeers) ? meleePeers : [])
+        .map((pid) => String(pid ?? "").trim())
+        .filter((pid) => !!pid && pid !== entryId && combatOrderIdSet.has(pid));
+      const peerNames = validPeers.map((pid) => resolveEngagementPeerName(pid)).filter(Boolean);
+      const listTitle = peerNames.length ? `Mêlée : ${peerNames.join(", ")}` : "";
+      if (isPlayerRow) {
+        const legacyEngagedValid =
+          !!engagedWithId &&
+          String(engagedWithId).trim() !== String(entryId).trim() &&
+          combatOrderIdSet.has(String(engagedWithId).trim());
+        const show = validPeers.length > 0 || legacyEngagedValid;
+        const tooltip =
+          listTitle ||
+          (legacyEngagedValid ? `Engagé avec : ${resolveEngagementPeerName(engagedWithId)}` : "");
+        return { showIcon: show, tooltip: tooltip || "Au corps à corps" };
+      }
+      const vsLocal =
+        validPeers.includes(localPlayerCombatantId) ||
+        (!multiplayerSessionId && validPeers.includes("player"));
+      const byLegacy =
+        engagedWithId != null &&
+        String(engagedWithId).trim() === String(entryId).trim() &&
+        combatOrderIdSet.has(String(entryId).trim());
+      const show = vsLocal || byLegacy;
+      const tooltip =
+        listTitle || (byLegacy ? "Corps à corps avec vous (état moteur engagedWithId)" : "");
+      return { showIcon: show, tooltip: tooltip || "Corps à corps avec vous" };
+    },
+    [
+      engagedWithId,
+      combatOrderIdSet,
+      localPlayerCombatantId,
+      multiplayerSessionId,
+      resolveEngagementPeerName,
+    ]
+  );
 
   // Lock scroll uniquement en jeu (évite le décalage), mais autorise le scroll dans les menus (création perso, etc.)
   useEffect(() => {
@@ -365,7 +572,154 @@ export default function Home() {
   }, [player, isGameStarted]);
 
   const [activeModal, setActiveModal] = useState<ModalType>(null);
+  const [sessionJoinInput, setSessionJoinInput] = useState("");
+  const [sessionUiError, setSessionUiError] = useState<string | null>(null);
+  const [joiningSession, setJoiningSession] = useState(false);
+  const [equipmentUiError, setEquipmentUiError] = useState<string | null>(null);
   const closeModal = useCallback(() => setActiveModal(null), []);
+
+  useEffect(() => {
+    const sessionFromUrl = normalizeMultiplayerSessionId(searchParams?.get("session") ?? "");
+    if (!sessionFromUrl || sessionFromUrl === multiplayerSessionId) return;
+    let cancelled = false;
+    let redirectTimer: ReturnType<typeof setTimeout> | null = null;
+    (async () => {
+      setJoiningSession(true);
+      setSessionUiError(null);
+      try {
+        const maxNotFoundRetries = 5;
+        const retryDelayMs = 450;
+
+        for (let attempt = 0; attempt <= maxNotFoundRetries; attempt++) {
+          const result = await joinMultiplayerSession(sessionFromUrl);
+          if (cancelled) return;
+
+          if (result.ok) break;
+
+          // Cas courant : le joueur ouvre l'URL pendant que l'hôte n'a pas encore créé le doc Firestore.
+          if (result.reason === "not_found" && attempt < maxNotFoundRetries) {
+            await new Promise((r) => setTimeout(r, retryDelayMs));
+            continue;
+          }
+
+          if (!result.ok) {
+            if (result.reason === "full") {
+              setSessionUiError("Cette session est complète (4 joueurs maximum).");
+            } else if (result.reason === "invalid_id") {
+              setSessionUiError("Identifiant de session invalide.");
+              redirectTimer = setTimeout(() => {
+                const qp = new URLSearchParams(Array.from(searchParams?.entries?.() ?? []));
+                qp.delete("session");
+                const next = qp.toString();
+                router.replace(next ? `?${next}` : "/");
+                setSessionUiError(null);
+              }, 4500);
+            } else if (result.reason === "duplicate_character") {
+              setSessionUiError("Ce personnage est déjà pris dans la session.");
+            } else {
+              setSessionUiError(
+                "Cette session n'existe pas ou n'est plus disponible sur le serveur. Vous allez être redirigé dans quelques secondes…"
+              );
+              redirectTimer = setTimeout(() => {
+                const qp = new URLSearchParams(Array.from(searchParams?.entries?.() ?? []));
+                qp.delete("session");
+                const next = qp.toString();
+                router.replace(next ? `?${next}` : "/");
+                setSessionUiError(null);
+              }, 4500);
+            }
+          }
+
+          break;
+        }
+
+        // En cas de réussite, la boucle se casse dès que `result.ok` est vrai.
+      } finally {
+        if (!cancelled) setJoiningSession(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (redirectTimer) clearTimeout(redirectTimer);
+    };
+  }, [joinMultiplayerSession, multiplayerSessionId, router, searchParams]);
+
+  // Si l'URL ne contient plus `?session=...` mais qu'on est encore en session (état React),
+  // forcer une sortie et revenir au menu.
+  useEffect(() => {
+    const sessionFromUrl = normalizeMultiplayerSessionId(searchParams?.get("session") ?? "");
+    if (sessionFromUrl) return; // on est dans le cas "session présente" (l'effet join gère)
+    if (!multiplayerSessionId) return;
+    if (!isGameStarted) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await leaveMultiplayerSession();
+        if (cancelled) return;
+        router.replace("/");
+      } catch {
+        // ignore
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams, multiplayerSessionId, isGameStarted, leaveMultiplayerSession, router]);
+
+  const handleCreateSession = useCallback(async () => {
+    setSessionUiError(null);
+    setJoiningSession(true);
+    try {
+      const sessionId = await createMultiplayerSession();
+      if (!sessionId) {
+        setSessionUiError("Impossible de créer la session.");
+        return;
+      }
+      const qp = new URLSearchParams(Array.from(searchParams?.entries?.() ?? []));
+      qp.set("session", sessionId);
+      router.replace(`?${qp.toString()}`);
+    } finally {
+      setJoiningSession(false);
+    }
+  }, [createMultiplayerSession, router, searchParams]);
+
+  const handleJoinSession = useCallback(async () => {
+    const target = extractSessionIdFromJoinInput(sessionJoinInput);
+    if (!target) return;
+    setSessionUiError(null);
+    setJoiningSession(true);
+    try {
+      const result = await joinMultiplayerSession(target);
+      if (!result.ok) {
+        if (result.reason === "full") setSessionUiError("Session complète (4/4).");
+        else if (result.reason === "invalid_id") setSessionUiError("Identifiant invalide.");
+        else if (result.reason === "duplicate_character") setSessionUiError("Ce personnage est déjà pris dans la session.");
+        else setSessionUiError("Session introuvable.");
+        return;
+      }
+      const qp = new URLSearchParams(Array.from(searchParams?.entries?.() ?? []));
+      qp.set("session", target);
+      router.replace(`?${qp.toString()}`);
+    } finally {
+      setJoiningSession(false);
+    }
+  }, [joinMultiplayerSession, router, searchParams, sessionJoinInput]);
+
+  const handleLeaveSession = useCallback(async () => {
+    setSessionUiError(null);
+    setJoiningSession(true);
+    try {
+      await leaveMultiplayerSession();
+      const qp = new URLSearchParams(Array.from(searchParams?.entries?.() ?? []));
+      qp.delete("session");
+      const next = qp.toString();
+      router.replace(next ? `?${next}` : "?");
+    } finally {
+      setJoiningSession(false);
+    }
+  }, [leaveMultiplayerSession, router, searchParams]);
 
    // Toujours appeler les hooks avant tout return conditionnel
   const effectiveLevel = player?.level ?? 1;
@@ -383,12 +737,49 @@ export default function Home() {
     return grouped;
   }, [player?.selectedSpells]);
 
+  const displayedArmorClass = useMemo(() => {
+    if (!player) return 10;
+    return computePlayerArmorClass({
+      stats: player.stats,
+      entityClass: player.entityClass,
+      equipment: player.equipment,
+      fighter: player.fighter,
+    });
+  }, [player]);
+
+  /** Sac (hors équipement porté) — hook avant tout return pour respecter l’ordre des hooks. */
+  const inventaireAffiche = useMemo(() => {
+    if (!player) return [];
+    return inventoryExcludingEquipped(player.inventory, player.equipment);
+  }, [player?.inventory, player?.equipment]);
+
+  /** Aperçu colonne latérale : objets portés / harmonisés (même ordre que la fiche équipement). */
+  const equipementListeApercu = useMemo(
+    () => listEquippedItemsDisplayOrder(player?.equipment),
+    [player?.equipment]
+  );
+
   // Étape 0 : aucun personnage sélectionné → écran de sélection/création
   if (!player) {
-    return <CharacterSelection onSelect={setPlayer} />;
+    const sessionParam = normalizeMultiplayerSessionId(searchParams?.get("session") ?? "");
+  return (
+      <div className="relative min-h-screen">
+        {(joiningSession && sessionParam) || sessionUiError ? (
+          <div
+            className="fixed left-0 right-0 top-0 z-[100] border-b border-slate-600 bg-slate-900/95 px-4 py-3 text-center text-sm text-slate-100 shadow-lg"
+            role="status"
+          >
+            {joiningSession && sessionParam && !sessionUiError ? (
+              <p>Connexion à la session <span className="font-mono text-slate-300">{sessionParam}</span>…</p>
+            ) : null}
+            {sessionUiError ? <p className="text-amber-200">{sessionUiError}</p> : null}
+          </div>
+        ) : null}
+        <CharacterSelection onSelect={setPlayer} />
+      </div>
+    );
   }
 
-  const displayedArmorClass = effectivePlayerArmorClass(player);
   const resourceRows: Array<{ key: string; label: string; value: string }> = [];
   if (player.hitDie) {
     resourceRows.push({
@@ -453,28 +844,161 @@ export default function Home() {
     });
   }
 
-  // Si le jeu n'a pas commencé, on affiche UNIQUEMENT le menu
-  if (!isGameStarted) {
-    return <CampaignMenu onStart={startGame} onBack={() => setPlayer(null)} />;
+  // Si le jeu n'a pas commencé OU qu'on n'est pas en session multijoueur,
+  // on affiche UNIQUEMENT le menu. (Le jeu ne doit jamais s'afficher sans session.)
+  if (!isGameStarted || !multiplayerSessionId) {
+    return (
+      <CampaignMenu
+        onStart={startGame}
+        onBack={() => setPlayer(null)}
+        messages={messages}
+        multiplayer={{
+          sessionId: multiplayerSessionId,
+          participants: multiplayerParticipants,
+          connected: multiplayerConnected,
+          participantProfiles: multiplayerParticipantProfiles,
+          meCharacterName: player?.name ?? null,
+          onCreate: handleCreateSession,
+          onLeave: handleLeaveSession,
+          joinInput: sessionJoinInput,
+          setJoinInput: setSessionJoinInput,
+          onJoin: handleJoinSession,
+          joining: joiningSession,
+          error: sessionUiError,
+        }}
+      />
+    );
   }
 
   const stats: PlayerStats  = player.stats;
-  const inventaire: string[] = player.inventory;
+  /** Source de vérité : tout ce que le PJ possède (équipé ou non). */
+  const inventaireComplet: string[] = player.inventory;
   const weapons: Weapon[]    = player.weapons;
 
-  const displayEntities = debugMode
+  const sortedMultiplayerParticipantProfiles = Array.isArray(multiplayerParticipantProfiles)
+    ? [...multiplayerParticipantProfiles].sort((a, b) =>
+        String(a?.clientId ?? "").localeCompare(String(b?.clientId ?? ""))
+      )
+    : [];
+
+  const sessionParticipantEntities: Entity[] = !multiplayerSessionId
+    ? []
+    : sortedMultiplayerParticipantProfiles
+        .filter((profile) => profile.connected !== false)
+        .map(
+          (profile): Entity => ({
+            id: `mp-player-${profile.clientId}`,
+            type: "friendly",
+            controller: "player",
+            name: profile.name,
+            entityClass: profile.entityClass ?? "Aventurier",
+            race: profile.race?.trim() ? profile.race : "—",
+            cr: 0,
+            visible: true,
+            // 0 PV = encore au combat (inconscient / jets contre la mort), pas retiré de l'ordre.
+            isAlive:
+              profile.hpCurrent != null
+                ? true
+                : profile.hpMax != null
+                  ? true
+                  : (profile.hpCurrent ?? 1) > 0,
+            hp:
+              profile.hpCurrent != null && profile.hpMax != null
+                ? { current: profile.hpCurrent, max: profile.hpMax }
+                : null,
+            ac: profile.ac ?? null,
+            stats: null,
+            attackBonus: 0,
+            damageDice: null,
+            damageBonus: 0,
+            weapons: null,
+            description: "Aventurier connecté à cette session partagée.",
+          })
+        );
+
+  const displayEntitiesBase = debugMode
     ? entities
     : entities.filter((e) => e.visible && e.type !== "object");
+  const displayEntities = [...sessionParticipantEntities, ...displayEntitiesBase];
   const isInCombat = gameMode === "combat";
   const isShortRestMode = gameMode === "short_rest";
+  const combatOrderSafeIndex =
+    isInCombat && combatOrder.length > 0
+      ? Math.min(Math.max(0, combatTurnIndex), combatOrder.length - 1)
+      : 0;
   const isPlayerTurn =
     isInCombat &&
     combatOrder.length > 0 &&
-    combatOrder[combatTurnIndex]?.id === "player";
+    (combatOrder[combatOrderSafeIndex]?.id === "player" ||
+      combatOrder[combatOrderSafeIndex]?.id === localPlayerCombatantId);
   const activeCombatantId =
     isInCombat && combatOrder.length > 0
-      ? combatOrder[combatTurnIndex]?.id ?? null
+      ? combatOrder[combatOrderSafeIndex]?.id ?? null
       : null;
+  const participantRowsForNameResolution = Array.isArray(multiplayerParticipantProfiles)
+    ? multiplayerParticipantProfiles
+        .map((profile) => {
+          const cid = String(profile?.clientId ?? "").trim();
+          const pname = String(profile?.playerSnapshot?.name ?? profile?.name ?? "").trim();
+          if (!cid || !pname) return null;
+          return { id: `mp-player-${cid}`, name: pname };
+        })
+        .filter(Boolean)
+    : [];
+  const nameResolutionEntities = [
+    ...(Array.isArray(entities) ? entities : []),
+    ...participantRowsForNameResolution,
+  ] as { id: string; name?: string }[];
+
+  const canChangeEquipment = gameMode !== "combat";
+
+  const applyEquipmentSlot = (slot: EquipSlot, itemName: string | null) => {
+    if (!canChangeEquipment) {
+      setEquipmentUiError("Changement d'équipement impossible pendant le combat.");
+      return;
+    }
+    setEquipmentUiError(null);
+    const eq = player.equipment ?? emptyEquipment();
+    const r = tryEquipFromInventory(eq, slot, itemName, inventaireComplet, {
+      stats: player.stats,
+      entityClass: player.entityClass,
+      fighter: player.fighter,
+      features: player.features,
+      feats: player.feats,
+    });
+    if (!r.ok || !r.equipment) {
+      setEquipmentUiError(r.reason ?? "Action impossible.");
+      return;
+    }
+    updatePlayer({ equipment: r.equipment });
+  };
+
+  const applyAttunement = (itemName: string) => {
+    if (!canChangeEquipment) {
+      setEquipmentUiError("Impossible pendant le combat.");
+      return;
+    }
+    setEquipmentUiError(null);
+    const eq = player.equipment ?? emptyEquipment();
+    const r = tryEquipFromInventory(eq, "attune", itemName, inventaireComplet, {
+      stats: player.stats,
+      entityClass: player.entityClass,
+      fighter: player.fighter,
+      features: player.features,
+      feats: player.feats,
+    });
+    if (!r.ok || !r.equipment) {
+      setEquipmentUiError(r.reason ?? "Action impossible.");
+      return;
+    }
+    updatePlayer({ equipment: r.equipment });
+  };
+
+  const removeAttunement = (itemName: string) => {
+    if (!canChangeEquipment) return;
+    const eq = player.equipment ?? emptyEquipment();
+    updatePlayer({ equipment: tryUnequipAttunement(eq, itemName) });
+  };
 
   const hpPct = Math.round((player.hp.current / player.hp.max) * 100);
 
@@ -496,6 +1020,9 @@ export default function Home() {
           </p>
           <p className="text-xs text-slate-500 mt-1">
             Niveau {player.level} · Initiative {player.initiative ?? abilityMod(stats.DEX)} · Vitesse {player.speed ?? "30 ft"}
+          </p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Bonus de maîtrise (PB) : <span className="font-semibold text-slate-300">+{pb}</span>
           </p>
           {player.alignment && (
             <p className="text-xs text-slate-500 mt-0.5">
@@ -646,26 +1173,9 @@ export default function Home() {
                       Niveau {lvl === 0 ? "0 — Tours de magie" : lvl}
                     </p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {names.map((name) => {
-                        const spell: any = (SPELLS as any)[name];
-                        const line =
-                          spell?.damage
-                            ? `${spell.damage}${spell.damageType ? ` ${spell.damageType}` : ""}`
-                            : spell?.effect || "";
-                        return (
-                          <div
-                            key={name}
-                            className="rounded-md border border-slate-700 bg-slate-900/60 px-3 py-2"
-                          >
-                            <p className="text-sm font-semibold text-slate-100">{name}</p>
-                            {line && (
-                              <p className="text-[11px] text-slate-400 mt-0.5">
-                                {line}
-                              </p>
-                            )}
-                          </div>
-                        );
-                      })}
+                      {names.map((name) => (
+                        <SpellBookCard key={name} name={name} />
+                      ))}
                     </div>
                   </div>
                 ))}
@@ -721,13 +1231,22 @@ export default function Home() {
       {/* Inventaire */}
       <div>
         <h4 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">Inventaire</h4>
+        <p className="text-[11px] text-slate-500 mb-2">
+          Objets dans le sac (non équipés ; armure, armes et bouclier portés sont dans « Équipement »).
+        </p>
         <ul className="grid grid-cols-2 gap-1.5">
-          {inventaire.map((item: string, i: number) => (
-            <li key={i} className="flex items-center gap-2 rounded-md border border-slate-700 bg-slate-800/50 px-3 py-2 text-sm text-slate-300">
-              <span className="text-slate-500">·</span>
-              {item}
+          {inventaireAffiche.length ? (
+            inventaireAffiche.map((item: string, i: number) => (
+              <li key={i} className="flex items-center gap-2 rounded-md border border-slate-700 bg-slate-800/50 px-3 py-2 text-sm text-slate-300">
+                <span className="text-slate-500">·</span>
+                {item}
+              </li>
+            ))
+          ) : (
+            <li className="col-span-2 text-sm text-slate-500 italic">
+              {inventaireComplet.length ? "Tout votre équipement est porté — voir « Équipement »." : "Aucun objet."}
             </li>
-          ))}
+          )}
         </ul>
       </div>
 
@@ -890,23 +1409,9 @@ export default function Home() {
                     Niveau {lvl === 0 ? "0 — Tours de magie" : lvl}
                   </p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {names.map((name) => {
-                      const spell: any = (SPELLS as any)[name];
-                      const line =
-                        spell?.damage
-                          ? `${spell.damage}${spell.damageType ? ` ${spell.damageType}` : ""}`
-                          : spell?.effect || "";
-                      return (
-                        <div key={name} className="rounded-md border border-slate-700 bg-slate-900/60 px-3 py-2">
-                          <p className="text-sm font-semibold text-slate-100">{name}</p>
-                          {line && (
-                            <p className="text-[11px] text-slate-400 mt-0.5">
-                              {line}
-                            </p>
-                          )}
-                        </div>
-                      );
-                    })}
+                    {names.map((name) => (
+                      <SpellBookCard key={name} name={name} />
+                    ))}
                   </div>
                 </div>
               ))}
@@ -922,20 +1427,166 @@ export default function Home() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h4 className="text-sm font-semibold uppercase tracking-wider text-slate-400">Inventaire</h4>
-        <span className="text-xs text-slate-500 tabular-nums">{inventaire.length} objet(s)</span>
+        <span className="text-xs text-slate-500 tabular-nums">{inventaireAffiche.length} objet(s) au sac</span>
       </div>
+      <p className="text-[11px] text-slate-500">
+        Sont listés ici uniquement les objets <strong className="text-slate-400">non équipés</strong> (le reste est dans
+        « Équipement »).
+      </p>
       <div className="max-h-[55vh] overflow-y-auto pr-1">
-        <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-          {inventaire.map((item: string, i: number) => (
-            <li
-              key={i}
-              className="flex items-center gap-2 rounded-md border border-slate-700 bg-slate-800/50 px-3 py-2 text-sm text-slate-300"
+        {inventaireAffiche.length ? (
+          <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            {inventaireAffiche.map((item: string, i: number) => (
+              <li
+                key={i}
+                className="flex items-center gap-2 rounded-md border border-slate-700 bg-slate-800/50 px-3 py-2 text-sm text-slate-300"
+              >
+                <span className="text-slate-500">·</span>
+                <span className="break-words">{item}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-sm text-slate-500 italic py-4 text-center">
+            {inventaireComplet.length
+              ? "Tout est équipé — voir l’encadré « Équipement »."
+              : "Aucun objet."}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+
+  const modalEquipment = (
+    <div className="space-y-4 text-sm text-slate-200">
+      {!canChangeEquipment && (
+        <p className="rounded-md border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-xs text-amber-100">
+          En combat, l&apos;équipement ne peut pas être modifié.
+        </p>
+      )}
+      {equipmentUiError ? (
+        <p className="rounded-md border border-red-800/60 bg-red-950/40 px-3 py-2 text-xs text-red-100">
+          {equipmentUiError}
+        </p>
+      ) : null}
+      <p className="text-xs text-slate-400">
+        CA actuelle : <span className="font-semibold text-slate-200">{displayedArmorClass}</span> — calculée
+        selon l&apos;armure, le bouclier et le style de combat (ex. Défense).
+      </p>
+      <div className="max-h-[50vh] space-y-3 overflow-y-auto pr-1">
+        {(
+          [
+            { slot: "armor" as const, label: "Armure (une seule)" },
+            { slot: "mainHand" as const, label: "Main principale" },
+            { slot: "offHand" as const, label: "Main secondaire (arme légère ou bouclier)" },
+            { slot: "bottes" as const, label: "Bottes / chaussures" },
+            { slot: "cape" as const, label: "Cape / manteau" },
+            { slot: "tete" as const, label: "Couvre-chef" },
+            { slot: "gants" as const, label: "Gants / gantelets" },
+          ] as const
+        ).map(({ slot, label }) => {
+          const eq = player.equipment ?? emptyEquipment();
+          const current =
+            slot === "armor"
+              ? eq.armor
+              : slot === "mainHand"
+                ? eq.mainHand
+                : slot === "offHand"
+                  ? eq.offHand
+                  : slot === "bottes"
+                    ? eq.bottes
+                    : slot === "cape"
+                      ? eq.cape
+                      : slot === "tete"
+                        ? eq.tete
+                        : eq.gants;
+          const candidates = inventoryCandidatesForSlot(inventaireComplet, slot);
+          return (
+            <div
+              key={slot}
+              className="space-y-2 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2"
             >
-              <span className="text-slate-500">·</span>
-              <span className="break-words">{item}</span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                  {label}
+                </span>
+                {current ? (
+                  <button
+                    type="button"
+                    disabled={!canChangeEquipment}
+                    onClick={() => applyEquipmentSlot(slot, null)}
+                    className="text-[11px] text-amber-300 hover:text-amber-100 disabled:opacity-40"
+                  >
+                    Déséquiper
+                  </button>
+                ) : null}
+              </div>
+              <p className="text-slate-100">{current ?? "—"}</p>
+              <select
+                className="w-full rounded-md border border-slate-600 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-40"
+                disabled={!canChangeEquipment}
+                defaultValue=""
+                onChange={(e) => {
+                  const v = e.target.value.trim();
+                  if (v) applyEquipmentSlot(slot, v);
+                  e.target.value = "";
+                }}
+              >
+                <option value="">Équiper depuis l&apos;inventaire…</option>
+                {candidates.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-3">
+        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          Harmonisation (max {MAX_ATTUNED_ITEMS})
+        </h4>
+        <p className="text-[11px] text-slate-500">
+          Objets magiques harmonisés — maximum {MAX_ATTUNED_ITEMS} à la fois (règle D&amp;D 5e).
+        </p>
+        <ul className="space-y-1">
+          {(player.equipment?.attunedItems ?? []).map((name) => (
+            <li key={name} className="flex items-center justify-between gap-2 text-slate-200">
+              <span>{name}</span>
+              <button
+                type="button"
+                disabled={!canChangeEquipment}
+                onClick={() => removeAttunement(name)}
+                className="text-[11px] text-amber-300 hover:text-amber-100 disabled:opacity-40"
+              >
+                Retirer
+              </button>
             </li>
           ))}
         </ul>
+        {(player.equipment?.attunedItems ?? []).length < MAX_ATTUNED_ITEMS ? (
+          <select
+            className="w-full rounded-md border border-slate-600 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-40"
+            disabled={!canChangeEquipment}
+            defaultValue=""
+            onChange={(e) => {
+              const v = e.target.value.trim();
+              if (v) applyAttunement(v);
+              e.target.value = "";
+            }}
+          >
+            <option value="">Harmoniser un objet…</option>
+            {inventaireComplet
+              .filter((x) => !(player.equipment?.attunedItems ?? []).includes(x))
+              .map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+          </select>
+        ) : null}
       </div>
     </div>
   );
@@ -946,7 +1597,17 @@ export default function Home() {
         <p className="text-slate-500 italic text-center py-8">Aucune entité dans cette scène.</p>
       ) : (
         displayEntities.map((entity: Entity) => (
-          <EntityCardFull key={entity.id} entity={entity} godMode={debugMode} />
+          <EntityCardFull
+            key={entity.id}
+            entity={entity}
+            godMode={debugMode}
+            combatStealthHidden={
+              gameMode === "combat" &&
+              entity.type === "hostile" &&
+              entity.isAlive &&
+              combatHiddenSet.has(entity.id)
+            }
+          />
         ))
       )}
     </div>
@@ -976,52 +1637,87 @@ export default function Home() {
           .map((raw) => normalizeCombatOrderEntry(raw))
           .filter((entry): entry is CombatEntry => entry !== null)
           .filter((entry: CombatEntry) => {
-            if (entry.id === "player") return true;
+            if (entry.id === "player" || entry.id === localPlayerCombatantId) return true;
+            if (String(entry.id ?? "").startsWith("mp-player-")) {
+              const cid = String(entry.id).slice("mp-player-".length);
+              const prof = multiplayerParticipantProfiles.find(
+                (p) => String(p?.clientId ?? "").trim() === String(cid).trim()
+              );
+              if (!prof) return debugMode;
+              if (prof.connected === false && !debugMode) return false;
+              return true;
+            }
             const ent = entities.find((e) => e.id === entry.id);
-            if (!ent) return debugMode; // inconnu : seulement en debug
-            if (ent.type !== "hostile") return debugMode; // on n'affiche que les hostiles en combat (hors debug)
-            if (ent.isAlive === false && !debugMode) return false; // hostile mort : caché
-            if (!ent.visible && !debugMode) return false; // hostile invisible : caché à l'UI
+            if (!ent) return true;
+            if (ent.type !== "hostile") return debugMode;
+            if (ent.isAlive === false) return false;
             return true;
           })
           .map((entry: CombatEntry, idx: number) => {
           const entityData = entities.find((e) => e.id === entry.id);
           const meta = entityData ? ENTITY_TYPE_META[entityData.type] : null;
-          const isPlayer = entry.id === "player";
+          const isPlayerRow = entry.id === "player" || entry.id === localPlayerCombatantId;
           const isActive = activeCombatantId != null && entry.id === activeCombatantId;
+          const meleePeers = getMeleeWith(entry.id);
+          const engage = initiativeRowMeleeEngage(entry.id, isPlayerRow, meleePeers);
+          const stealthHiddenRow = (() => {
+            const eid = String(entry.id ?? "").trim();
+            if (isPlayerRow) {
+              const aliases = [
+                eid,
+                String(localPlayerCombatantId ?? "").trim(),
+                "player",
+                player?.id != null ? String(player.id).trim() : "",
+              ].filter(Boolean);
+              return aliases.some((id) => combatHiddenSet.has(id));
+            }
+            return combatHiddenSet.has(eid);
+          })();
           return (
             <div
               key={`combat-init-${entry.id}-${idx}`}
-              className={`flex items-center gap-4 rounded-xl border px-5 py-3 transition-colors ${
+              className={`flex items-center gap-3 rounded-xl border px-4 py-3 transition-colors ${
                 isActive
                   ? "border-red-600 bg-red-950/40"
-                  : isPlayer
+                  : isPlayerRow
                   ? "border-blue-700 bg-blue-950/30"
                   : "border-slate-700 bg-slate-800/40"
               }`}
             >
+              {engage.showIcon || stealthHiddenRow ? (
+                <div className="flex w-11 shrink-0 flex-col items-center justify-center gap-0.5">
+                  {engage.showIcon ? (
+                    <span className="text-2xl leading-none text-amber-300" title={engage.tooltip}>
+                      ⚔
+                    </span>
+                  ) : null}
+                  {stealthHiddenRow ? (
+                    <span
+                      className="text-xl leading-none text-slate-400"
+                      title="Caché — jet de Discrétion réussi (tant que non repéré)"
+                    >
+                      🥷
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="flex w-12 shrink-0 items-center justify-center gap-0.5">
                 <span className={`text-2xl text-center ${isActive ? "animate-pulse" : ""}`}>
-                  {isActive ? "▶" : isPlayer ? "🧙" : (meta?.icon ?? "👤")}
+                  {isActive ? "▶" : isPlayerRow ? "🧙" : (meta?.icon ?? "👤")}
                 </span>
-                {!isPlayer && isInMeleeWithPlayer(entry.id) && (
-                  <span
-                    className="text-base leading-none text-amber-400"
-                    title="Au contact avec vous (mêlée)"
-                    aria-label="Au contact, mêlée"
-                  >
-                    ⚔
-                  </span>
-                )}
               </div>
               <div className="flex-1 min-w-0">
-                <p className={`font-bold ${isPlayer ? "text-blue-300" : "text-slate-100"}`}>
-                  {resolveCombatantDisplayName(entry, entities, player?.name)}
+                <p
+                  className={`font-bold flex items-center gap-1.5 min-w-0 ${isPlayerRow ? "text-blue-300" : "text-slate-100"}`}
+                >
+                  <span className="truncate">
+                    {resolveCombatantDisplayName(entry, nameResolutionEntities, player?.name)}
+                  </span>
                 </p>
                 {entityData && (
                   <p className="text-xs text-slate-400">{entityData.race} · {entityData.entityClass}</p>
                 )}
-              </div>
+        </div>
               <div className="text-right">
                 <p className="text-2xl font-bold tabular-nums text-slate-100">{entry.initiative}</p>
                 <p className="text-xs text-slate-500">initiative</p>
@@ -1078,6 +1774,29 @@ export default function Home() {
             </div>
           </div>
 
+          {!player.deathState?.dead &&
+            (player.hp?.current ?? 0) <= 0 &&
+            !player.deathState?.stable && (
+              <div className="rounded-lg border border-amber-700/70 bg-amber-950/50 px-3 py-2.5 text-xs text-amber-50 shadow-sm">
+                <p className="font-semibold uppercase tracking-wide text-amber-200/95">
+                  Jets contre la mort
+                </p>
+                <p className="mt-1 tabular-nums text-slate-100">
+                  Réussites <span className="font-semibold">{player.deathState?.successes ?? 0}</span>/3 ·
+                  Échecs <span className="font-semibold">{player.deathState?.failures ?? 0}</span>/3
+                </p>
+                <p className="mt-1.5 text-[11px] leading-snug text-amber-100/90">
+                  {pendingRoll?.kind === "death_save"
+                    ? "C\u2019est votre tour : lancez le dé depuis la zone de chat (bouton ou raccourci habituel)."
+                    : isInCombat && !isPlayerTurn
+                      ? "Ce n'est pas encore votre tour : le jet de sauvegarde sera demandé quand votre tour reviendra."
+                      : isInCombat
+                        ? "En attente du jet de sauvegarde — le prompt devrait apparaître dans le chat sous peu."
+                        : "Hors combat, restez vigilant : si vous revenez en combat à 0 PV non stabilisé, les jets contre la mort reprendront."}
+                </p>
+              </div>
+            )}
+
           {/* Stats — cliquables */}
           <div
             onClick={() => setActiveModal("stats")}
@@ -1086,7 +1805,7 @@ export default function Home() {
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Stats</h3>
               <span className="text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">voir ↗</span>
-            </div>
+        </div>
             <div className="grid grid-cols-3 gap-1">
               {(Object.entries(stats) as [string, number][]).map(([key, val]) => {
                 const mod = Math.floor((val - 10) / 2);
@@ -1101,6 +1820,9 @@ export default function Home() {
                 );
               })}
             </div>
+            <p className="mt-2 text-[11px] text-slate-500">
+              PB <span className="font-semibold text-slate-300">+{pb}</span>
+            </p>
           </div>
 
           {/* Armes */}
@@ -1152,6 +1874,44 @@ export default function Home() {
             </div>
           </div>
 
+          {/* Équipement */}
+          <div
+            onClick={() => {
+              setEquipmentUiError(null);
+              setActiveModal("equipment");
+            }}
+            className={`cursor-pointer rounded-md border border-slate-700 bg-slate-800 p-3 hover:border-slate-500 hover:bg-slate-700/60 transition-all group ${
+              isInCombat ? "opacity-60" : ""
+            }`}
+            title={isInCombat ? "Lecture seule en combat" : "Gérer armes, armure, bouclier"}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Équipement</h3>
+              <span className="text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">voir ↗</span>
+            </div>
+            <p className="text-[11px] text-slate-400 mb-1.5">
+              CA <span className="font-semibold text-slate-200 tabular-nums">{displayedArmorClass}</span>
+              {isInCombat ? <span className="text-slate-500"> · combat (verrouillé)</span> : null}
+            </p>
+            {equipementListeApercu.length > 0 ? (
+              <ul className="space-y-1 text-xs text-slate-300 max-h-28 overflow-hidden">
+                {equipementListeApercu.slice(0, 8).map((name: string, i: number) => (
+                  <li key={`${name}-${i}`} className="flex items-center gap-1.5">
+                    <span className="text-slate-600 shrink-0">·</span>
+                    <span className="truncate">{name}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-[11px] text-slate-500 italic">Aucun objet équipé.</p>
+            )}
+            {equipementListeApercu.length > 8 ? (
+              <p className="mt-1.5 text-[11px] text-slate-500">
+                +{equipementListeApercu.length - 8} autre(s)…
+              </p>
+            ) : null}
+          </div>
+
           {/* Inventaire */}
           <div
             onClick={() => setActiveModal("inventory")}
@@ -1162,16 +1922,19 @@ export default function Home() {
               <span className="text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">voir ↗</span>
             </div>
             <ul className="space-y-1 text-xs text-slate-300 max-h-32 overflow-hidden">
-              {inventaire.slice(0, 8).map((item: string, i: number) => (
+              {inventaireAffiche.slice(0, 8).map((item: string, i: number) => (
                 <li key={i} className="flex items-center gap-1.5">
                   <span className="text-slate-600">·</span>
                   <span className="truncate">{item}</span>
                 </li>
               ))}
             </ul>
-            {inventaire.length > 8 && (
+            {inventaireAffiche.length === 0 && inventaireComplet.length > 0 ? (
+              <p className="mt-1 text-[10px] text-slate-500 italic">Sac vide — tout est équipé.</p>
+            ) : null}
+            {inventaireAffiche.length > 8 && (
               <p className="mt-2 text-[11px] text-slate-500">
-                +{inventaire.length - 8} autre(s) objet(s)… (cliquer pour ouvrir)
+                +{inventaireAffiche.length - 8} autre(s) objet(s)… (cliquer pour ouvrir)
               </p>
             )}
           </div>
@@ -1199,7 +1962,7 @@ export default function Home() {
         {/* ── Colonne Centre — Chat (60%) ── */}
         <main className="flex w-3/5 flex-col border-r border-slate-700">
           <ChatInterface />
-        </main>
+      </main>
 
         {/* ── Colonne Droite — État du Jeu (20%) ── */}
         <aside className="flex w-1/5 flex-col gap-3 p-4 overflow-y-auto">
@@ -1218,7 +1981,7 @@ export default function Home() {
             {isInCombat ? "⚔️ COMBAT" : isShortRestMode ? "🛌 REPOS COURT" : "🗺️ EXPLORATION"}
             {debugMode && <span className="text-teal-400 text-xs font-normal">[Debug]</span>}
             {isInCombat && <span className="text-[10px] text-red-600">↗</span>}
-          </div>
+    </div>
 
           {/* Horloge de campagne (Jour / Heure) */}
           <div className="rounded-md border border-slate-700 bg-slate-800/60 px-3 py-2 text-xs text-slate-300">
@@ -1228,6 +1991,72 @@ export default function Home() {
                 {formatWorldTimeLabel(worldTimeMinutes)}
               </span>
             </div>
+          </div>
+
+          {/* Session multijoueur */}
+          <div className="rounded-md border border-slate-700 bg-slate-800/60 px-3 py-2 text-xs text-slate-300 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold uppercase tracking-wider text-slate-500">Session</span>
+              <span className={`font-semibold ${multiplayerConnected ? "text-emerald-300" : "text-slate-400"}`}>
+                {multiplayerConnected ? "connectée" : "locale"}
+              </span>
+            </div>
+            {multiplayerSessionId ? (
+              <div className="space-y-1">
+                <p className="text-[11px] text-slate-400">
+                  id: <span className="font-mono text-slate-200">{multiplayerSessionId}</span>
+                </p>
+                <p className="text-[11px] text-slate-400">Participants: {multiplayerParticipants}/4</p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const url = `${window.location.origin}${window.location.pathname}?session=${multiplayerSessionId}`;
+                      try { await navigator.clipboard.writeText(url); } catch {}
+                    }}
+                    className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700/50"
+                  >
+                    Copier lien
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLeaveSession}
+                    disabled={joiningSession}
+                    className="rounded border border-amber-700/60 px-2 py-1 text-[11px] text-amber-200 hover:bg-amber-900/40 disabled:opacity-50"
+                  >
+                    Quitter
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={handleCreateSession}
+                    disabled={joiningSession}
+                    className="rounded border border-emerald-700/60 px-2 py-1 text-[11px] text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-50"
+                  >
+                    Créer
+                  </button>
+                  <input
+                    value={sessionJoinInput}
+                    onChange={(e) => setSessionJoinInput(e.target.value)}
+                    placeholder="session id"
+                    className="min-w-0 flex-1 rounded border border-slate-600 bg-slate-900/70 px-2 py-1 text-[11px] text-slate-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleJoinSession}
+                    disabled={joiningSession || !sessionJoinInput.trim()}
+                    className="rounded border border-blue-700/60 px-2 py-1 text-[11px] text-blue-200 hover:bg-blue-900/40 disabled:opacity-50"
+                  >
+                    Rejoindre
+                  </button>
+                </div>
+              </div>
+            )}
+            {sessionUiError && <p className="text-[11px] text-amber-300">{sessionUiError}</p>}
           </div>
 
           {/* Ordre d'initiative (compact) — cliquable */}
@@ -1245,43 +2074,91 @@ export default function Home() {
                   .map((raw) => normalizeCombatOrderEntry(raw))
                   .filter((entry): entry is CombatEntry => entry !== null)
                   .filter((entry: CombatEntry) => {
-                    if (entry.id === "player") return true;
+                    if (entry.id === "player" || entry.id === localPlayerCombatantId) return true;
+                    if (String(entry.id ?? "").startsWith("mp-player-")) {
+                      const cid = String(entry.id).slice("mp-player-".length);
+                      const prof = multiplayerParticipantProfiles.find(
+                        (p) => String(p?.clientId ?? "").trim() === String(cid).trim()
+                      );
+                      if (!prof) return debugMode;
+                      if (prof.connected === false && !debugMode) return false;
+                      return true;
+                    }
                     const ent = entities.find((e) => e.id === entry.id);
-                    if (!ent) return debugMode;
+                    // combatOrder est synchronisé (MJ / multijoueur) : afficher même si l'entité
+                    // n'est pas encore dans `entities` sur ce client (hostiles souvent absents du sync).
+                    if (!ent) return true;
                     if (ent.type !== "hostile") return debugMode;
-                    if (ent.isAlive === false && !debugMode) return false;
-                    if (!ent.visible && !debugMode) return false;
+                    if (ent.isAlive === false) return false;
                     return true;
                   })
-                  .map((entry: CombatEntry, idx: number) => (
+                  .map((entry: CombatEntry, idx: number) => {
+                  const meleePeersCompact = getMeleeWith(entry.id);
+                  const isPlayerRowCompact =
+                    entry.id === "player" || entry.id === localPlayerCombatantId;
+                  const engageCompact = initiativeRowMeleeEngage(
+                    entry.id,
+                    isPlayerRowCompact,
+                    meleePeersCompact
+                  );
+                  const stealthHiddenCompact = (() => {
+                    const eid = String(entry.id ?? "").trim();
+                    if (isPlayerRowCompact) {
+                      const aliases = [
+                        eid,
+                        String(localPlayerCombatantId ?? "").trim(),
+                        "player",
+                        player?.id != null ? String(player.id).trim() : "",
+                      ].filter(Boolean);
+                      return aliases.some((id) => combatHiddenSet.has(id));
+                    }
+                    return combatHiddenSet.has(eid);
+                  })();
+                  const isTurnActive =
+                    activeCombatantId != null && entry.id === activeCombatantId;
+                  return (
                   <li
               key={`combat-init-${entry.id}-${idx}`}
               className={`flex items-center justify-between rounded px-2 py-1 text-xs border transition-all ${
-                activeCombatantId != null && entry.id === activeCombatantId
+                isTurnActive
                         ? "bg-red-900/45 border-red-500/70 text-red-100 font-semibold shadow-[0_0_0_1px_rgba(239,68,68,0.15),0_0_14px_rgba(239,68,68,0.2)]"
                         : "border-transparent text-slate-400"
                     }`}
                   >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      {activeCombatantId != null && entry.id === activeCombatantId && <span className="shrink-0 text-red-400">▶</span>}
-                      {entry.id !== "player" && isInMeleeWithPlayer(entry.id) && (
+                    <span className="flex min-w-0 flex-1 items-center gap-1">
+                      {engageCompact.showIcon ? (
                         <span
-                          className="shrink-0 text-amber-400"
-                          title="Au contact avec vous (mêlée)"
-                          aria-label="Au contact, mêlée"
+                          className="inline-flex w-5 shrink-0 justify-center"
+                          title={engageCompact.tooltip}
                         >
-                          ⚔
+                          <span className="text-sm leading-none text-amber-300" aria-hidden>
+                            ⚔
+                          </span>
                         </span>
-                      )}
+                      ) : null}
+                      {stealthHiddenCompact ? (
+                        <span
+                          className="inline-flex w-5 shrink-0 justify-center"
+                          title="Caché — jet de Discrétion réussi (tant que non repéré)"
+                        >
+                          <span className="text-sm leading-none text-slate-400" aria-hidden>
+                            🥷
+                          </span>
+                        </span>
+                      ) : null}
+                      {isTurnActive && <span className="shrink-0 text-red-400">▶</span>}
                       <span
-                        className={`truncate ${entry.id === "player" ? "text-blue-300" : ""}`}
+                        className={`min-w-0 truncate ${
+                          entry.id === "player" || entry.id === localPlayerCombatantId ? "text-blue-300" : ""
+                        }`}
                       >
-                        {resolveCombatantDisplayName(entry, entities, player?.name)}
+                        {resolveCombatantDisplayName(entry, nameResolutionEntities, player?.name)}
                       </span>
                     </span>
                     <span className="tabular-nums text-slate-500">{entry.initiative}</span>
                   </li>
-                ))}
+                );
+                })}
               </ol>
             </div>
           )}
@@ -1303,7 +2180,17 @@ export default function Home() {
             ) : (
               <div className="space-y-2">
                 {displayEntities.map((entity: Entity) => (
-                  <EntityCard key={entity.id} entity={entity} godMode={debugMode} />
+                  <EntityCard
+                    key={entity.id}
+                    entity={entity}
+                    godMode={debugMode}
+                    combatStealthHidden={
+                      gameMode === "combat" &&
+                      entity.type === "hostile" &&
+                      entity.isAlive &&
+                      combatHiddenSet.has(entity.id)
+                    }
+                  />
                 ))}
               </div>
             )}
@@ -1358,6 +2245,17 @@ export default function Home() {
           {modalInventory}
         </Modal>
       )}
+      {activeModal === "equipment" && (
+        <Modal
+          title={`${player.name} — Équipement porté`}
+          onClose={() => {
+            setEquipmentUiError(null);
+            closeModal();
+          }}
+        >
+          {modalEquipment}
+        </Modal>
+      )}
       {activeModal === "entities" && (
         <Modal title={debugMode ? "Toutes les entités (Debug)" : "Entités présentes dans la scène"} onClose={closeModal}>
           {modalEntities}
@@ -1374,5 +2272,13 @@ export default function Home() {
         </Modal>
       )}
     </>
+  );
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={null}>
+      <HomeContent />
+    </Suspense>
   );
 }

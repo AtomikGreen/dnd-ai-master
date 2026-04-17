@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { logInteraction } from "@/lib/aiTraceLog";
+import { logTerminalAiCallEnd, logTerminalAiCallStart, withTerminalAiTiming } from "@/lib/aiTerminalTimingLog";
 
 /** Modèle image Gemini (Nano Banana / API image). Surcharge possible via GEMINI_IMAGE_MODEL. */
 const DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image-preview";
@@ -164,17 +165,27 @@ async function synthesizeVisualPrompt(visualContext, apiKey) {
   const fallbackCore = fallbackPromptFromVisualContext(visualContext);
   const fallback = finalizeImagePrompt(fallbackCore, visualContext);
   try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: DEFAULT_GEMINI_SCENE_PROMPT_MODEL,
-      systemInstruction: VISUAL_SYNTH_SYSTEM,
-    });
     const payload =
       typeof visualContext === "object" && visualContext !== null
         ? JSON.stringify(visualContext, null, 2)
         : String(visualContext ?? "");
-    const result = await model.generateContent(payload);
-    const raw = (result.response.text() || "").trim();
+    const raw = await withTerminalAiTiming(
+      {
+        routePath: "/api/scene-image",
+        agentLabel: "Synthèse prompt visuel",
+        provider: "Gemini",
+        model: DEFAULT_GEMINI_SCENE_PROMPT_MODEL,
+      },
+      async () => {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({
+          model: DEFAULT_GEMINI_SCENE_PROMPT_MODEL,
+          systemInstruction: VISUAL_SYNTH_SYSTEM,
+        });
+        const result = await model.generateContent(payload);
+        return (result.response.text() || "").trim();
+      }
+    );
     let prompt = raw.replace(/^["'`]+|["'`]+$/g, "").trim();
     if (prompt.length < 40) {
       return { prompt: fallback || finalizeImagePrompt(prompt, visualContext), raw, usedSynth: false };
@@ -190,6 +201,8 @@ async function synthesizeVisualPrompt(visualContext, apiKey) {
  * Génère une image via l'API Gemini (generateContent + inlineData).
  */
 export async function POST(request) {
+  /** Pour log terminal si exception après début d’appel image. */
+  let sceneImageGenTiming = null;
   try {
     const body = await request.json();
     const { prompt, model, visualContext } = body || {};
@@ -230,24 +243,33 @@ export async function POST(request) {
     const selectedModel = resolveModel(model);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent`;
 
+    sceneImageGenTiming = logTerminalAiCallStart("/api/scene-image", "Génération image (Gemini)", {
+      provider: "Gemini REST",
+      model: selectedModel,
+    });
     const controller = new AbortController();
-    const timeoutMs = Number(process.env.IMAGE_GEN_TIMEOUT_MS ?? 120000);
-    const t = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 120000);
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "x-goog-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [{ text: imagePrompt }],
-          },
-        ],
-      }),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(t));
+    const timeoutMs = Number(process.env.IMAGE_GEN_TIMEOUT_MS ?? 180000);
+    const t = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 180000);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: imagePrompt }],
+            },
+          ],
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(t);
+    }
 
     const data = await res.json().catch(() => ({}));
 
@@ -256,6 +278,13 @@ export async function POST(request) {
         data?.error?.message ||
         data?.error?.status ||
         `Erreur API Gemini (${res.status})`;
+      logTerminalAiCallEnd("/api/scene-image", "Génération image (Gemini)", sceneImageGenTiming, {
+        provider: "Gemini REST",
+        model: selectedModel,
+        ok: false,
+        status: res.status >= 400 ? res.status : 502,
+        errorMessage: msg,
+      });
       return NextResponse.json(
         { error: "Échec génération image Gemini.", details: msg },
         { status: res.status >= 400 ? res.status : 502 }
@@ -291,6 +320,12 @@ export async function POST(request) {
           }
         );
 
+        logTerminalAiCallEnd("/api/scene-image", "Génération image (Gemini)", sceneImageGenTiming, {
+          provider: "Gemini REST",
+          model: selectedModel,
+          ok: true,
+          status: 200,
+        });
         return NextResponse.json({
           url: urlData,
           model: selectedModel,
@@ -301,6 +336,14 @@ export async function POST(request) {
     }
 
     const blockReason = data?.promptFeedback?.blockReason;
+    logTerminalAiCallEnd("/api/scene-image", "Génération image (Gemini)", sceneImageGenTiming, {
+      provider: "Gemini REST",
+      model: selectedModel,
+      ok: false,
+      status: 502,
+      note: "aucune_image_inline",
+      errorMessage: blockReason ? `Bloqué : ${blockReason}` : "réponse sans image",
+    });
     return NextResponse.json(
       {
         error: "Aucune image dans la réponse Gemini.",
@@ -311,6 +354,15 @@ export async function POST(request) {
       { status: 502 }
     );
   } catch (err) {
+    if (sceneImageGenTiming) {
+      logTerminalAiCallEnd("/api/scene-image", "Génération image (Gemini)", sceneImageGenTiming, {
+        provider: "Gemini REST",
+        model: "(exception)",
+        ok: false,
+        errorMessage: String(err?.message ?? err),
+      });
+      sceneImageGenTiming = null;
+    }
     return NextResponse.json(
       {
         error: "Erreur lors de la génération d'image.",

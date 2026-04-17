@@ -1,9 +1,8 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useCallback } from "react";
 import {
   RACES,
   CLASSES,
   WEAPONS,
-  ARMORS,
   STARTING_EQUIPMENT,
   BACKGROUNDS,
   SKILLS_DB,
@@ -41,6 +40,14 @@ import {
   ARCANE_TRICKSTER_ALLOWED_SCHOOLS,
   ARCANE_TRICKSTER_ANY_SCHOOL_SPELL_LEVELS,
 } from "../data/srd5";
+import {
+  buildEquipmentFromStartingGear,
+  computePlayerArmorClass,
+  emptyEquipment,
+  tryEquipFromInventory,
+  inventoryCandidatesForSlot,
+  isWeaponName,
+} from "@/lib/playerEquipment";
 
 const BASE_SCORES = [15, 14, 13, 12, 10, 8];
 const ABILITIES = ["FOR", "DEX", "CON", "INT", "SAG", "CHA"];
@@ -224,6 +231,9 @@ export default function CharacterBuilder({ onSave }) {
     SAG: 10,
     CHA: 8,
   });
+  /** null = utiliser l’équipement par défaut du pack SRD */
+  const [equippedOverride, setEquippedOverride] = useState(null);
+  const [equipBuilderError, setEquipBuilderError] = useState(null);
 
   const raceObj = race ? RACES[race] : null;
   const classObj = className ? CLASSES[className] : null;
@@ -495,48 +505,75 @@ export default function CharacterBuilder({ onSave }) {
     return out.filter(Boolean);
   }, [startingEquipment]);
 
+  const defaultEquipment = useMemo(() => {
+    if (!startingEquipment) return emptyEquipment();
+    return buildEquipmentFromStartingGear({
+      armorName: startingEquipment.armor ?? null,
+      shieldEquipped: startingEquipment.shield === "Bouclier",
+      weaponNames: Array.isArray(startingEquipment.weapons) ? startingEquipment.weapons : [],
+    });
+  }, [startingEquipment]);
+
+  const resolvedEquipment = useMemo(
+    () => equippedOverride ?? defaultEquipment,
+    [equippedOverride, defaultEquipment]
+  );
+
+  useEffect(() => {
+    setEquippedOverride(null);
+    setEquipBuilderError(null);
+  }, [defaultEquipment]);
+
   const armorClass = useMemo(() => {
-    const dexMod = modifiers.DEX ?? 0;
-    const wisMod = modifiers.SAG ?? 0;
-    const conMod = modifiers.CON ?? 0;
+    if (!className) return 10;
+    return computePlayerArmorClass({
+      stats: finalStats,
+      entityClass: className,
+      equipment: resolvedEquipment,
+      fighter: isFighter ? { fightingStyle: fighterStyle || undefined } : undefined,
+    });
+  }, [finalStats, className, resolvedEquipment, isFighter, fighterStyle]);
 
-    const armorName = startingEquipment?.armor ?? "Aucune";
-    const shieldName = startingEquipment?.shield ?? "Aucun";
-
-    const hasShield = shieldName === "Bouclier";
-    const shieldBonus = hasShield ? (ARMORS?.Bouclier?.baseAC ?? 2) : 0;
-
-    const fighterDefenseBonus =
-      isFighter && fighterStyle === "Défense" && armorName && armorName !== "Aucune" && ARMORS?.[armorName]
-        ? 1
-        : 0;
-
-    // Armure "Aucune" ou inconnue -> CA de base + éventuellement Défense sans armure
-    if (!armorName || armorName === "Aucune" || !ARMORS?.[armorName]) {
-      let base = 10 + dexMod;
-      if (className === "Moine") base += wisMod;
-      if (className === "Barbare") base += conMod;
-      return base + shieldBonus;
-    }
-
-    const armor = ARMORS[armorName];
-    const baseAC = Number(armor.baseAC ?? 10);
-    let modPart = 0;
-    if (armor.modifier === "DEX") modPart = dexMod;
-    else if (armor.modifier === "DEX_MAX_2") modPart = Math.min(2, dexMod);
-    else if (armor.modifier === "NONE") modPart = 0;
-    // "SHIELD" géré via shieldBonus
-
-    return baseAC + modPart + shieldBonus + fighterDefenseBonus;
-  }, [startingEquipment, modifiers, className, isFighter, fighterStyle]);
+  const applyBuilderSlot = useCallback(
+    (slot, rawValue) => {
+      const itemName = rawValue === "" || rawValue == null ? null : String(rawValue).trim();
+      const base = equippedOverride ?? defaultEquipment;
+      const r = tryEquipFromInventory(base, slot, itemName, inventory, {
+        stats: finalStats,
+        entityClass: className,
+        fighter: isFighter ? { fightingStyle: fighterStyle || undefined } : undefined,
+      });
+      if (!r.ok || !r.equipment) {
+        setEquipBuilderError(r.reason ?? "Action impossible.");
+        return;
+      }
+      setEquipBuilderError(null);
+      setEquippedOverride(r.equipment);
+    },
+    [
+      equippedOverride,
+      defaultEquipment,
+      inventory,
+      finalStats,
+      className,
+      isFighter,
+      fighterStyle,
+    ]
+  );
 
   const attacks = useMemo(() => {
     const list = [];
-    const weaponNames = startingEquipment?.weapons ?? [];
+    const eq = resolvedEquipment;
+    const weaponNames = [];
+    if (eq?.mainHand && isWeaponName(eq.mainHand)) weaponNames.push(eq.mainHand);
+    if (eq?.offHand && eq.offHand !== "Bouclier" && isWeaponName(eq.offHand)) {
+      weaponNames.push(eq.offHand);
+    }
+    const unique = [...new Set(weaponNames)];
     const strMod = modifiers.FOR ?? 0;
     const dexMod = modifiers.DEX ?? 0;
 
-    for (const wName of weaponNames) {
+    for (const wName of unique) {
       const w = WEAPONS?.[wName] ?? null;
       if (!w) continue; // résilient : ignore si DB manquante
 
@@ -549,6 +586,45 @@ export default function CharacterBuilder({ onSave }) {
           : strMod;
 
       // Style Archerie : +2 aux jets d'attaque avec une arme à distance
+      const isRanged = (w?.properties ?? []).some((p) => String(p).toLowerCase().includes("munitions"));
+      const archeryBonus = isFighter && fighterStyle === "Archerie" && isRanged ? 2 : 0;
+
+      const toHit = abilityMod + proficiencyBonus + archeryBonus;
+      const dmgBonus = abilityMod;
+      const dmgDice = String(w.damage ?? "1");
+      const dmgType = w.damageType ?? "—";
+
+      list.push({
+        name: wName,
+        toHit,
+        damageDice: dmgDice,
+        damageBonus: dmgBonus,
+        damageType: dmgType,
+      });
+    }
+
+    return list;
+  }, [resolvedEquipment, modifiers, proficiencyBonus, isFighter, fighterStyle]);
+
+  /** Toutes les armes du pack (pour la fiche / moteur) — indépendant de ce qui est équipé en main. */
+  const weaponsForSave = useMemo(() => {
+    const list = [];
+    const weaponNames = startingEquipment?.weapons ?? [];
+    const strMod = modifiers.FOR ?? 0;
+    const dexMod = modifiers.DEX ?? 0;
+
+    for (const wName of weaponNames) {
+      const w = WEAPONS?.[wName] ?? null;
+      if (!w) continue;
+
+      const statTag = w.stat ?? "FOR";
+      const abilityMod =
+        statTag === "DEX"
+          ? dexMod
+          : statTag === "FINESSE"
+            ? Math.max(strMod, dexMod)
+            : strMod;
+
       const isRanged = (w?.properties ?? []).some((p) => String(p).toLowerCase().includes("munitions"));
       const archeryBonus = isFighter && fighterStyle === "Archerie" && isRanged ? 2 : 0;
 
@@ -1097,7 +1173,7 @@ export default function CharacterBuilder({ onSave }) {
     const id = Date.now();
     const hitDieValue = classObj?.hitDice;
     const hitDie = hitDieValue ? `d${hitDieValue}` : null;
-    const weaponsForState = attacks.map((a) => ({
+    const weaponsForState = weaponsForSave.map((a) => ({
       name: a.name,
       attackBonus: a.toHit,
       damageDice: a.damageDice,
@@ -1156,6 +1232,8 @@ export default function CharacterBuilder({ onSave }) {
       });
     }
 
+    const equipment = resolvedEquipment;
+
     const character = {
       id,
       type: "player",
@@ -1176,7 +1254,13 @@ export default function CharacterBuilder({ onSave }) {
       visible: true,
       isAlive: true,
       hp: { current: maxHp, max: maxHp },
-      ac: armorClass,
+      equipment,
+      ac: computePlayerArmorClass({
+        stats: finalStats,
+        entityClass: className,
+        equipment,
+        fighter: isFighter ? { fightingStyle: fighterStyle || undefined } : undefined,
+      }),
       xp: XP_BY_LEVEL[level] ?? 0,
       hitDie: hitDie || undefined,
       hitDiceTotal: level,
@@ -1553,6 +1637,91 @@ export default function CharacterBuilder({ onSave }) {
           </div>
         </div>
 
+        {/* Équipement porté (objets possédés = pack de départ ; ici vous choisissez ce qui est équipé) */}
+        {className && startingEquipment && inventory.length > 0 ? (
+          <div className="rounded-lg border border-emerald-900/50 bg-emerald-950/20 p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-emerald-100">
+                Équipement porté (SRD)
+              </h3>
+              <button
+                type="button"
+                onClick={() => {
+                  setEquippedOverride(null);
+                  setEquipBuilderError(null);
+                }}
+                className="text-xs rounded-md border border-slate-600 bg-slate-800 px-2 py-1 text-slate-200 hover:bg-slate-700"
+              >
+                Réinitialiser (défaut du pack)
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Tout le matériel du pack reste dans votre <strong className="text-slate-300">inventaire</strong>.
+              Indiquez ici ce que le personnage porte ou tient en main : armure, bouclier, armes (une arme à deux
+              mains libère la main secondaire). La CA ci-dessous se met à jour automatiquement.
+            </p>
+            {equipBuilderError ? (
+              <p className="text-xs text-amber-300 rounded-md border border-amber-800/50 bg-amber-950/30 px-2 py-1">
+                {equipBuilderError}
+              </p>
+            ) : null}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {(
+                [
+                  { slot: "armor", label: "Armure (1 seule)" },
+                  { slot: "mainHand", label: "Main principale" },
+                  { slot: "offHand", label: "Main secondaire (arme ou bouclier)" },
+                  { slot: "bottes", label: "Bottes / chaussures" },
+                  { slot: "cape", label: "Cape / manteau" },
+                  { slot: "tete", label: "Couvre-chef" },
+                  { slot: "gants", label: "Gants / gantelets" },
+                ]
+              ).map(({ slot, label }) => {
+                const eq = resolvedEquipment ?? emptyEquipment();
+                const cur =
+                  slot === "armor"
+                    ? eq.armor
+                    : slot === "mainHand"
+                      ? eq.mainHand
+                      : slot === "offHand"
+                        ? eq.offHand
+                        : slot === "bottes"
+                          ? eq.bottes
+                          : slot === "cape"
+                            ? eq.cape
+                            : slot === "tete"
+                              ? eq.tete
+                              : eq.gants;
+                const opts = (() => {
+                  const cands = inventoryCandidatesForSlot(inventory, slot);
+                  const s = new Set(cands);
+                  if (cur) s.add(cur);
+                  return [...s];
+                })();
+                return (
+                  <div key={slot} className="rounded-md border border-slate-700 bg-slate-950/60 p-2">
+                    <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-1">
+                      {label}
+                    </label>
+                    <select
+                      value={cur ?? ""}
+                      onChange={(e) => applyBuilderSlot(slot, e.target.value)}
+                      className="w-full rounded-md border border-slate-600 bg-slate-900 px-2 py-1.5 text-xs text-slate-100"
+                    >
+                      <option value="">— Rien / déséquiper —</option>
+                      {opts.map((name) => (
+                        <option key={name} value={name}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
         {/* Résumé en direct */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-4">
@@ -1668,9 +1837,15 @@ export default function CharacterBuilder({ onSave }) {
             <p>
               <span className="font-semibold">CA :</span>{" "}
               <span className="tabular-nums">{armorClass}</span>
-              <span className="text-slate-500">
-                {startingEquipment?.armor ? ` · ${startingEquipment.armor}` : ""}
-                {startingEquipment?.shield && startingEquipment.shield !== "Aucun" ? ` + ${startingEquipment.shield}` : ""}
+              <span className="text-slate-500 text-xs block mt-0.5">
+                {resolvedEquipment?.armor
+                  ? `Armure : ${resolvedEquipment.armor}`
+                  : "Sans armure (ou non équipée)"}
+                {resolvedEquipment?.offHand === "Bouclier" ? " · Bouclier" : ""}
+                {resolvedEquipment?.mainHand ? ` · Main : ${resolvedEquipment.mainHand}` : ""}
+                {resolvedEquipment?.offHand && resolvedEquipment.offHand !== "Bouclier"
+                  ? ` · Off : ${resolvedEquipment.offHand}`
+                  : ""}
               </span>
             </p>
             {raceObj && (
