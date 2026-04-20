@@ -39,6 +39,11 @@ import {
   spellDurationLine,
   spellRangeCategoryLine,
 } from "@/lib/spellDisplayMeta";
+import {
+  formatCombatTimedStatesShort,
+  getAcBonusFromCombatTimedStates,
+  normalizeCombatTimedStates,
+} from "@/lib/combatTimedStates";
 
 // Next.js 16 : évite l'échec de prerender quand `useSearchParams()` est utilisé.
 export const dynamic = "force-dynamic";
@@ -53,6 +58,14 @@ const ENTITY_TYPE_META: Record<string, { icon: string; color: string; label: str
   friendly: { icon: "🛡", color: "text-green-400",  label: "Allié"    },
   object:   { icon: "📦", color: "text-amber-400",  label: "Objet"    },
 };
+
+function getEntityTypeMetaForDisplay(entity: Entity) {
+  // Un "friendly" piloté par l'IA est un PNJ allié, pas un joueur connecté.
+  if (entity?.type === "friendly" && String((entity as any)?.controller ?? "") !== "player") {
+    return ENTITY_TYPE_META.npc;
+  }
+  return ENTITY_TYPE_META[entity?.type] ?? { icon: "?", color: "text-slate-400", label: "Inconnu" };
+}
 
 /** Initiative : tolère string ou objet incomplet (réponses JSON IA incorrectes). */
 function normalizeCombatOrderEntry(raw: unknown): CombatEntry | null {
@@ -235,7 +248,7 @@ function EntityCard({
   /** Créature hostile camouflée (moteur : jet de Discrétion vs Perception passive). */
   combatStealthHidden?: boolean;
 }) {
-  const meta = ENTITY_TYPE_META[entity.type] ?? { icon: "?", color: "text-slate-400", label: "" };
+  const meta = getEntityTypeMetaForDisplay(entity);
   const isHidden = !entity.visible;
   return (
     <div
@@ -295,7 +308,7 @@ function EntityCardFull({
   godMode: boolean;
   combatStealthHidden?: boolean;
 }) {
-  const meta = ENTITY_TYPE_META[entity.type] ?? { icon: "?", color: "text-slate-400", label: "Inconnu" };
+  const meta = getEntityTypeMetaForDisplay(entity);
   const isHidden = !entity.visible;
 
   return (
@@ -739,13 +752,17 @@ function HomeContent() {
 
   const displayedArmorClass = useMemo(() => {
     if (!player) return 10;
-    return computePlayerArmorClass({
+    let base = computePlayerArmorClass({
       stats: player.stats,
       entityClass: player.entityClass,
       equipment: player.equipment,
       fighter: player.fighter,
     });
-  }, [player]);
+    if (gameMode === "combat") {
+      base += getAcBonusFromCombatTimedStates(player.combatTimedStates);
+    }
+    return base;
+  }, [player, gameMode]);
 
   /** Sac (hors équipement porté) — hook avant tout return pour respecter l’ordre des hooks. */
   const inventaireAffiche = useMemo(() => {
@@ -880,11 +897,24 @@ function HomeContent() {
         String(a?.clientId ?? "").localeCompare(String(b?.clientId ?? ""))
       )
     : [];
+  const participantClientIdsSet = new Set(
+    (Array.isArray(multiplayerParticipants) ? multiplayerParticipants : [])
+      .map((id) => String(id ?? "").trim())
+      .filter(Boolean)
+  );
 
   const sessionParticipantEntities: Entity[] = !multiplayerSessionId
     ? []
     : sortedMultiplayerParticipantProfiles
-        .filter((profile) => profile.connected !== false)
+        .filter((profile) => {
+          if (profile.connected === false) return false;
+          const pid = String(profile?.clientId ?? "").trim();
+          if (!pid) return false;
+          // Ne garder que les profils des vrais participants connectés à la session.
+          // Evite d'afficher des PNJ/artefacts comme "Aventurier connecté".
+          if (participantClientIdsSet.size > 0 && !participantClientIdsSet.has(pid)) return false;
+          return true;
+        })
         .map(
           (profile): Entity => ({
             id: `mp-player-${profile.clientId}`,
@@ -1044,6 +1074,21 @@ function HomeContent() {
           <p className="text-3xl font-bold text-blue-300">{displayedArmorClass}</p>
         </div>
       </div>
+
+      {gameMode === "combat" && normalizeCombatTimedStates(player.combatTimedStates).length > 0 ? (
+        <div className="rounded-lg border border-amber-800/50 bg-amber-950/35 px-4 py-3 text-xs text-amber-100">
+          <span className="font-semibold uppercase tracking-wider text-amber-300/90">
+            États (combat, durée)
+          </span>
+          <p className="mt-1.5 text-amber-50/95">
+            {formatCombatTimedStatesShort(player.combatTimedStates)}
+          </p>
+          <p className="mt-1 text-[10px] text-amber-200/70">
+            Le compteur diminue à chaque début de tour dans l&apos;ordre d&apos;initiative (tous les
+            combattants).
+          </p>
+        </div>
+      ) : null}
 
       {/* Ressources suivies */}
       <div>

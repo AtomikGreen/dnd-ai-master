@@ -82,6 +82,7 @@ Voici ce que tu peux faire et comemnt le faire :
 - timeAdvanceMinutes : avance l'horloge du monde (en minutes) quand un temps notable s'écoule dans la fiction.
 - roomMemoryAppend : met à jour la mémoire de la salle seulement si cela apporte une nouveauté mécanique réelle.
 - crossRoomEntityUpdates : met à jour durablement l'état connu d'autres salles.
+- crossRoomMoves : déplace durablement une créature connue d'une salle à une autre en conservant son id (remove source + upsert destination).
 - crossRoomMemoryAppend : met à jour durablement la mémoire d'autres salles seulement si cela change réellement leur état mémorisé.
 
 COHÉRENCE OBLIGATOIRE resolution/rollRequest :
@@ -94,7 +95,7 @@ Format :
   "resolution": "no_roll_needed" | "request_roll" | "apply_consequences" | "needs_campaign_context",
   "reason": "texte court",
   "campaignContextRequest": null | { "scope": "full_campaign"|"connected_rooms", "reason": "pourquoi le contexte demandé est nécessaire" },
-  "rollRequest": null | { "kind": "gm_secret", "roll": "1d100", "reason": "..." } | { "kind": "player_check", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Perception", "dc": 10, "reason": "...", "returnToArbiter": true },
+  "rollRequest": null | { "kind": "gm_secret", "roll": "1d100", "reason": "..." } | { "kind": "player_check", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Perception", "dc": 10, "reason": "...", "returnToArbiter": true, "audience": "single"|"global"|"selected", "rollTargetEntityIds": ["mp-player-…", "..."] },
   "entityUpdates": null | [{ "action": "spawn"|"update"|"kill"|"remove", "id": "goblin_1" | "player", "name": "Gobelin grimaçant", "templateId": "goblin", "type": "hostile", "visible": true, "hp": { "current": 4, "max": 7 }, "ac": 15, "acDelta": -2, "surprised": true, "awareOfPlayer": true, "lootItems": ["18 pa"] }],
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "room_intro" },
   "gameMode": null | "combat" | "exploration",
@@ -102,6 +103,7 @@ Format :
   "engineEvent": null | { "kind": "scene_rule_resolution", "details": "..." },
   "roomMemoryAppend": null | "phrase courte factuelle (mécanique)",
   "crossRoomEntityUpdates": null | [{ "roomId": "room_7", "updates": [{ "action": "remove", "id": "goblin_1" }] }],
+  "crossRoomMoves": null | [{ "entityId": "goblin_1", "fromRoomId": "room_7", "toRoomId": "room_5", "patch": { "awareOfPlayer": true, "visible": true } }],
   "crossRoomMemoryAppend": null | [{ "roomId": "room_7", "line": "Les gobelins ont quitté la salle après avoir entendu l'alerte." }]
 }
 Le joueur est une cible valide dans entityUpdates avec id:"player". Utilise le même mécanisme que pour une créature : "update" pour modifier ses PV/CA/stats/états/inventaire, "kill" ou "remove" pour le mettre à 0 PV et hors de combat. Tous les changements d'état du joueur passent par entityUpdates.
@@ -147,7 +149,19 @@ Règles :
 - quand campaignWorldContext est fourni, tu peux lire uniquement les salles incluses dans ce contexteWorldContext (connected_rooms ou full_campaign), puis renvoyer apply_consequences avec crossRoomEntityUpdates / crossRoomMemoryAppend si nécessaire.
 - apply_consequences nouveau → utilise roomMemoryAppend / crossRoomMemoryAppend seulement si la mémoire doit réellement être mise à jour.
 - Jet requis sans rollResult → request_roll.
-- gm_secret = "XdY" seul ; player_check = stat+skill+dc+returnToArbiter ; jamais "1d20+bonus" dans roll.
+- gm_secret = "XdY" seul ; player_check = stat+skill+dc+returnToArbiter+audience ; jamais "1d20+bonus" dans roll.
+- JET JOUEUR — audience (player_check) : décide **au cas par cas** selon la fiction du moment, jamais par automatisme.
+- "single" = un seul PJ concerné.
+- "selected" = sous-groupe explicite ; dans ce cas renseigne obligatoirement "rollTargetEntityIds" (ids exacts mp-player-* des PJ concernés).
+- "global" = toute l'équipe connectée est réellement exposée au même risque / effort au même instant.
+- Interdiction : ne choisis jamais "global" par défaut.
+- Cas typiques :
+  - formulation de secret du type « le premier personnage », « la première créature », « l'éclaireur », « celui qui ouvre la marche » => audience "single" (ou "selected" si plusieurs personnes explicitement en tête), **jamais** "global" ;
+  - action spécialisée par un sous-groupe (fouille locale, acrobatie coordonnée, manipulation ciblée, aide mutuelle limitée) => audience "selected" ;
+  - véritable épreuve collective où chaque PJ doit tenter (ex. discrétion de groupe, traversée collective, perception générale simultanée) => audience "global".
+- Le moteur agrège les jets "global"/"selected" en rollResult.kind="player_check_group" (byClientId + summary). Après retour, interprète en respectant le périmètre choisi ; ne redemande pas le même jet sans nouveau fait.
+- Après rollResult.kind="player_check_group", interprète l'ensemble (qui réussit, qui échoue, le plus mauvais score pertinent pour une fuite collective, etc.) ; ne redemande pas un second request_roll identique pour la même situation sans changement fictionnel.
+- ANTI-RÉESSAI / ANTI-REJOUAGE (jets joueur déjà dans rollResult ou l'historique mécanique) : si rollResult (ou un message debug d'arbitre / une ligne [Canon moteur] en mémoire de salle) montre qu'un **même** test (même compétence + même intention de situation, ex. même Perception sur le même indice, même Investigation sur le même objet, même sauvegarde contre le même piège) a **déjà** été demandé et résolu (succès ou échec), tu ne redemandes **pas** ce jet une nouvelle fois sans nouveau fait : pas de second request_roll équivalent. Si le joueur réessaie la même stratégie après un échec sans changement de méthode / d'outils / de contexte, applique no_roll_needed ou apply_consequences (coût, bruit, temps, complication) au lieu de request_roll.
 - rollResult fourni → apply_consequences ou no_roll_needed.
 - Historique mécanique : le prompt peut inclure « Historique mécanique arbitre/moteur » et/ou des messages debug filtrés (jets secrets MJ, JSON /api/gm-arbiter). Si un jet secret MJ requis par les secrets (ex. 1d100 pour une embuscade) y figure déjà comme résolu pour ce passage de jeu, tu ne redemandes JAMAIS le même request_roll gm_secret : tu appliques apply_consequences (ou no_roll_needed) en utilisant ce résultat.
 - Si rollResult est un jet de compétence joueur déjà résolu (Investigation, Perception, etc.) et que les secrets mentionnent aussi un jet secret MJ distinct : vérifie d'abord l'historique mécanique ; ne lance pas une seconde fois un gm_secret déjà tiré dans cette chaîne.
@@ -155,6 +169,7 @@ Règles :
 - CONTRAINTE D'INTENTION : "sourceAction" (texte joueur) et "intentDecision" décrivent déjà ce que le joueur essaie de faire ; tu ne remplaces jamais cette action par une autre.
 - Hiérarchie stricte pour l'action tentée : 1) texte du joueur / sourceAction, 2) intentDecision, 3) secrets du lieu, 4) inventaire / outils / capacités. Les niveaux 3 et 4 peuvent seulement autoriser, bloquer ou qualifier l'action tentée ; ils ne peuvent jamais en inventer une nouvelle.
 - Tu ne transformes jamais une tentative de passage, d'entrée, d'approche, d'ouverture générale ou de déplacement en crochetage, forçage, désamorçage, fouille, soin, attaque, fuite, prise d'objet, ou toute autre sous-action technique non explicitement déclarée.
+- SEUIL vs ENTREE DANS LA PIECE (derriere la porte fermee) : si sourceAction decrit suivre ou longer un couloir ET ecouter a la porte, coller l'oreille, epier, regarder par l'entrebaillement ou equivalent, le PJ est au seuil (couloir / antichambre), pas encore dans la piece derriere la porte fermee. Ne presuppose jamais qu'ils ont franchi la porte ; ne declenche pas les secrets du type « quand ils ouvrent la porte de cette piece » tant que la fiction n'a pas une ouverture ou un franchissement explicite. Un request_roll Perception pour des bruits derriere la porte est coherent ; sceneUpdate vers la salle interieure reste interdit sauf transition deja posee par le moteur / intentDecision.
 - Le fait que le joueur possède des outils de voleur, une clef, un sort, une arme, une compétence ou une autre ressource ne signifie JAMAIS qu'il choisit automatiquement de les utiliser.
 - Les secrets du lieu décrivent ce qui serait possible SI le joueur choisissait explicitement cette méthode ; ils ne t'autorisent jamais à sélectionner cette méthode à sa place.
 - Si "intentDecision" dit qu'une action est impossible à cause d'un obstacle (porte verrouillée, passage bloqué, vide, mur, etc.), tu ne requalifies jamais cela en "request_roll" pour une autre action technique, sauf si le texte du joueur ou "intentDecision" mentionne explicitement cette autre action.
@@ -166,9 +181,11 @@ Règles :
 - Si plusieurs créatures proches / du même template apparaissent dans la même scène, donne à chacune un nom distinct et mémorable (ex. 'Gobelin grimaçant', 'Gobelin malade'). Ne laisse jamais le moteur les renommer à ta place.
 - N'utilise pas des noms froids ou ambigus du type 'Gobelin', 'Gobelin 2', 'Créature', 'Créature A'. Donne directement un nom final différenciant.
 - CONTRAINTE TEMPLATE (spawn) : pour toute créature non-joueur, entityUpdates.action="spawn" DOIT inclure un templateId valide présent dans la liste bestiaryTemplateIds fournie dans le prompt utilisateur. N'invente jamais un templateId hors liste.
+- PNJ SANS FICHE (module) : pour un personnage nommé dans la fiction mais sans stat block officiel, utilise templateId="pnj_generique", un "name" et un "id" explicites (souvent l'id prévu dans encounterEntities de la salle), et des champs légers : "description", "race", "entityClass", "type" (friendly/npc/hostile), "hp" si les secrets imposent un état (ex. 0 PV), "conditions" si besoin. Ne réinvente pas une fiche de monstre complète ; le gabarit fournit des stats de combat modestes.
 - Lors d'un spawn hostile, privilégie templateId + name + états (awareOfPlayer, surprised, visible, looted/lootItems). N'essaie pas de reconstruire manuellement toutes les stats de combat ; le moteur initialise la créature depuis le template.
 - Un entityUpdates.action="update" sur une entité absente n'engendre plus aucun spawn implicite côté moteur. Si tu veux créer une créature, utilise explicitement action="spawn".
 - RELOCALISATION D'UN PNJ DÉJÀ CONNU : si la fiction dit qu'une créature déjà connue fuit, se replie, change de salle, rattrape le groupe ou réapparaît ailleurs, tu dois conserver son identité existante. Réutilise le MÊME id via update / crossRoomEntityUpdates, et au besoin remove depuis l'ancienne salle ; ne crée jamais un nouveau spawn avec un autre id pour le même personnage.
+- Pour une relocalisation inter-salles, privilégie crossRoomMoves (plus sûr) ; crossRoomEntityUpdates reste autorisé pour cas avancés.
 - Si une créature portant déjà le même nom existe dans entities, dans resume_etat_entites_verite, ou dans le contexte de campagne fourni, considère que c'est le même individu sauf secret explicite de doublon. Dans ce cas, interdiction de renvoyer action="spawn" avec un nouvel id.
 - Exemple interdit : le Chef Gobelin Tremblant existe déjà comme goblin_chef, puis tu renvoies un spawn goblin_chief dans une autre salle. Exemple correct : update/crossRoomEntityUpdates sur goblin_chef pour refléter sa nouvelle position, sa visibilité ou son état.
 - COMBAT = moteur souverain : tu n'inventes JAMAIS le déroulement ordinaire d'un combat.
@@ -240,6 +257,9 @@ function truncate(s, n = 1000) {
 function classifyRollResultForArbiter(rollResult) {
   if (rollResult == null || typeof rollResult !== "object") return "aucun";
   if (String(rollResult.kind ?? "").trim() === "gm_secret") return "jet_secret_mj_resolu";
+  if (String(rollResult.kind ?? "").trim() === "player_check_group") {
+    return "jet_competence_groupe_joueurs_resolu";
+  }
   if (
     rollResult.skill != null ||
     rollResult.nat != null ||
@@ -423,6 +443,7 @@ function applyGmArbiterAntiReplayGuard(parsed, { sourceAction, intentDecision, m
       engineEvent: null,
       roomMemoryAppend: null,
       crossRoomEntityUpdates: null,
+      crossRoomMoves: null,
       crossRoomMemoryAppend: null,
     },
   };
@@ -629,7 +650,17 @@ const ABILITY_STATS = ["FOR", "DEX", "CON", "INT", "SAG", "CHA"];
 /** Corrige les anciennes réponses LLM (ex: roll "1d20+2" pour Perception) → player_check. */
 function normalizeGmArbiterRollRequest(rr, currentRoomSecrets) {
   if (!rr || typeof rr !== "object") return rr;
-  if (rr.kind === "player_check") return rr;
+  if (rr.kind === "player_check") {
+    const aud = String(rr.audience ?? "single").trim().toLowerCase();
+    const audience = aud === "global" ? "global" : aud === "selected" ? "selected" : "single";
+    const out = { ...rr, audience };
+    if (audience === "selected" && Array.isArray(rr.rollTargetEntityIds)) {
+      out.rollTargetEntityIds = [...new Set(rr.rollTargetEntityIds.map((x) => String(x ?? "").trim()).filter(Boolean))];
+    } else {
+      delete out.rollTargetEntityIds;
+    }
+    return out;
+  }
 
   const roll = String(rr.roll ?? "").trim();
   const reason = String(rr.reason ?? "");
@@ -705,6 +736,7 @@ function normalizeGmArbiterRollRequest(rr, currentRoomSecrets) {
     dc,
     reason: reason || `Test (DD ${dc})`,
     returnToArbiter: true,
+    audience: "single",
   };
 }
 
@@ -754,6 +786,23 @@ function safeParseGmArbiterJson(raw, context = {}) {
         if (!Number.isFinite(dc)) {
           return { ok: false, error: "rollRequest.dc invalide (player_check)." };
         }
+        const audRaw = String(rawR.audience ?? "single").trim().toLowerCase();
+        let audience =
+          audRaw === "global" ? "global" : audRaw === "selected" ? "selected" : "single";
+        const entSet = new Set(
+          (Array.isArray(context.entities) ? context.entities : [])
+            .map((e) => String(e?.id ?? "").trim())
+            .filter(Boolean)
+        );
+        const rawTids = rawR.rollTargetEntityIds;
+        let rollTargetEntityIds =
+          audience === "selected" && Array.isArray(rawTids)
+            ? [...new Set(rawTids.map((x) => String(x ?? "").trim()).filter((id) => entSet.has(id)))]
+            : undefined;
+        if (audience === "selected" && (!rollTargetEntityIds || !rollTargetEntityIds.length)) {
+          audience = "single";
+          rollTargetEntityIds = undefined;
+        }
         rollRequest = {
           kind: "player_check",
           stat,
@@ -764,6 +813,10 @@ function safeParseGmArbiterJson(raw, context = {}) {
               ? `Test (${stat})`
               : String(rawR.reason).trim(),
           returnToArbiter: true,
+          audience,
+          ...(audience === "selected" && rollTargetEntityIds?.length
+            ? { rollTargetEntityIds }
+            : {}),
         };
       } else {
         const roll = String(rawR.roll ?? "").trim();
@@ -898,6 +951,23 @@ function safeParseGmArbiterJson(raw, context = {}) {
           .filter(Boolean)
       : null;
 
+    const crossRoomMoves = Array.isArray(data.crossRoomMoves)
+      ? data.crossRoomMoves
+          .map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+            const entityId = String(entry.entityId ?? "").trim();
+            const fromRoomId = String(entry.fromRoomId ?? "").trim();
+            const toRoomId = String(entry.toRoomId ?? "").trim();
+            if (!entityId || !fromRoomId || !toRoomId || fromRoomId === toRoomId) return null;
+            const patch =
+              entry.patch && typeof entry.patch === "object" && !Array.isArray(entry.patch)
+                ? entry.patch
+                : null;
+            return { entityId, fromRoomId, toRoomId, patch };
+          })
+          .filter(Boolean)
+      : null;
+
     const crossRoomMemoryAppend = Array.isArray(data.crossRoomMemoryAppend)
       ? data.crossRoomMemoryAppend
           .map((entry) => {
@@ -926,6 +996,7 @@ function safeParseGmArbiterJson(raw, context = {}) {
         engineEvent,
         roomMemoryAppend,
         crossRoomEntityUpdates,
+        crossRoomMoves,
         crossRoomMemoryAppend,
       },
     };
@@ -1015,6 +1086,7 @@ export async function POST(request) {
           engineEvent: null,
           roomMemoryAppend: null,
           crossRoomEntityUpdates: null,
+          crossRoomMoves: null,
           crossRoomMemoryAppend: null,
         },
         { status: 200 }
@@ -1092,6 +1164,11 @@ export async function POST(request) {
             ...(rollKindForConstraint === "jet_competence_ou_sauvegarde_joueur_resolu"
               ? [
                   "CONTRAINTE (jet joueur déjà résolu dans rollResult) : ce n'est PAS un jet secret MJ. Si les secrets exigent aussi un jet secret MJ (ex. 1d100 embuscade), consulte « Historique mécanique arbitre/moteur » et les messages debug d'arbitre : si ce jet secret figure déjà comme tiré, interdiction de request_roll gm_secret ; applique apply_consequences avec ce tirage.",
+                ]
+              : []),
+            ...(rollKindForConstraint === "jet_competence_groupe_joueurs_resolu"
+              ? [
+                  "CONTRAINTE (jet de groupe déjà résolu dans rollResult) : rollResult contient kind=player_check_group avec byClientId (un résultat par joueur) et summary. Interprète la situation globale (ex. discrétion de groupe : le plan le plus fragile / le bruit le plus fort / qui est repéré) en t'appuyant sur les totaux et succès/échecs ; ne redemande pas le même request_roll player_check (single ou global) pour la même scène sans nouveau fait.",
                 ]
               : []),
             ...(rollKindForConstraint === "jet_secret_mj_resolu"

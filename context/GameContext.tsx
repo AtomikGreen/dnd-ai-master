@@ -181,6 +181,12 @@ export interface CombatantBase {
   surprised?: boolean;
 }
 
+/** Effets de combat à durée (décrémentés par le moteur à chaque début de tour d’initiative). */
+export interface CombatTimedStateEntry {
+  stateId: string;
+  rounds: number;
+}
+
 export interface Player {
   /** Pré-tirés / créateur : identifiant stable pour savoir si le joueur a changé de perso. */
   id?: string | number;
@@ -222,6 +228,8 @@ export interface Player {
   hitDiceRemaining?: number;
   /** États D&D (prone, blinded, poisoned, …) pour avantage/désavantage. */
   conditions?: string[];
+  /** États temporels de combat (ex. bouclier magique) : `rounds` = pas d’initiative restants. */
+  combatTimedStates?: CombatTimedStateEntry[];
   /** État D&D 5e à 0 PV : inconscience, stabilisation, jets contre la mort, mort. */
   deathState?: DeathState;
   /** Minute monde du dernier repos long effectivement bénéficié. */
@@ -364,6 +372,25 @@ export interface PendingRoll {
   rollMode?: "normal" | "advantage" | "disadvantage" | "cancelled";
   /** Libellé court pour le résumé de chat (ex. « empoisonné »). */
   advDisReason?: string;
+  /**
+   * Jet de compétence demandé par l'arbitre de scène : `single` = un seul PJ (défaut),
+   * `global` = tous les PJ connectés doivent lancer avant une seule relance arbitre,
+   * `selected` = sous-ensemble explicite (`rollTargetEntityIds`, ids d'entités PJ type `mp-player-…`).
+   */
+  audience?: "single" | "global" | "selected";
+  /** Avec `audience: "selected"` : ids d'entité (bloc Entités) qui doivent chacun lancer le même test. */
+  rollTargetEntityIds?: string[];
+  /** En MP : résultats partiels d'un jet de groupe (clé = clientId Firestore du joueur). */
+  globalRollsByClientId?: Record<
+    string,
+    { nat: number; total: number; success: boolean | null; playerName?: string | null }
+  >;
+  /** DD pour jets de compétence / sauvegarde (arbitre, pièges, etc.). */
+  dc?: number | null;
+  /** Après résolution, relance unique `/api/gm-arbiter` avec le résultat structuré. */
+  returnToArbiter?: boolean;
+  /** Contexte sérialisé pour la relance arbitre (jet lieu / piège). */
+  sceneArbiterContext?: Record<string, unknown> | null;
 }
 
 export interface DeathState {
@@ -425,6 +452,37 @@ function shouldRetainLocalHitDiePendingRoll(
   if (localPr.forClientId && cid && String(localPr.forClientId).trim() === cid) return true;
   if (!localPr.forPlayerId && !localPr.forClientId) return true;
   return false;
+}
+
+function globalSkillPendingRollSignature(pr: PendingRoll | null | undefined): string {
+  if (!pr || typeof pr !== "object") return "";
+  const ctx = pr.sceneArbiterContext as Record<string, unknown> | null | undefined;
+  const rid = ctx?.roomId != null ? String(ctx.roomId).trim() : "";
+  const dc = typeof pr.dc === "number" && Number.isFinite(pr.dc) ? String(Math.trunc(pr.dc)) : "";
+  const aud = String(pr.audience ?? "").trim();
+  const tgt =
+    aud === "selected" && Array.isArray(pr.rollTargetEntityIds)
+      ? [...new Set(pr.rollTargetEntityIds.map((x) => String(x ?? "").trim()).filter(Boolean))].sort().join(",")
+      : "";
+  return `${rid}|${String(pr.stat ?? "").trim()}|${String(pr.skill ?? "").trim()}|${dc}|${aud}|${tgt}`;
+}
+
+function mergeGlobalSkillCheckPendingRolls(
+  remotePr: PendingRoll,
+  localPr: PendingRoll | null | undefined
+): PendingRoll {
+  const rMap =
+    remotePr.globalRollsByClientId && typeof remotePr.globalRollsByClientId === "object"
+      ? { ...remotePr.globalRollsByClientId }
+      : {};
+  const lMap =
+    localPr?.globalRollsByClientId && typeof localPr.globalRollsByClientId === "object"
+      ? localPr.globalRollsByClientId
+      : {};
+  return {
+    ...remotePr,
+    globalRollsByClientId: { ...rMap, ...lMap },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +593,8 @@ export interface Entity {
   awareOfPlayer?: boolean;
   /** États D&D (prone, blinded, poisoned, invisible, …) — avantage/désavantage au combat. */
   conditions?: string[];
+  /** États temporels de combat (ex. bouclier magique). */
+  combatTimedStates?: CombatTimedStateEntry[];
 }
 
 /** Mise à jour partielle d'une entité envoyée par l'IA */
@@ -570,6 +630,8 @@ export interface EntityUpdate {
   awareOfPlayer?: boolean;
   /** Remplace la liste d'états D&D (prone, blinded, …). */
   conditions?: string[];
+  /** Remplace les états de combat à durée (bouclier, …). */
+  combatTimedStates?: CombatTimedStateEntry[] | null;
   /** Modificateur additif d'AC (ex: -2 si pas de bouclier). */
   acDelta?: number;
   /** Modificateurs additifs de caractéristiques (FOR/DEX/CON/INT/SAG/CHA). */
@@ -1266,6 +1328,30 @@ function isHostileReadyForCombat(entity: Entity | null | undefined): boolean {
   return !!entity && entity.type === "hostile" && entity.isAlive && entity.awareOfPlayer !== false;
 }
 
+function promoteHostilesAwareWhenInitiativeOpen(
+  entities: Entity[],
+  payload: {
+    awaitingPlayerInitiative?: boolean | null;
+    waitForGmNarrationForInitiative?: boolean | null;
+    gameMode?: GameMode | null;
+    combatOrder?: CombatEntry[] | null;
+  }
+): Entity[] {
+  const initiativeOpen =
+    payload?.awaitingPlayerInitiative === true ||
+    payload?.waitForGmNarrationForInitiative === true;
+  if (!initiativeOpen) return entities;
+
+  let changed = false;
+  const next = entities.map((ent) => {
+    if (!ent || ent.type !== "hostile" || ent.isAlive === false) return ent;
+    if (ent.awareOfPlayer === true) return ent;
+    changed = true;
+    return { ...ent, awareOfPlayer: true };
+  });
+  return changed ? next : entities;
+}
+
 /** Brouillon d'initiative PNJ : même ensemble d'ids que les hostiles prêts au combat (nouvelle escarmouche). */
 function npcInitiativeDraftMatchesHostiles(draft: CombatEntry[], hostiles: Entity[]): boolean {
   if (!Array.isArray(draft) || !Array.isArray(hostiles)) return false;
@@ -1409,8 +1495,14 @@ function appendLocalEntitiesAbsentFromRemote(local: Entity[], remote: unknown): 
 
 /**
  * Un snapshot Firestore peut arriver avant flushMultiplayerSharedState et réinjecter d'anciens PV.
- * On garde donc la valeur la plus basse entre local et remote pour éviter les "résurrections" visuelles
- * (ex: ennemi à 0 PV qui remonte à 2/11 après un snapshot retardé).
+ *
+ * **Hostiles** : si le distant a plus de PV que le local (`ic > pc`), on garde le local — évite qu'un
+ * snapshot retardé « ressuscite » un ennemi déjà blessé ici. Sinon on prend le distant (dégâts).
+ *
+ * **Non-hostiles** : cas fréquent MP — le journal affiche un soin (PV locaux à jour) puis un snapshot
+ * distant encore à **0 PV** écrase l'affichage. Règle : si `ic === 0` et `pc > 0`, garder `pc`.
+ * Sinon : si `ic > pc` prendre `ic` (soin / état réseau plus haut) ; si `ic < pc` prendre `ic`
+ * (dégâts distants). Symétrique à l'hostile sauf le cas snapshot « 0 » périmé.
  */
 function mergeIncomingEntitiesHpWithPrev(prevEnts: Entity[], incoming: Entity[]): Entity[] {
   const prevById = new Map(prevEnts.map((e) => [e.id, e]));
@@ -1421,7 +1513,17 @@ function mergeIncomingEntitiesHpWithPrev(prevEnts: Entity[], incoming: Entity[])
     const ic = typeof inc.hp.current === "number" ? inc.hp.current : NaN;
     if (!Number.isFinite(pc) || !Number.isFinite(ic)) return inc;
     if (pc === ic) return inc;
-    const mergedCurrent = ic > pc ? pc : ic;
+    const isHostile = String((inc as any)?.type ?? "").toLowerCase() === "hostile";
+    let mergedCurrent;
+    if (isHostile) {
+      mergedCurrent = ic > pc ? pc : ic;
+    } else if (ic === 0 && pc > 0) {
+      mergedCurrent = pc;
+    } else if (ic > pc) {
+      mergedCurrent = ic;
+    } else {
+      mergedCurrent = ic;
+    }
     if (mergedCurrent === ic) return inc;
     const id = String(inc.id ?? "").trim();
     const controller = String((inc as any)?.controller ?? "").trim();
@@ -2064,52 +2166,31 @@ function cloneMeleeStateRecord(s: Record<string, string[]>): Record<string, stri
 }
 
 /**
- * Ferme transitivement la mêlée:
- * si A est au contact de B et B de C, alors A, B et C sont tous mutuellement au contact.
+ * Normalise le graphe de mêlée en paires DIRECTES symétriques (A<->B),
+ * sans fermeture transitive (A-B et B-C n'impliquent pas A-C).
  */
 function normalizeMeleeStateTransitive(raw: Record<string, string[]>): Record<string, string[]> {
-  const nodeSet = new Set<string>();
-  for (const [k, peers] of Object.entries(raw ?? {})) {
-    const kk = String(k ?? "").trim();
-    if (!kk) continue;
-    nodeSet.add(kk);
-    for (const p of Array.isArray(peers) ? peers : []) {
-      const pp = String(p ?? "").trim();
-      if (pp && pp !== kk) nodeSet.add(pp);
-    }
-  }
-  const nodes = [...nodeSet];
   const adj = new Map<string, Set<string>>();
-  for (const n of nodes) adj.set(n, new Set<string>());
+  const ensure = (id: string) => {
+    if (!adj.has(id)) adj.set(id, new Set<string>());
+  };
+
   for (const [k, peers] of Object.entries(raw ?? {})) {
     const a = String(k ?? "").trim();
-    if (!a || !adj.has(a)) continue;
+    if (!a) continue;
+    ensure(a);
     for (const p of Array.isArray(peers) ? peers : []) {
       const b = String(p ?? "").trim();
-      if (!b || b === a || !adj.has(b)) continue;
+      if (!b || b === a) continue;
+      ensure(b);
       adj.get(a)!.add(b);
       adj.get(b)!.add(a);
     }
   }
+
   const out: Record<string, string[]> = {};
-  const seen = new Set<string>();
-  for (const start of nodes) {
-    if (seen.has(start)) continue;
-    const stack = [start];
-    const comp: string[] = [];
-    seen.add(start);
-    while (stack.length > 0) {
-      const cur = stack.pop() as string;
-      comp.push(cur);
-      for (const nxt of adj.get(cur) ?? []) {
-        if (seen.has(nxt)) continue;
-        seen.add(nxt);
-        stack.push(nxt);
-      }
-    }
-    for (const id of comp) {
-      out[id] = comp.filter((x) => x !== id);
-    }
+  for (const [id, peers] of adj.entries()) {
+    out[id] = [...peers].filter((x) => x !== id);
   }
   return out;
 }
@@ -2998,6 +3079,19 @@ export function GameProvider({ children }: { children: ReactNode }) {
       ) {
         nextPr = pendingRollRef.current;
       } else if (
+        !!multiplayerSessionId &&
+        nextPr &&
+        pendingRollRef.current &&
+        nextPr.kind === "check" &&
+        pendingRollRef.current.kind === "check" &&
+        (nextPr.audience === "global" || nextPr.audience === "selected") &&
+        (pendingRollRef.current.audience === "global" || pendingRollRef.current.audience === "selected") &&
+        nextPr.returnToArbiter === true &&
+        pendingRollRef.current.returnToArbiter === true &&
+        globalSkillPendingRollSignature(nextPr) === globalSkillPendingRollSignature(pendingRollRef.current)
+      ) {
+        nextPr = mergeGlobalSkillCheckPendingRolls(nextPr, pendingRollRef.current);
+      } else if (
         nextPr &&
         typeof nextPr === "object" &&
         nextPr.kind === "damage_roll" &&
@@ -3012,14 +3106,29 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setPendingRollState(nextPr);
     }
     setIsGameStarted(!!p.isGameStarted);
-    setCurrentSceneName(typeof p.currentSceneName === "string" ? p.currentSceneName : DEFAULT_SCENE_NAME);
-    setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
     const localRoomBeforeApply = currentRoomIdLiveRef.current;
     const localSvBeforeApply = sceneVersionRef.current;
-    setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
-    const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
-    let hostileCheckEntities: Entity[] = loadedEntities;
-    if (Array.isArray(p.entities)) {
+    const remoteSv = typeof p.sceneVersion === "number" ? p.sceneVersion : 0;
+    const incomingRoomId = typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village";
+    const staleRoomRegression =
+      remoteSv < localSvBeforeApply &&
+      typeof incomingRoomId === "string" &&
+      incomingRoomId.trim() &&
+      incomingRoomId.trim() !== localRoomBeforeApply;
+    if (staleRoomRegression) {
+      setCurrentRoomId(localRoomBeforeApply);
+      setCurrentSceneName(currentSceneNameLiveRef.current || DEFAULT_SCENE_NAME);
+      setCurrentScene(currentSceneLiveRef.current || DEFAULT_SCENE_DESCRIPTION);
+    } else {
+      setCurrentRoomId(incomingRoomId);
+      setCurrentSceneName(typeof p.currentSceneName === "string" ? p.currentSceneName : DEFAULT_SCENE_NAME);
+      setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
+    }
+    const loadedEntitiesRaw = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
+    const loadedEntities = promoteHostilesAwareWhenInitiativeOpen(loadedEntitiesRaw, p);
+    const shouldApplyRemoteRoomScopedState = !staleRoomRegression;
+    let hostileCheckEntities: Entity[] = entitiesRef.current ?? [];
+    if (shouldApplyRemoteRoomScopedState && Array.isArray(p.entities)) {
       const prevEnts = (entitiesRef.current ?? []) as Entity[];
       // Toujours fusionner : `mergeIncomingEntitiesHpWithPrev` empêche un snapshot Firestore « en retard »
       // (PV encore pleins avant flush local) d'écraser des dégâts déjà appliqués ici (ic > pc → garde pc).
@@ -3034,6 +3143,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
         localSvBeforeApply
       );
       const mergedWithLocalHp = mergeIncomingEntitiesHpWithPrev(prevEnts, mergedEntities);
+      const mergedWithInitiativeAwareness = promoteHostilesAwareWhenInitiativeOpen(mergedWithLocalHp, p);
       const incomingEmpty = mergedWithLocalHp.length === 0;
       const skipEmptyWipe =
         incomingEmpty &&
@@ -3042,17 +3152,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
         p.gameMode === "combat" &&
         (!Array.isArray(p.combatOrder) || p.combatOrder.length === 0);
       if (!skipEmptyWipe) {
-        entitiesRef.current = mergedWithLocalHp as Entity[];
-        setEntities(mergedWithLocalHp as Entity[]);
-        hostileCheckEntities = mergedWithLocalHp;
+        entitiesRef.current = mergedWithInitiativeAwareness as Entity[];
+        setEntities(mergedWithInitiativeAwareness as Entity[]);
+        hostileCheckEntities = mergedWithInitiativeAwareness;
       } else {
         hostileCheckEntities = prevEnts;
       }
     }
-    const remoteSv = typeof p.sceneVersion === "number" ? p.sceneVersion : 0;
     setSceneVersion(Math.max(remoteSv, localSvBeforeApply));
 
-    if (!skipRemotePendingRollApplyRef.current) {
+    if (!skipRemotePendingRollApplyRef.current && shouldApplyRemoteRoomScopedState) {
       if (p.entitiesByRoom && typeof p.entitiesByRoom === "object" && !Array.isArray(p.entitiesByRoom)) {
         const nextMap: Record<string, Entity[]> = {};
         for (const [k, v] of Object.entries(p.entitiesByRoom)) {
@@ -3078,9 +3187,18 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setRoomMemoryByRoom({});
     }
     const hostileAlive = hostileCheckEntities.some((e) => isHostileReadyForCombat(e));
+    const hostilePresent = hostileCheckEntities.some(
+      (e) => e?.type === "hostile" && e.isAlive !== false
+    );
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
     const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
+    const localInitiativeFlowActive =
+      awaitingPlayerInitiativeRef.current ||
+      waitForGmNarrationForInitiativeRef.current ||
+      (Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0) ||
+      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
+      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3095,14 +3213,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
       // parce qu'encore des hostiles vivants / un vieux combatOrder (sinon MJ reste en exploration).
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !preserveCombatFromPayload) {
+        } else if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActive) {
           // Ordre d'initiative distant souvent encore rempli alors que tous les hostiles sont morts :
           // sans ce garde, `hasCombatOrder` seul forçait le mode combat indéfiniment.
           setGameModeState("exploration");
         } else {
           const shouldCombat =
             hasCombatOrder ||
+            localInitiativeFlowActive ||
             (want === "exploration" && hostileAlive) ||
+            (want === "combat" && hostilePresent) ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);
         }
@@ -3131,24 +3251,29 @@ export function GameProvider({ children }: { children: ReactNode }) {
         ? Math.trunc(p.initiativeStateUpdatedAtMs)
         : 0;
     const hasCombatOrderInPayload = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
+    const hasLocalCombatOrder = Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0;
+    const mayBootstrapCombatOrder = hasCombatOrderInPayload && !hasLocalCombatOrder;
+    const mayRefreshCombatOrderWithSeq = hasCombatOrderInPayload && incomingTurnWriteSeq !== null;
     const hasAnyInitiativeRollInPayload =
       p.playerInitiativeRollsByEntityId &&
       typeof p.playerInitiativeRollsByEntityId === "object" &&
       !Array.isArray(p.playerInitiativeRollsByEntityId) &&
       Object.keys(p.playerInitiativeRollsByEntityId as Record<string, number>).length > 0;
-    // Anti-stale : par défaut on n'applique que si le snapshot est >= local,
-    // mais on force l'application si le serveur a déjà progressé l'initiative
-    // (ordre final / rolls déjà reçus) : sinon l'UI redemande à tort sur reload.
+    const incomingInitiativeFlowOpen =
+      p.awaitingPlayerInitiative === true || p.waitForGmNarrationForInitiative === true;
+    // Anti-stale : par défaut on n'applique que si le snapshot est >= local.
+    // Autoriser aussi les snapshots qui portent un ordre/fusion de jets pour converger en multijoueur.
     const canApplyIncomingInitiative =
-      incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current || hasCombatOrderInPayload || hasAnyInitiativeRollInPayload;
-    /** Ref locale (bump clear-wait, etc.) avant ce merge — ne pas réarmer `wait` depuis un snapshot plus vieux. */
-    const initiativeMsBaselineBeforeInitiativeMerge = initiativeStateUpdatedAtMsRef.current;
+      incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current ||
+      mayBootstrapCombatOrder ||
+      mayRefreshCombatOrderWithSeq ||
+      (hasAnyInitiativeRollInPayload && incomingInitiativeFlowOpen);
     if (canApplyIncomingInitiative) {
       initiativeStateUpdatedAtMsRef.current = Math.max(
         initiativeStateUpdatedAtMsRef.current,
         incomingInitiativeMs
       );
-      if (!hostileAlive && !preserveCombatFromPayload) {
+      if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActive) {
         setCombatOrderState([]);
         combatOrderRef.current = [];
         combatTurnWriteSeqRef.current = 0;
@@ -3208,19 +3333,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {
-            const trustIncomingAwaitingFalse =
-              incomingInitiativeMs >= initiativeMsBaselineBeforeInitiativeMerge ||
-              hasCombatOrderInPayload;
-            if (trustIncomingAwaitingFalse) {
-              awaitingPlayerInitiativeRef.current = false;
-              setAwaitingPlayerInitiativeState(false);
-            }
+            awaitingPlayerInitiativeRef.current = false;
+            setAwaitingPlayerInitiativeState(false);
           } else {
-            const nextAwaiting = (hostileAlive || hasCombatOrder) && p.awaitingPlayerInitiative;
+            const nextAwaiting =
+              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActive) &&
+              p.awaitingPlayerInitiative;
             awaitingPlayerInitiativeRef.current = nextAwaiting;
             setAwaitingPlayerInitiativeState(nextAwaiting);
           }
-        } else if (!hostileAlive && !hasCombatOrder) {
+        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActive) {
           awaitingPlayerInitiativeRef.current = false;
           setAwaitingPlayerInitiativeState(false);
         }
@@ -3231,16 +3353,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
             nextWait = false;
           } else {
             const barrierMs = waitNarrationClearBarrierMsRef.current;
-            const mayRearmNarrationWait =
-              hasCombatOrderInPayload ||
-              incomingInitiativeMs > barrierMs ||
-              barrierMs === 0;
-            nextWait = !!((hostileAlive || hasCombatOrder) && mayRearmNarrationWait);
+            const mayRearmNarrationWait = incomingInitiativeMs > barrierMs || barrierMs === 0;
+            nextWait = !!(
+              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActive) &&
+              mayRearmNarrationWait
+            );
           }
           waitForGmNarrationForInitiativeSyncRef.current = nextWait;
           waitForGmNarrationForInitiativeRef.current = nextWait;
           setWaitForGmNarrationForInitiativeState(nextWait);
-        } else if (!hostileAlive && !hasCombatOrder) {
+        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActive) {
           waitForGmNarrationForInitiativeSyncRef.current = false;
           waitForGmNarrationForInitiativeRef.current = false;
           setWaitForGmNarrationForInitiativeState(false);
@@ -3421,7 +3543,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
     setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
     setSceneVersion(typeof p.sceneVersion === "number" ? p.sceneVersion : 0);
-    const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
+    const loadedEntitiesRaw = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
+    const loadedEntities = promoteHostilesAwareWhenInitiativeOpen(loadedEntitiesRaw, p);
     if (Array.isArray(p.entities)) {
       entitiesRef.current = loadedEntities as Entity[];
       setEntities(loadedEntities as Entity[]);
@@ -3451,9 +3574,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setRoomMemoryByRoom({});
     }
     const hostileAlive = loadedEntities.some((e) => isHostileReadyForCombat(e));
+    const hostilePresent = loadedEntities.some((e) => e?.type === "hostile" && e.isAlive !== false);
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
     const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
+    const localInitiativeFlowActiveP =
+      awaitingPlayerInitiativeRef.current ||
+      waitForGmNarrationForInitiativeRef.current ||
+      (Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0) ||
+      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
+      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3464,12 +3594,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
         const want = p.gameMode;
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !preserveCombatFromPayload) {
+        } else if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActiveP) {
           setGameModeState("exploration");
         } else {
           const shouldCombat =
             hasCombatOrder ||
+            localInitiativeFlowActiveP ||
             (want === "exploration" && hostileAlive) ||
+            (want === "combat" && hostilePresent) ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);
         }
@@ -3481,20 +3613,25 @@ export function GameProvider({ children }: { children: ReactNode }) {
           ? Math.trunc(p.initiativeStateUpdatedAtMs)
           : 0;
       const hasCombatOrderInPayloadP = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
+      const hasLocalCombatOrderP = Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0;
+      const mayBootstrapCombatOrderP = hasCombatOrderInPayloadP && !hasLocalCombatOrderP;
+      const incomingTurnWriteSeqP =
+        typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
+          ? Math.trunc(p.combatTurnWriteSeq)
+          : null;
+      const mayRefreshCombatOrderWithSeqP = hasCombatOrderInPayloadP && incomingTurnWriteSeqP !== null;
       const hasAnyInitiativeRollInPayloadP =
         p.playerInitiativeRollsByEntityId &&
         typeof p.playerInitiativeRollsByEntityId === "object" &&
         !Array.isArray(p.playerInitiativeRollsByEntityId) &&
         Object.keys(p.playerInitiativeRollsByEntityId as Record<string, number>).length > 0;
+      const incomingInitiativeFlowOpenP =
+        p.awaitingPlayerInitiative === true || p.waitForGmNarrationForInitiative === true;
       const canApplyIncomingInitiativeP =
         incomingInitiativeMsP >= initiativeStateUpdatedAtMsRef.current ||
-        hasCombatOrderInPayloadP ||
-        hasAnyInitiativeRollInPayloadP;
-      const initiativeMsBaselineBeforePersistInitiativeMerge = initiativeStateUpdatedAtMsRef.current;
-      const incomingTurnWriteSeqP =
-        typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
-          ? Math.trunc(p.combatTurnWriteSeq)
-          : null;
+        mayBootstrapCombatOrderP ||
+        mayRefreshCombatOrderWithSeqP ||
+        (hasAnyInitiativeRollInPayloadP && incomingInitiativeFlowOpenP);
       const staleCombatTurnWriteP =
         incomingTurnWriteSeqP !== null && incomingTurnWriteSeqP < combatTurnWriteSeqRef.current;
       if (canApplyIncomingInitiativeP) {
@@ -3502,7 +3639,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           initiativeStateUpdatedAtMsRef.current,
           incomingInitiativeMsP
         );
-        if (!hostileAlive && !preserveCombatFromPayload) {
+        if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActiveP) {
           setCombatOrderState([]);
           combatOrderRef.current = [];
           combatTurnWriteSeqRef.current = 0;
@@ -3562,25 +3699,23 @@ export function GameProvider({ children }: { children: ReactNode }) {
           typeof p.playerInitiativeRollsByEntityId === "object" &&
           !Array.isArray(p.playerInitiativeRollsByEntityId)
         ) {
-          const nextRolls = { ...p.playerInitiativeRollsByEntityId };
-          playerInitiativeRollsByEntityIdRef.current = nextRolls;
-          setPlayerInitiativeRollsByEntityIdState(nextRolls);
+          const incoming = { ...(p.playerInitiativeRollsByEntityId as Record<string, number>) };
+          const merged = { ...(playerInitiativeRollsByEntityIdRef.current ?? {}), ...incoming };
+          playerInitiativeRollsByEntityIdRef.current = merged;
+          setPlayerInitiativeRollsByEntityIdState(merged);
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {
-            const trustIncomingAwaitingFalseP =
-              incomingInitiativeMsP >= initiativeMsBaselineBeforePersistInitiativeMerge ||
-              hasCombatOrderInPayloadP;
-            if (trustIncomingAwaitingFalseP) {
-              awaitingPlayerInitiativeRef.current = false;
-              setAwaitingPlayerInitiativeState(false);
-            }
+            awaitingPlayerInitiativeRef.current = false;
+            setAwaitingPlayerInitiativeState(false);
           } else {
-            const nextAwaiting = (hostileAlive || hasCombatOrder) && p.awaitingPlayerInitiative;
+            const nextAwaiting =
+              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActiveP) &&
+              p.awaitingPlayerInitiative;
             awaitingPlayerInitiativeRef.current = nextAwaiting;
             setAwaitingPlayerInitiativeState(nextAwaiting);
           }
-        } else if (!hostileAlive && !hasCombatOrder) {
+        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActiveP) {
           awaitingPlayerInitiativeRef.current = false;
           setAwaitingPlayerInitiativeState(false);
         }
@@ -3591,16 +3726,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
             nextWait = false;
           } else {
             const barrierMsP = waitNarrationClearBarrierMsRef.current;
-            const mayRearmNarrationWaitP =
-              hasCombatOrderInPayloadP ||
-              incomingInitiativeMsP > barrierMsP ||
-              barrierMsP === 0;
-            nextWait = !!((hostileAlive || hasCombatOrder) && mayRearmNarrationWaitP);
+            const mayRearmNarrationWaitP = incomingInitiativeMsP > barrierMsP || barrierMsP === 0;
+            nextWait = !!(
+              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActiveP) &&
+              mayRearmNarrationWaitP
+            );
           }
           waitForGmNarrationForInitiativeSyncRef.current = nextWait;
           waitForGmNarrationForInitiativeRef.current = nextWait;
           setWaitForGmNarrationForInitiativeState(nextWait);
-        } else if (!hostileAlive && !hasCombatOrder) {
+        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActiveP) {
           waitForGmNarrationForInitiativeSyncRef.current = false;
           waitForGmNarrationForInitiativeRef.current = false;
           setWaitForGmNarrationForInitiativeState(false);
@@ -4952,7 +5087,21 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
             const hostIdForEntityMerge = String(multiplayerHostClientId ?? "").trim();
             const meForEntityMerge = String(clientId ?? "").trim();
-            if (hostIdForEntityMerge && meForEntityMerge && hostIdForEntityMerge !== meForEntityMerge) {
+            const localRoomForEntityMerge = String(payload.currentRoomId ?? "").trim();
+            const remoteRoomForEntityMerge = String(remotePayload?.currentRoomId ?? "").trim();
+            // Invité : ne pas fusionner « entités locales absentes du remote » si la salle ne correspond pas.
+            // Sinon le snapshot hôte (encore dans la pièce précédente) sert de base et chaque PNJ de la
+            // nouvelle salle (nouveaux ids) est ajouté par-dessus → doublons visuels (anciens + nouveaux).
+            const roomsAlignedForNpcSpawnMerge =
+              !!localRoomForEntityMerge &&
+              !!remoteRoomForEntityMerge &&
+              localRoomForEntityMerge === remoteRoomForEntityMerge;
+            if (
+              hostIdForEntityMerge &&
+              meForEntityMerge &&
+              hostIdForEntityMerge !== meForEntityMerge &&
+              roomsAlignedForNpcSpawnMerge
+            ) {
               payload.entities = appendLocalEntitiesAbsentFromRemote(
                 Array.isArray(payload.entities) ? (payload.entities as Entity[]) : [],
                 remotePayload?.entities
@@ -5637,6 +5786,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
               ? update.conditions.map((x) => String(x ?? "").trim()).filter(Boolean)
               : [],
           }),
+          ...(update.combatTimedStates !== undefined && {
+            combatTimedStates: Array.isArray(update.combatTimedStates)
+              ? (update.combatTimedStates as CombatTimedStateEntry[])
+                  .filter(
+                    (x) =>
+                      x &&
+                      typeof x.stateId === "string" &&
+                      typeof x.rounds === "number" &&
+                      Number.isFinite(x.rounds) &&
+                      x.rounds > 0
+                  )
+                  .map((x) => ({
+                    stateId: String(x.stateId ?? "").trim(),
+                    rounds: Math.max(1, Math.trunc(x.rounds)),
+                  }))
+                  .filter((x) => x.stateId.length > 0)
+              : [],
+          }),
         };
 
         if (update.hp !== undefined) {
@@ -5874,6 +6041,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
                     ...(Array.isArray(update.conditions) && {
                       conditions: update.conditions.map((x) => String(x ?? "").trim()).filter(Boolean),
                     }),
+                    ...(update.combatTimedStates !== undefined && {
+                      combatTimedStates: Array.isArray(update.combatTimedStates)
+                        ? (update.combatTimedStates as CombatTimedStateEntry[])
+                            .filter(
+                              (x) =>
+                                x &&
+                                typeof x.stateId === "string" &&
+                                typeof x.rounds === "number" &&
+                                Number.isFinite(x.rounds) &&
+                                x.rounds > 0
+                            )
+                            .map((x) => ({
+                              stateId: String(x.stateId ?? "").trim(),
+                              rounds: Math.max(1, Math.trunc(x.rounds)),
+                            }))
+                            .filter((x) => x.stateId.length > 0)
+                        : [],
+                    }),
                     isAlive: true,
                   }
             );
@@ -5909,6 +6094,22 @@ export function GameProvider({ children }: { children: ReactNode }) {
             stealthDc: update.stealthDc ?? template?.stealthDc ?? null,
             conditions: Array.isArray(update.conditions)
               ? update.conditions.map((x) => String(x ?? "").trim()).filter(Boolean)
+              : undefined,
+            combatTimedStates: Array.isArray(update.combatTimedStates)
+              ? (update.combatTimedStates as CombatTimedStateEntry[])
+                  .filter(
+                    (x) =>
+                      x &&
+                      typeof x.stateId === "string" &&
+                      typeof x.rounds === "number" &&
+                      Number.isFinite(x.rounds) &&
+                      x.rounds > 0
+                  )
+                  .map((x) => ({
+                    stateId: String(x.stateId ?? "").trim(),
+                    rounds: Math.max(1, Math.trunc(x.rounds)),
+                  }))
+                  .filter((x) => x.stateId.length > 0)
               : undefined,
             lootItems:
               update.lootItems ??
@@ -5981,6 +6182,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
               ...(update.conditions !== undefined && {
                 conditions: Array.isArray(update.conditions)
                   ? update.conditions.map((x) => String(x ?? "").trim()).filter(Boolean)
+                  : [],
+              }),
+              ...(update.combatTimedStates !== undefined && {
+                combatTimedStates: Array.isArray(update.combatTimedStates)
+                  ? (update.combatTimedStates as CombatTimedStateEntry[])
+                      .filter(
+                        (x) =>
+                          x &&
+                          typeof x.stateId === "string" &&
+                          typeof x.rounds === "number" &&
+                          Number.isFinite(x.rounds) &&
+                          x.rounds > 0
+                      )
+                      .map((x) => ({
+                        stateId: String(x.stateId ?? "").trim(),
+                        rounds: Math.max(1, Math.trunc(x.rounds)),
+                      }))
+                      .filter((x) => x.stateId.length > 0)
                   : [],
               }),
             };
@@ -6746,8 +6965,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
       return;
     }
     const hostiles = entities.filter((e) => isHostileReadyForCombat(e));
+    const hostilesPresent = entities.filter((e) => e?.type === "hostile" && e.isAlive !== false);
+    const initiativeFlowActive =
+      awaitingPlayerInitiativeRef.current ||
+      waitForGmNarrationForInitiativeRef.current ||
+      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
+      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
+    const hostilesForOrderValidation =
+      hostiles.length > 0 || !initiativeFlowActive ? hostiles : hostilesPresent;
     if (combatOrder.length > 0) {
-      if (!combatOrderMatchesCurrentHostiles(combatOrder, hostiles)) {
+      if (!combatOrderMatchesCurrentHostiles(combatOrder, hostilesForOrderValidation)) {
         // Nouveau combat / nouveaux hostiles : l'ancien ordre ne correspond plus à la scène actuelle.
         initiativeDraftCacheRef.current = null;
         initiativeRemoteFinalizeSigRef.current = null;
@@ -6771,6 +6998,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     if (!player) return;
     if (hostiles.length === 0) {
+      if (hostilesPresent.length > 0 && initiativeFlowActive) {
+        return;
+      }
       // Plus aucun hostile engagé (repère le PJ) : ne pas garder le bandeau initiative ni le mode combat.
       initiativeDraftCacheRef.current = null;
       initiativeRemoteFinalizeSigRef.current = null;
@@ -6853,6 +7083,70 @@ export function GameProvider({ children }: { children: ReactNode }) {
       return changed ? next : prev;
     });
   }, [entities, player?.name, combatOrder.length]);
+
+  /** D&D 5e : la surprise se termine à la fin du tour du créature — pas seulement dans quelques branches du client. */
+  const surpriseTurnPrevIndexRef = useRef<number | null>(null);
+  const surpriseTurnOrderWasEmptyRef = useRef(true);
+
+  useLayoutEffect(() => {
+    if (gameMode !== "combat") {
+      surpriseTurnPrevIndexRef.current = null;
+      surpriseTurnOrderWasEmptyRef.current = true;
+      return;
+    }
+    const order = combatOrderRef.current;
+    const len = Array.isArray(order) ? order.length : 0;
+    if (len <= 0) {
+      surpriseTurnPrevIndexRef.current = null;
+      surpriseTurnOrderWasEmptyRef.current = true;
+      return;
+    }
+
+    if (surpriseTurnOrderWasEmptyRef.current) {
+      surpriseTurnOrderWasEmptyRef.current = false;
+      surpriseTurnPrevIndexRef.current = combatTurnIndex;
+      return;
+    }
+
+    const prev = surpriseTurnPrevIndexRef.current;
+    if (prev === null) {
+      surpriseTurnPrevIndexRef.current = combatTurnIndex;
+      return;
+    }
+    if (prev === combatTurnIndex) {
+      return;
+    }
+
+    const endedIdx = Math.min(Math.max(0, prev), len - 1);
+    const endedId = String(order[endedIdx]?.id ?? "").trim();
+    if (endedId) {
+      const p = playerRef.current;
+      const localCombatantId = resolveLocalPlayerCombatantId({
+        player: p,
+        entities: entitiesRef.current,
+        multiplayerSessionId,
+        clientId,
+      });
+      const isLocalPc =
+        endedId === localCombatantId ||
+        (!multiplayerSessionId && endedId === "player") ||
+        (multiplayerSessionId &&
+          p?.id != null &&
+          String(endedId).trim() === String(p.id).trim());
+
+      if (isLocalPc && p?.surprised === true) {
+        updatePlayer({ surprised: false });
+      }
+
+      const ents = entitiesRef.current ?? [];
+      const ent = ents.find((e) => e && String(e.id ?? "").trim() === endedId);
+      if (ent && ent.surprised === true) {
+        applyEntityUpdates([{ id: endedId, action: "update", surprised: false }]);
+      }
+    }
+
+    surpriseTurnPrevIndexRef.current = combatTurnIndex;
+  }, [gameMode, combatTurnIndex, clientId, multiplayerSessionId, updatePlayer]);
 
   function replaceEntities(next: Entity[]) {
     // Ne conserver que les entités non-objets (créatures, PNJ, hostiles).

@@ -32,6 +32,13 @@ import {
 import { resolvePendingDamageRollStage } from "@/lib/pendingDamageRollResolve";
 import { computePlayerArmorClass, normalizeEquipmentState } from "@/lib/playerEquipment";
 import { validateSpellCastingComponents } from "@/lib/spellCastingComponents";
+import {
+  COMBAT_TIMED_STATE_IDS,
+  decrementCombatTimedStatesOneTick,
+  getAcBonusFromCombatTimedStates,
+  normalizeCombatTimedStates,
+  upsertCombatTimedState,
+} from "@/lib/combatTimedStates";
 import { resourceKindForCastingTime } from "@/lib/spellDisplayMeta";
 
 // En React 18 StrictMode (dev), le démontage/remontage réinitialise les useRef du composant
@@ -461,6 +468,22 @@ function effectivePlayerArmorClass(player) {
  * Ex: formatDmgRoll("1d6", [4], 1)  â†’ "1d6 [4] +1 = **5 dégâts**"
  * Ex: formatDmgRoll("1d6", [4,3], 1, true) â†’ "1d6 [4] + 1d6 [3] +1 = **8 dégâts**" (crit)
  */
+/** Lecture seule : au moins un emplacement de sort de niveau ≥ spellLevel disponible. */
+function combatantHasSpellSlotAtOrAbove(combatant, spellLevel) {
+  if (!combatant?.spellSlots || spellLevel <= 0) return true;
+  const slots = combatant.spellSlots;
+  const levels = Object.keys(slots)
+    .map((lvl) => parseInt(lvl, 10))
+    .filter((lvl) => !Number.isNaN(lvl))
+    .sort((a, b) => a - b);
+  return levels.some((lvl) => {
+    if (lvl < spellLevel) return false;
+    const row = slots[lvl];
+    const remaining = typeof row?.remaining === "number" ? row.remaining : row?.max ?? 0;
+    return remaining > 0;
+  });
+}
+
 function formatDmgRoll(notation, rolls1, bonus, isCrit = false, rolls2 = null) {
   const fmt = (rolls) => `${notation} [${rolls.join("+")}]`;
   const dice1Str = fmt(rolls1);
@@ -574,6 +597,9 @@ function applyUpdatesLocally(entities, updates) {
           ...(upd.surprised !== undefined && { surprised: !!upd.surprised }),
           ...(upd.awareOfPlayer !== undefined && { awareOfPlayer: !!upd.awareOfPlayer }),
           ...(upd.controller !== undefined && { controller: upd.controller }),
+          ...(upd.combatTimedStates !== undefined && {
+            combatTimedStates: normalizeCombatTimedStates(upd.combatTimedStates),
+          }),
         };
         if (upd.hp !== undefined) {
           merged.hp = normalizeHpShape(upd.hp, e.hp ?? null);
@@ -1256,8 +1282,12 @@ function computeEntitySaveBonus(entity, abilityKey) {
 }
 
 function spendSpellSlot(player, updatePlayer, spellLevel) {
-  if (!player || !player.spellSlots || spellLevel <= 0) {
+  if (spellLevel <= 0) {
     return { ok: true, usedLevel: null };
+  }
+  if (!player || !player.spellSlots || typeof player.spellSlots !== "object") {
+    // Sort de niveau >= 1 sans ressource d'emplacements configurée : refuser.
+    return { ok: false, usedLevel: null };
   }
   const slots = player.spellSlots;
   const levels = Object.keys(slots)
@@ -1447,6 +1477,26 @@ function emitMeleeGraphDebugChat(opts) {
     "debug",
     makeMsgId()
   );
+}
+
+/** Paires de combattants au contact (graphe de mêlée non orienté) — pour /api/enemy-tactics. */
+function buildUndirectedMeleePairsForTactics(meleeGraph) {
+  const seen = new Set();
+  const out = [];
+  if (!meleeGraph || typeof meleeGraph !== "object") return out;
+  for (const [id, neighbors] of Object.entries(meleeGraph)) {
+    const a = String(id ?? "").trim();
+    if (!a || !Array.isArray(neighbors)) continue;
+    for (const nb of neighbors) {
+      const b = String(nb ?? "").trim();
+      if (!b || a === b) continue;
+      const key = a < b ? `${a}\0${b}` : `${b}\0${a}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push([a, b]);
+    }
+  }
+  return out;
 }
 
 /** Normalise actionIntent (API ou copie locale). */
@@ -1695,10 +1745,13 @@ function resolveAdventuringConsumableByQuery(itemQuery) {
   return null;
 }
 
-function rollHealFromGearEffect(effectStr) {
-  const m = String(effectStr ?? "").match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
-  if (!m) return 0;
-  return rollDice(m[1].replace(/\s+/g, ""));
+function isSpellOffensiveForCombatOpening(spellMeta) {
+  const sp = spellMeta?.raw;
+  const hasDamage = !!String(sp?.damage ?? "").trim();
+  const hasSave = !!spellMeta?.save;
+  const attackHint = String(sp?.attack ?? spellMeta?.attackType ?? "").toLowerCase();
+  const hasAttackHint = /\b(sort|attaque|attack|distance|corps)\b/i.test(attackHint);
+  return hasDamage || hasSave || hasAttackHint;
 }
 
 /** Évite double bulle / double consommation quand parse-intent et la réponse MJ appliquent la même intention (ex. Esquiver, repositionnement sans cible). */
@@ -1786,6 +1839,7 @@ function executeCombatActionIntent(intent, ctx) {
     combatEngagementSeqRef = { current: 0 },
     combatRoundInEngagementRef = { current: 0 },
     combatTurnIndexLiveRef = { current: 0 },
+    multiplayerPendingCommandId: multiplayerPendingCommandIdFromCtx = null,
   } = ctx;
 
   const meleeStateSnapshot =
@@ -1821,21 +1875,93 @@ function executeCombatActionIntent(intent, ctx) {
 
   const findLivingTarget = (id) => {
     if (!id) return null;
+    const sid = String(id).trim();
+    const sidNorm = normalizeFr(sid);
     // Autorise le ciblage d'une cible cachée (non visible) : la pénalité est gérée par
     // le désavantage d'attaque (`targetHidden`) au moment de la résolution du jet.
-    return postEntities.find((e) => e.id === id && e.isAlive) ?? null;
+    const fromScene = postEntities.find((e) => e && e.id === sid && e.isAlive !== false) ?? null;
+    if (fromScene) return fromScene;
+    const fromSceneByName =
+      postEntities.find((e) => e && e.isAlive !== false && normalizeFr(String(e?.name ?? "")) === sidNorm) ??
+      postEntities.find((e) => {
+        if (!e || e.isAlive === false) return false;
+        const n = normalizeFr(String(e?.name ?? ""));
+        return !!n && !!sidNorm && (n.includes(sidNorm) || sidNorm.includes(n));
+      }) ??
+      null;
+    if (fromSceneByName) return fromSceneByName;
+    /** MP : les alliés `mp-player-<clientId>` sont dans le prompt parse-intent mais souvent absents de `entities`. */
+    const mpPrefix = "mp-player-";
+    if (!sid.startsWith(mpPrefix)) return null;
+    const cid = sid.slice(mpPrefix.length).trim();
+    if (!cid) return null;
+    if (String(localCombatantId ?? "").trim() === sid && player) {
+      const dead = player?.deathState?.dead === true;
+      if (dead) return null;
+      return {
+        ...player,
+        id: sid,
+        name: player.name ?? "Vous",
+        type: player.type ?? "friendly",
+        controller: "player",
+        visible: player.visible !== false,
+        isAlive: true,
+      };
+    }
+    const profs = multiplayerParticipantProfilesRef?.current;
+    const prof = Array.isArray(profs) ? profs.find((p) => String(p?.clientId ?? "").trim() === cid) : null;
+    if (!prof || prof.connected === false) return null;
+    const sheet = prof?.playerSnapshot && typeof prof.playerSnapshot === "object" ? prof.playerSnapshot : null;
+    const cur =
+      typeof prof.hpCurrent === "number" && Number.isFinite(prof.hpCurrent)
+        ? Math.trunc(prof.hpCurrent)
+        : typeof sheet?.hp?.current === "number" && Number.isFinite(sheet.hp.current)
+          ? Math.trunc(sheet.hp.current)
+          : null;
+    const max =
+      typeof prof.hpMax === "number" && Number.isFinite(prof.hpMax)
+        ? Math.trunc(prof.hpMax)
+        : typeof sheet?.hp?.max === "number" && Number.isFinite(sheet.hp.max)
+          ? Math.trunc(sheet.hp.max)
+          : cur != null
+            ? Math.max(1, cur)
+            : null;
+    const dead = sheet?.deathState?.dead === true;
+    if (dead) return null;
+    const hp = cur != null && max != null ? { current: cur, max } : sheet?.hp ?? null;
+    return {
+      id: sid,
+      name: String(prof.name ?? sheet?.name ?? "Joueur").trim() || "Joueur",
+      type: "friendly",
+      controller: "player",
+      visible: true,
+      isAlive: true,
+      hp,
+    };
   };
 
   const { type, targetId, itemName } = intent;
+  const spellMetaFromIntent =
+    gameMode !== "combat" && type === "spell"
+      ? (() => {
+          const resolved = resolveCombatItemForIntent("spell", itemName, player, userContent);
+          if (!resolved || resolved.kind !== "spell") return null;
+          return getSpellRuntimeMeta(resolved.spellName);
+        })()
+      : null;
   let effectiveMode = gameMode;
   const canOpenCombatFromExploration =
-    gameMode !== "combat" && ["attack", "spell", "move_and_attack"].includes(type);
+    gameMode !== "combat" &&
+    (type === "attack" ||
+      type === "move_and_attack" ||
+      (type === "spell" && isSpellOffensiveForCombatOpening(spellMetaFromIntent)));
 
   if (
     gameMode !== "combat" &&
     type !== "second_wind" &&
     type !== "use_item" &&
     type !== "stabilize" &&
+    type !== "spell" &&
     !canOpenCombatFromExploration
   ) {
     return fail("Action impossible : hors combat.");
@@ -1894,8 +2020,29 @@ function executeCombatActionIntent(intent, ctx) {
     if (!tid || tid === "player") tid = localCombatantId;
 
     const findPotionTargetEntity = (id) => {
-      const e = postEntities.find((x) => x && String(x.id) === String(id) && x.visible !== false);
-      if (!e || e.type === "hostile") return null;
+      const q = String(id ?? "").trim();
+      if (!q) return null;
+      const qNorm = normalizeFr(q);
+      const fromLiving = findLivingTarget(q);
+      if (fromLiving && fromLiving.visible !== false && String(fromLiving.type ?? "").toLowerCase() !== "hostile") {
+        const hpCur = typeof fromLiving.hp?.current === "number" ? fromLiving.hp.current : null;
+        if (!(fromLiving.isAlive === false && (hpCur == null || hpCur <= 0))) return fromLiving;
+      }
+      const e =
+        postEntities.find((x) => x && String(x.id ?? "").trim() === q && x.visible !== false) ??
+        postEntities.find(
+          (x) =>
+            x &&
+            x.visible !== false &&
+            normalizeFr(String(x?.name ?? "")) === qNorm
+        ) ??
+        postEntities.find((x) => {
+          if (!x || x.visible === false) return false;
+          const n = normalizeFr(String(x?.name ?? ""));
+          return !!n && !!qNorm && (n.includes(qNorm) || qNorm.includes(n));
+        }) ??
+        null;
+      if (!e || String(e.type ?? "").toLowerCase() === "hostile") return null;
       const hpCur = typeof e.hp?.current === "number" ? e.hp.current : null;
       if (e.isAlive === false && (hpCur == null || hpCur <= 0)) return null;
       return e;
@@ -1908,6 +2055,7 @@ function executeCombatActionIntent(intent, ctx) {
       if (!targetEnt) {
         return fail("Action impossible : cible introuvable ou non valide pour un soin.");
       }
+      tid = String(targetEnt?.id ?? tid).trim();
       if (gameMode === "combat") {
         const melee = getMeleeWith(localCombatantId);
         if (!Array.isArray(melee) || !melee.includes(tid)) {
@@ -1918,52 +2066,31 @@ function executeCombatActionIntent(intent, ctx) {
       }
     }
 
-    const healAmt = rollHealFromGearEffect(gear.effect);
-    if (healAmt <= 0) {
+    const m = String(gear.effect ?? "").match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
+    if (!m) {
       return fail("Action impossible : effet de soin non résolu pour cet objet.");
     }
-
-    const removed = removeOneStackedItem(inv, gear.name);
-    if (!removed) {
-      return fail(`Action impossible : vous n'avez pas **${gear.name}**.`);
-    }
-    updatePlayer({ inventory: stackInventory(removed) });
-
-    const giverName = player?.name ?? "Vous";
-
-    if (isSelf) {
-      const cur = typeof player?.hp?.current === "number" ? player.hp.current : 0;
-      const max = typeof player?.hp?.max === "number" ? player.hp.max : Math.max(1, cur + healAmt);
-      const next = Math.min(max, cur + healAmt);
-      setHp(next);
-      addMessage(
-        "ai",
-        `🧪 ${giverName} utilise ${gear.name} — +${healAmt} PV → ${next}/${max} PV.`,
-        "event",
-        makeMsgId()
-      );
-    } else {
-      const cur = typeof targetEnt.hp?.current === "number" ? targetEnt.hp.current : 0;
-      const max = typeof targetEnt.hp?.max === "number" ? targetEnt.hp.max : Math.max(1, cur + healAmt);
-      const nextCur = Math.min(max, cur + healAmt);
-      applyEntityUpdates([
-        {
-          action: "update",
-          id: tid,
-          hp: { current: nextCur, max },
+    const split = splitDiceNotationAndFlatBonus(m[1].replace(/\s+/g, ""));
+    return {
+      ok: true,
+      pendingRoll: buildPendingDiceRoll({
+        kind: "damage_roll",
+        roll: split.diceNotation,
+        totalBonus: split.flatBonus,
+        stat: "Soins",
+        skill: gear.name,
+        raison: `Soins (${gear.name} → ${isSelf ? player?.name ?? "vous" : targetEnt?.name ?? tid})`,
+        weaponName: gear.name,
+        targetId: isSelf ? String(localCombatantId ?? "player") : tid,
+        engineContext: {
+          stage: "item_heal_followup",
+          itemName: gear.name,
+          targetId: isSelf ? String(localCombatantId ?? "player") : tid,
+          targetName: isSelf ? player?.name ?? "vous" : targetEnt?.name ?? tid,
+          resourceKind: "action",
         },
-      ]);
-      const tgtName = targetEnt.name ?? tid;
-      addMessage(
-        "ai",
-        `🧪 ${giverName} fait boire ${gear.name} à ${tgtName} — +${healAmt} PV → ${nextCur}/${max} PV.`,
-        "event",
-        makeMsgId()
-      );
-    }
-
-    consumeRes(setTurnResources, gameMode, "action");
-    return { ok: true, pendingRoll: null };
+      }),
+    };
   }
 
   if (type === "stabilize") {
@@ -2140,11 +2267,22 @@ function executeCombatActionIntent(intent, ctx) {
     clearMeleeFor(localCombatantId);
     // Toujours confirmer : le flux parse-intent → processEngineIntent utilise parserMinimalNarration
     // et ne rappelle pas le MJ pour combat_intent, sinon le joueur ne voit aucune réponse (hors logs debug).
+    const mpCmd = multiplayerPendingCommandIdFromCtx
+      ? String(multiplayerPendingCommandIdFromCtx).trim()
+      : "";
+    const disengageMsgId = mpCmd ? `mp-engine-disengage:${mpCmd}` : makeMsgId();
+    if (
+      mpCmd &&
+      Array.isArray(messagesRef?.current) &&
+      messagesRef.current.some((m) => m && m.id === disengageMsgId)
+    ) {
+      return { ok: true, pendingRoll: null };
+    }
     addMessage(
       "ai",
       "Vous vous désengagez et reculez prudemment (Action).",
       undefined,
-      makeMsgId()
+      disengageMsgId
     );
     return { ok: true, pendingRoll: null };
   }
@@ -2283,7 +2421,7 @@ function executeCombatActionIntent(intent, ctx) {
   const buildPendingAfterItem = (resolved, opts = {}) => {
     const assumeInMeleeWithTarget = opts.assumeInMeleeWithTarget === true;
     if (resolved.kind === "error") return fail(resolved.message);
-    if (!turnResources?.action) {
+    if (effectiveMode === "combat" && !turnResources?.action) {
       return fail(ACTION_CONSUMED_MESSAGE);
     }
 
@@ -2296,12 +2434,56 @@ function executeCombatActionIntent(intent, ctx) {
       if (!hasResource(turnResources, effectiveMode, resourceKind)) {
         return fail(ACTION_CONSUMED_MESSAGE);
       }
+      // Sort non offensif (soin/buff) : utiliser le pipeline de dés joueur
+      // via pendingRoll (comme les autres résolutions), y compris hors combat.
+      if (!spellMeta.save && !isSpellOffensiveForCombatOpening(spellMeta)) {
+        const effectRaw = String(spell?.effect ?? "");
+        const healDiceMatch = effectRaw.match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
+        const healDice = healDiceMatch ? healDiceMatch[1].replace(/\s+/g, "") : "";
+        const includesCastingMod = /mod\s*sort|modificateur\s*de\s*sort|mod\s*d['’]incantation/i.test(effectRaw);
+        const healBonus = includesCastingMod
+          ? abilityMod(player?.stats?.[spellcastingAbilityAbbrevForCombatant(player)])
+          : 0;
+        if (!healDice) {
+          consumeRes(setTurnResources, effectiveMode, resourceKind);
+          addMessage(
+            "ai",
+            `✨ ${player?.name ?? "Vous"} lance **${resolved.spellName}** sur ${targetEnt?.name ?? "la cible"}.`,
+            "meta",
+            makeMsgId()
+          );
+          return { ok: true, pendingRoll: null };
+        }
+        return {
+          ok: true,
+          pendingRoll: buildPendingDiceRoll({
+            kind: "damage_roll",
+            roll: healDice,
+            totalBonus: healBonus,
+            stat: "Soins",
+            skill: resolved.spellName,
+            raison: `Soins (${resolved.spellName} → ${targetEnt?.name ?? "cible"})`,
+            weaponName: resolved.spellName,
+            targetId: targetEnt.id,
+            engineContext: {
+              stage: "spell_heal_followup",
+              spellName: resolved.spellName,
+              targetId: targetEnt.id,
+              targetName: targetEnt?.name ?? "cible",
+              resourceKind,
+              spellLevel: typeof spell?.level === "number" ? spell.level : 0,
+            },
+          }),
+        };
+      }
       if (spellMeta.save) {
         return { ok: true, pendingRoll: null, runSpellSave: { spellName: resolved.spellName, target: targetEnt } };
       }
       const meleeWith = getMeleeWith(localCombatantId);
       const inMeleeWithTarget = meleeWith.includes(targetId) || assumeInMeleeWithTarget;
-      const rangedSpellLike = meleeWith.length > 0 && !inMeleeWithTarget;
+      const contactSpell = spell && spellRangeIsContact(spell);
+      const rangedSpellLike =
+        !contactSpell && meleeWith.length > 0 && !inMeleeWithTarget;
       if (!hasDisengagedThisTurn && rangedSpellLike) {
         return fail(
           "Action impossible : attaque à distance en mêlée — désengagez-vous ou rapprochez-vous de la cible visée."
@@ -2401,6 +2583,23 @@ function executeCombatActionIntent(intent, ctx) {
 
   if (type === "attack" || type === "spell") {
     const resolved = resolveCombatItemForIntent(type, itemName, player, userContent);
+    if (resolved.kind === "error") return fail(resolved.message);
+    if (type === "spell" && resolved.kind === "spell") {
+      const sm = getSpellRuntimeMeta(resolved.spellName);
+      const sp = sm.raw;
+      if (
+        sp &&
+        spellRangeIsContact(sp) &&
+        targetId &&
+        String(targetId).trim() !== String(localCombatantId).trim() &&
+        !sm.save
+      ) {
+        if (!getMeleeWith(localCombatantId).includes(targetId)) {
+          const step = tryEngageMelee();
+          if (!step.ok) return fail(step.userMessage);
+        }
+      }
+    }
     return buildPendingAfterItem(resolved);
   }
 
@@ -2507,9 +2706,13 @@ function executeCombatActionIntent(intent, ctx) {
       }
     } else if (resolved.kind === "spell") {
       const spellMeta = getSpellRuntimeMeta(resolved.spellName);
+      const sp = spellMeta.raw;
+      const contactSpell = sp && spellRangeIsContact(sp);
       const meleeWith = getMeleeWith(localCombatantId);
       const inMeleeWithTarget = meleeWith.includes(targetId) || assumeInMeleeWithTarget;
-      if (!spellMeta.save && !hasDisengagedThisTurn && meleeWith.length > 0 && !inMeleeWithTarget) {
+      const rangedSpellLike =
+        !contactSpell && !spellMeta.save && meleeWith.length > 0 && !inMeleeWithTarget;
+      if (!hasDisengagedThisTurn && rangedSpellLike) {
         return fail(
           "Action impossible : attaque à distance en mêlée — désengagez-vous ou rapprochez-vous de la cible visée."
         );
@@ -2545,6 +2748,14 @@ function spellRequiresAttackRoll(spell) {
   const low = atk.toLowerCase();
   if (/touche\s*auto|auto-?hit|touch\s*auto/.test(low)) return false;
   return true;
+}
+
+/** Sorts SRD « contact » (buff, soins, etc.) : la règle « sort à distance en mêlée » ne s'applique pas. */
+function spellRangeIsContact(spell) {
+  if (!spell || typeof spell !== "object") return false;
+  const r = String(spell.range ?? "").trim().toLowerCase();
+  if (!r) return false;
+  return r === "contact" || /^contact\b/i.test(String(spell.range ?? ""));
 }
 
 function canonicalizeSpellNameAgainstCombatant(combatant, spellName) {
@@ -2973,8 +3184,34 @@ function hasUnresolvedDeathSavePromptInMessages(messagesArr, playerName) {
   return true;
 }
 
-function pendingRollTargetsLocalPlayer(roll, localPlayer, localClientId, inMultiplayerSession) {
+function pendingRollTargetsLocalPlayer(
+  roll,
+  localPlayer,
+  localClientId,
+  inMultiplayerSession,
+  multiplayerSessionId = null,
+  participantProfiles = null
+) {
   if (!roll || typeof roll !== "object") return false;
+  const groupAud =
+    roll.kind === "check" &&
+    (roll.audience === "global" || roll.audience === "selected") &&
+    roll.returnToArbiter === true;
+  if (groupAud) {
+    const me = localClientId != null && String(localClientId).trim() ? String(localClientId).trim() : "";
+    const map = roll.globalRollsByClientId && typeof roll.globalRollsByClientId === "object" ? roll.globalRollsByClientId : {};
+    if (me && map[me] != null) return false;
+    if (inMultiplayerSession && me) {
+      const expected = getGroupSkillCheckExpectedClientIds(
+        multiplayerSessionId,
+        participantProfiles,
+        me,
+        roll
+      );
+      if (Array.isArray(expected) && expected.length && !expected.includes(me)) return false;
+    }
+    return true;
+  }
   const pid = roll.forPlayerId != null && String(roll.forPlayerId).trim() ? String(roll.forPlayerId).trim() : null;
   const cid = roll.forClientId != null && String(roll.forClientId).trim() ? String(roll.forClientId).trim() : null;
   if (!inMultiplayerSession) {
@@ -2982,9 +3219,201 @@ function pendingRollTargetsLocalPlayer(roll, localPlayer, localClientId, inMulti
     if (localPlayer?.id != null && pid === String(localPlayer.id)) return true;
     return false;
   }
-  if (cid && localClientId && cid !== localClientId) return false;
-  if (pid && localPlayer?.id != null && pid !== String(localPlayer.id)) return false;
-  return true;
+  // Multijoueur : `forClientId` est la source de vérité (quel onglet doit lancer).
+  // Ne pas exiger aussi un match sur `forPlayerId` : la fiche locale utilise souvent
+  // `mp-player-<clientId>` alors que stampPendingRoll met encore l'id gabarit (`pre-*`).
+  if (cid && localClientId) {
+    return cid === localClientId;
+  }
+  if (!pid && !cid) return true;
+  if (pid && localPlayer?.id != null && pid === String(localPlayer.id)) return true;
+  return false;
+}
+
+function getConnectedParticipantClientIds(participantProfiles) {
+  if (!Array.isArray(participantProfiles)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const p of participantProfiles) {
+    if (!p || p.connected === false) continue;
+    const cid = String(p?.clientId ?? "").trim();
+    if (!cid || seen.has(cid)) continue;
+    seen.add(cid);
+    out.push(cid);
+  }
+  return out;
+}
+
+function getGlobalSkillCheckExpectedClientIds(multiplayerSessionId, participantProfiles, fallbackClientId) {
+  if (multiplayerSessionId && Array.isArray(participantProfiles)) {
+    const c = getConnectedParticipantClientIds(participantProfiles);
+    if (c.length) return c;
+  }
+  const f = String(fallbackClientId ?? "").trim();
+  return f ? [f] : [];
+}
+
+const MP_PLAYER_ENTITY_ID_RE = /^mp-player-(.+)$/i;
+
+/** Extrait le clientId Firestore depuis un id d'entité multijoueur `mp-player-<clientId>`. */
+function clientIdFromMpPlayerEntityId(entityId) {
+  const m = String(entityId ?? "").trim().match(MP_PLAYER_ENTITY_ID_RE);
+  return m ? String(m[1]).trim() : "";
+}
+
+/**
+ * Ids d'entité reconnus pour filtrer `rollTargetEntityIds` côté client.
+ * Les fiches `mp-player-<clientId>` sont envoyées au parse-intent mais ne sont pas
+ * toujours dans `entities` du moteur (elles sont surtout fusionnées à l'affichage) ;
+ * sans les participants session, un jet « selected » pour deux PJ ne garde qu'un seul id.
+ */
+function buildEntityIdSetForMpRollTargetSanitize(baseEntities, multiplayerSessionId, participantProfilesLive) {
+  const s = new Set(
+    (Array.isArray(baseEntities) ? baseEntities : [])
+      .map((e) => (e?.id != null ? String(e.id).trim() : ""))
+      .filter(Boolean)
+  );
+  if (multiplayerSessionId && Array.isArray(participantProfilesLive)) {
+    for (const p of participantProfilesLive) {
+      const cid = String(p?.clientId ?? "").trim();
+      if (cid) s.add(`mp-player-${cid}`);
+    }
+  }
+  return s;
+}
+
+/**
+ * ClientIds qui doivent lancer pour un jet de groupe (arbitre / parse-intent) :
+ * `global` = tous les connectés ; `selected` = sous-ensemble dérivé de `roll.rollTargetEntityIds`.
+ */
+function getGroupSkillCheckExpectedClientIds(multiplayerSessionId, participantProfiles, fallbackClientId, roll) {
+  if (!roll || typeof roll !== "object") {
+    const f = String(fallbackClientId ?? "").trim();
+    return f ? [f] : [];
+  }
+  const aud = String(roll.audience ?? "single").trim().toLowerCase();
+  if (aud === "selected") {
+    const raw = roll.rollTargetEntityIds;
+    const ids = Array.isArray(raw)
+      ? [...new Set(raw.map((x) => String(x ?? "").trim()).filter(Boolean))]
+      : [];
+    const fromEntities = [...new Set(ids.map(clientIdFromMpPlayerEntityId).filter(Boolean))];
+    if (!fromEntities.length) {
+      const f = String(fallbackClientId ?? "").trim();
+      return f ? [f] : [];
+    }
+    // Liste explicite parse-intent / arbitre : ne pas réduire aux seuls onglets marqués « connectés »
+    // dans participantProfiles (un 2e joueur peut être absent ou mal flaggé → un seul lanceur, UI bloquée).
+    return fromEntities;
+  }
+  if (aud === "global") {
+    return getGlobalSkillCheckExpectedClientIds(
+      multiplayerSessionId,
+      participantProfiles,
+      fallbackClientId
+    );
+  }
+  const f = String(fallbackClientId ?? "").trim();
+  return f ? [f] : [];
+}
+
+/**
+ * MP : jet de compétence groupe (`global` / `selected`) — chaque clientId attendu a déjà une entrée
+ * dans `globalRollsByClientId`. Sert à ne plus bloquer la saisie ni afficher « lancez le dé » alors
+ * que la suite est uniquement arbitre MJ + narration (latence API).
+ */
+function isGlobalOrSelectedGroupSkillAllRollsRecorded(
+  pendingRoll,
+  multiplayerSessionId,
+  participantProfiles,
+  clientId
+) {
+  if (!pendingRoll || typeof pendingRoll !== "object") return false;
+  if (!multiplayerSessionId) return false;
+  if (pendingRoll.kind !== "check") return false;
+  const aud = String(pendingRoll.audience ?? "").trim().toLowerCase();
+  if (aud !== "global" && aud !== "selected") return false;
+  if (pendingRoll.returnToArbiter !== true) return false;
+  const expected = getGroupSkillCheckExpectedClientIds(
+    multiplayerSessionId,
+    participantProfiles,
+    clientId,
+    pendingRoll
+  );
+  const map =
+    pendingRoll.globalRollsByClientId && typeof pendingRoll.globalRollsByClientId === "object"
+      ? pendingRoll.globalRollsByClientId
+      : {};
+  return expected.length > 0 && expected.every((eid) => map[eid] != null);
+}
+
+/** Libellé court pour le bandeau « jet en attente » (autre onglet) — jets de groupe / multi-PJ. */
+function formatGroupSkillCheckWaitTitle(roll, entities, forPlayerNameFallback) {
+  const aud = String(roll?.audience ?? "").trim().toLowerCase();
+  if (!(roll?.kind === "check" && (aud === "global" || aud === "selected"))) {
+    return forPlayerNameFallback || "un joueur";
+  }
+  if (aud === "selected" && Array.isArray(roll.rollTargetEntityIds) && roll.rollTargetEntityIds.length) {
+    const names = roll.rollTargetEntityIds
+      .map((eid) => {
+        const id = String(eid ?? "").trim();
+        const ent = Array.isArray(entities) ? entities.find((e) => e && String(e.id).trim() === id) : null;
+        return ent?.name != null ? String(ent.name).trim() : "";
+      })
+      .filter(Boolean);
+    if (names.length) return names.join(" · ");
+    return "PJ sélectionnés";
+  }
+  return "tous les PJ connectés";
+}
+
+function buildGlobalPlayerCheckGroupRollOutcome({ roll, globalRollsByClientId, dc }) {
+  const by = globalRollsByClientId && typeof globalRollsByClientId === "object" ? globalRollsByClientId : {};
+  const entries = Object.entries(by).map(([clientId, v]) => ({
+    clientId,
+    nat: Math.trunc(Number(v?.nat)),
+    total: Math.trunc(Number(v?.total)),
+    success: typeof v?.success === "boolean" ? v.success : null,
+    playerName: v?.playerName != null ? String(v.playerName) : null,
+  }));
+  const totals = entries.map((e) => e.total).filter((n) => Number.isFinite(n));
+  const lowestTotal = totals.length ? Math.min(...totals) : null;
+  const highestTotal = totals.length ? Math.max(...totals) : null;
+  let successesCount = 0;
+  let failuresCount = 0;
+  for (const e of entries) {
+    if (e.success === true) successesCount++;
+    else if (e.success === false) failuresCount++;
+  }
+  return {
+    kind: "player_check_group",
+    stat: roll.stat ?? null,
+    skill: roll.skill ?? null,
+    dc,
+    byClientId: by,
+    summary: {
+      lowestTotal,
+      highestTotal,
+      successesCount,
+      failuresCount,
+      rollsCount: entries.length,
+      anyNat1: entries.some((e) => e.nat === 1),
+      anyNat20: entries.some((e) => e.nat === 20),
+    },
+  };
+}
+
+function shouldRunGlobalArbiterFollowup({ multiplayerSessionId, clientId, hostClientId, expectedClientIds }) {
+  if (!multiplayerSessionId) return true;
+  const ids = Array.isArray(expectedClientIds)
+    ? expectedClientIds.map((x) => String(x ?? "").trim()).filter(Boolean)
+    : [];
+  if (!ids.length) return true;
+  const me = String(clientId ?? "").trim();
+  const host = String(hostClientId ?? "").trim();
+  if (host && ids.includes(host)) return me === host;
+  const sorted = [...new Set(ids)].sort();
+  return sorted[0] === me;
 }
 
 /**
@@ -3028,6 +3457,7 @@ export default function ChatInterface() {
     currentScene, setCurrentScene,
     currentSceneName,
     sceneVersion,
+    setSceneVersion,
     currentRoomId, setCurrentRoomId,
     entities,
     getEntitiesSnapshot,
@@ -3062,6 +3492,7 @@ export default function ChatInterface() {
     patchParticipantProfileInventory,
     patchParticipantProfilePlayerSnapshot,
     patchParticipantProfileDeathState,
+    multiplayerHostClientId,
     setMultiplayerGameModeImmediate,
     flushMultiplayerSharedState,
     submitMultiplayerCommand,
@@ -3089,6 +3520,8 @@ export default function ChatInterface() {
   const [retryCountdown, setRetryCountdown] = useState(0);
   const [movementGate, setMovementGate] = useState(null); // { text: string, hostileIds: string[] }
   const [opportunityAttackPrompt, setOpportunityAttackPrompt] = useState(null); // { reactorId, targetId, reactorName, targetName }
+  /** Réaction *Bouclier* : toucher confirmé par l'ennemi — le PJ local peut lancer le sort avant les dégâts. */
+  const [shieldReactionPrompt, setShieldReactionPrompt] = useState(null); // { defenderId, attackerName, weaponName, defenderName, atkTotal, baseAc }
   const [showActionsHelp, setShowActionsHelp] = useState(false);
   const [fullImageUrl, setFullImageUrl] = useState(null);
   const inputValueRef = useRef("");
@@ -3118,6 +3551,16 @@ export default function ChatInterface() {
     multiplayerParticipantProfilesRef.current = Array.isArray(multiplayerParticipantProfiles)
       ? multiplayerParticipantProfiles
       : [];
+  }, [multiplayerParticipantProfiles]);
+
+  /** Primitive stable pour deps d'effets (évite taille / identité instable du tableau `profiles`). */
+  const multiplayerParticipantProfilesRollGateKey = useMemo(() => {
+    if (!Array.isArray(multiplayerParticipantProfiles)) return "";
+    return multiplayerParticipantProfiles
+      .map((p) => `${String(p?.clientId ?? "").trim()}:${p?.connected === false ? "0" : "1"}`)
+      .filter(Boolean)
+      .sort()
+      .join("|");
   }, [multiplayerParticipantProfiles]);
 
   /** Aligné sur l'ordre d'initiative / clés `meleeState` (voir `resolveLocalPlayerCombatantId`). */
@@ -3197,10 +3640,17 @@ export default function ChatInterface() {
   const recentHiddenNaturalReplayRef = useRef(new Map());
   /** MP : une seule résolution moteur par `pendingCommand.id` (Strict Mode / effets dupliqués). */
   const mpPendingCmdResolutionIdsRef = useRef(new Set());
+  const runSceneEntryGmArbiterRef = useRef(async () => null);
+  /** MP : évite double relance arbitre pour un même jet de groupe (effet hôte). */
+  const globalSkillGroupArbiterResolvedIdsRef = useRef(new Set());
   function getPendingRollStableKey(roll) {
     if (!roll || typeof roll !== "object") return null;
     if (typeof roll.id === "string" && roll.id.trim()) return `id:${roll.id.trim()}`;
-    return `k:${roll.kind ?? "roll"}|${roll.stat}|${String(roll.skill ?? "")}|${String(roll.targetId ?? "")}|${String(roll.weaponName ?? "")}|${String(roll.raison ?? "")}|${String(roll.forPlayerId ?? "")}|${String(roll.forClientId ?? "")}`;
+    const sel =
+      roll.audience === "selected" && Array.isArray(roll.rollTargetEntityIds)
+        ? [...new Set(roll.rollTargetEntityIds.map((x) => String(x ?? "").trim()).filter(Boolean))].sort().join(",")
+        : "";
+    return `k:${roll.kind ?? "roll"}|${roll.stat}|${String(roll.skill ?? "")}|${String(roll.targetId ?? "")}|${String(roll.weaponName ?? "")}|${String(roll.raison ?? "")}|${String(roll.forPlayerId ?? "")}|${String(roll.forClientId ?? "")}|${String(roll.audience ?? "")}|${sel}`;
   }
 
   useEffect(() => {
@@ -3321,6 +3771,7 @@ export default function ChatInterface() {
   const failedRequestPayloadRef = useRef(failedRequestPayload);
   useEffect(() => { failedRequestPayloadRef.current = failedRequestPayload; }, [failedRequestPayload]);
   const opportunityAttackPromptResolverRef = useRef(null);
+  const shieldReactionPromptResolverRef = useRef(null);
   const shortRestStateRef = useRef(shortRestState);
   useEffect(() => { shortRestStateRef.current = shortRestState; }, [shortRestState]);
   const recentLongRestApplyAtMsRef = useRef(0);
@@ -3458,6 +3909,14 @@ export default function ChatInterface() {
     const latest = multiplayerPendingCommandRef.current;
     if (!latest || String(latest.id).trim() !== cmdId) return;
 
+    /** Une seule exécution moteur / parse-intent par commande : le garde-fou global est par onglet,
+     * donc sans ceci chaque client lançait callApi → doublons MJ + coût API. */
+    const submitterClient = String(latest?.submittedBy ?? "").trim();
+    const localClient = String(clientId ?? "").trim();
+    if (submitterClient && localClient && submitterClient !== localClient) {
+      return;
+    }
+
     const fin = lastFinishedMultiplayerCommandRef.current;
     // IMPORTANT: cmdId est déjà unique (makeMsgId). Si une commande terminée réapparaît via
     // un echo/stale snapshot Firestore, on doit la purger sans jamais la rejouer, même si
@@ -3466,6 +3925,11 @@ export default function ChatInterface() {
       fin.id === cmdId &&
       Date.now() - fin.finishedAt < 180000;
     if (sameFinishedRecently) {
+      void setMultiplayerThinkingState({
+        active: false,
+        actor: null,
+        label: null,
+      });
       void clearMultiplayerPendingCommand(cmdId);
       return;
     }
@@ -3481,6 +3945,11 @@ export default function ChatInterface() {
     // En exploration, bloquer les doublons d'intention quasi simultanés même si cmdId diffère
     // (ex: deux auto-joueurs soumettent la même phrase à quelques ms d'intervalle).
     if (sigRecent && cmdMode === "exploration") {
+      void setMultiplayerThinkingState({
+        active: false,
+        actor: null,
+        label: null,
+      });
       void clearMultiplayerPendingCommand(cmdId);
       return;
     }
@@ -3500,6 +3969,11 @@ export default function ChatInterface() {
     if (busy && busy !== cmdId) {
       const inFlightSig = String(processingRemoteCommandSigRef.current ?? "");
       if (cmdSig && inFlightSig && cmdSig === inFlightSig && cmdMode === "exploration") {
+        void setMultiplayerThinkingState({
+          active: false,
+          actor: null,
+          label: null,
+        });
         void clearMultiplayerPendingCommand(cmdId);
       }
       mpPendingCmdResolutionIdsRef.current.delete(cmdId);
@@ -3763,11 +4237,17 @@ export default function ChatInterface() {
       title = r ? r : roll.skill ? `Dégâts (${roll.skill})` : "Jet de dégâts";
     } else {
       const isSpellAtk = roll.kind === "attack" && roll.weaponName && SPELLS?.[roll.weaponName];
+      const groupTag =
+        roll.kind === "check" && (roll.audience === "global" || roll.audience === "selected")
+          ? roll.audience === "selected"
+            ? "Jet multi-PJ — "
+            : "Jet de groupe — "
+          : "";
       const label = roll.skill
-        ? `Jet de ${roll.skill}`
+        ? `${groupTag}Jet de ${roll.skill}`
         : isSpellAtk
-          ? `Attaque de sort (${roll.stat})`
-          : `Jet de ${roll.stat}`;
+          ? `${groupTag}Attaque de sort (${roll.stat})`
+          : `${groupTag}Jet de ${roll.stat}`;
       title = shouldHidePendingRollReason(roll)
         ? label
         : `${label} (${roll.raison ?? ""})`;
@@ -3863,6 +4343,49 @@ export default function ChatInterface() {
     debugMode,
     worldTimeMinutes,
   };
+
+  /**
+   * Chaque début de tour d’initiative (même clé que le grant des ressources) : −1 sur chaque entrée
+   * de `combatTimedStates` pour tous les combattants (pas de double tick sur l’entité mp-player locale).
+   */
+  const tickCombatTimedStatesForAllCombatants = useCallback(() => {
+    const pl = gameStateRef.current?.player;
+    const pool = Array.isArray(gameStateRef.current?.entities) ? gameStateRef.current.entities : [];
+    const localMpId =
+      multiplayerSessionId && clientId ? `mp-player-${String(clientId).trim()}` : null;
+
+    if (pl) {
+      const prev = normalizeCombatTimedStates(pl.combatTimedStates);
+      const next = decrementCombatTimedStatesOneTick(pl.combatTimedStates);
+      if (JSON.stringify(prev) !== JSON.stringify(next)) {
+        updatePlayer({ combatTimedStates: next });
+      }
+    }
+
+    const updates = [];
+    for (const ent of pool) {
+      if (!ent?.id) continue;
+      if (localMpId && ent.id === localMpId) continue;
+      const prev = normalizeCombatTimedStates(ent.combatTimedStates);
+      const next = decrementCombatTimedStatesOneTick(ent.combatTimedStates);
+      if (JSON.stringify(prev) === JSON.stringify(next)) continue;
+      updates.push({ id: ent.id, action: "update", combatTimedStates: next });
+    }
+    if (updates.length) applyEntityUpdates(updates);
+  }, [updatePlayer, applyEntityUpdates, multiplayerSessionId, clientId]);
+
+  useEffect(() => {
+    if (gameMode === "combat") return;
+    const pl = gameStateRef.current?.player ?? player;
+    if (pl && normalizeCombatTimedStates(pl.combatTimedStates).length > 0) {
+      updatePlayer({ combatTimedStates: [] });
+    }
+    const pool = gameStateRef.current?.entities ?? entities ?? [];
+    const clears = pool
+      .filter((e) => e?.id && normalizeCombatTimedStates(e.combatTimedStates).length > 0)
+      .map((e) => ({ id: e.id, action: "update", combatTimedStates: [] }));
+    if (clears.length) applyEntityUpdates(clears);
+  }, [gameMode, player, entities, updatePlayer, applyEntityUpdates]);
 
   const queueSceneImageTrigger = useCallback((trigger) => {
     if (!trigger || typeof trigger !== "object") return;
@@ -4021,11 +4544,15 @@ export default function ChatInterface() {
   const getCombatantArmorClass = useCallback(
     (combatant) => {
       if (!combatant) return 10;
-      if (combatant.id === "player") return effectivePlayerArmorClass(player);
-      if (String(combatant.id ?? "").startsWith("mp-player-")) {
-        return Number(combatant?.ac ?? 10) || 10;
+      let base = 10;
+      if (combatant.id === "player") base = effectivePlayerArmorClass(player);
+      else if (String(combatant.id ?? "").startsWith("mp-player-")) {
+        base = Number(combatant?.ac ?? 10) || 10;
+      } else {
+        base = Number(combatant?.ac ?? 10) || 10;
       }
-      return Number(combatant?.ac ?? 10) || 10;
+      const timedBonus = getAcBonusFromCombatTimedStates(combatant?.combatTimedStates);
+      return base + timedBonus;
     },
     [player]
   );
@@ -5047,6 +5574,8 @@ export default function ChatInterface() {
     }`;
     if (lastTurnResourcesGrantKeyRef.current === key) return;
 
+    tickCombatTimedStatesForAllCombatants();
+
     lastTurnResourcesGrantKeyRef.current = key;
 
     if (debugMode && gameMode === "combat") {
@@ -5122,6 +5651,7 @@ export default function ChatInterface() {
     setSneakAttackUsedThisTurn,
     setTurnResourcesForCombatant,
     debugMode,
+    tickCombatTimedStatesForAllCombatants,
   ]);
 
   function controllerForCombatantId(combatantId, entitiesOverride = null) {
@@ -5560,7 +6090,17 @@ export default function ChatInterface() {
     if (ds.dead || ds.stable) return;
 
     const pr = pendingRollRef.current;
-    if (pr && pendingRollTargetsLocalPlayer(pr, player, clientId, !!multiplayerSessionId)) {
+    if (
+      pr &&
+      pendingRollTargetsLocalPlayer(
+        pr,
+        player,
+        clientId,
+        !!multiplayerSessionId,
+        multiplayerSessionId,
+        multiplayerParticipantProfilesRef.current
+      )
+    ) {
       if (pr.kind === "death_save") return;
       pendingRollRef.current = null;
       setPendingRoll(null);
@@ -5580,6 +6120,7 @@ export default function ChatInterface() {
     player,
     clientId,
     multiplayerSessionId,
+    multiplayerParticipantProfilesRollGateKey,
     messages,
   ]);
 
@@ -5902,7 +6443,6 @@ export default function ChatInterface() {
     let nextTurnIndex = combatTurnIndex;
 
     if (teleport?.targetRoomId && teleport.targetRoomId !== currentRoomId) {
-      rememberRoomEntitiesSnapshot(currentRoomId, entities);
       nextRoomId = teleport.targetRoomId;
       nextSceneName =
         String(teleport.targetSceneName ?? "").trim() ||
@@ -5913,10 +6453,67 @@ export default function ChatInterface() {
           ? teleport.targetSceneDescription
           : String(GOBLIN_CAVE[nextRoomId]?.description ?? currentScene);
       nextEntitiesForRef = nextRoomId === "scene_journey" ? [] : takeEntitiesForRoom(nextRoomId);
+      if (multiplayerSessionId) {
+        const participantIds = Array.isArray(multiplayerParticipantProfiles)
+          ? multiplayerParticipantProfiles
+              .map((p) => String(p?.clientId ?? "").trim())
+              .filter(Boolean)
+          : [];
+        const mpEntityIds = participantIds.map((cid) => `mp-player-${cid}`);
+        const mpEntityIdSet = new Set(mpEntityIds);
+        if (mpEntityIdSet.size > 0) {
+          const allRoomIds = Object.keys(GOBLIN_CAVE ?? {});
+          const movedMpById = new Map();
+          const sourceCurrent = Array.isArray(entities) ? entities : [];
+
+          const currentRoomWithoutPlayers = sourceCurrent.filter(
+            (e) => !mpEntityIdSet.has(String(e?.id ?? "").trim())
+          );
+          rememberRoomEntitiesSnapshot(currentRoomId, currentRoomWithoutPlayers);
+
+          for (const entity of sourceCurrent) {
+            const eid = String(entity?.id ?? "").trim();
+            if (mpEntityIdSet.has(eid) && !movedMpById.has(eid)) movedMpById.set(eid, entity);
+          }
+
+          for (const roomId of allRoomIds) {
+            if (!roomId || roomId === "scene_journey" || roomId === currentRoomId || roomId === nextRoomId) continue;
+            const roomEntities = Array.isArray(takeEntitiesForRoom(roomId)) ? takeEntitiesForRoom(roomId) : [];
+            let changed = false;
+            const kept = [];
+            for (const entity of roomEntities) {
+              const eid = String(entity?.id ?? "").trim();
+              if (mpEntityIdSet.has(eid)) {
+                if (!movedMpById.has(eid)) movedMpById.set(eid, entity);
+                changed = true;
+                continue;
+              }
+              kept.push(entity);
+            }
+            if (changed) rememberRoomEntitiesSnapshot(roomId, kept);
+          }
+
+          const targetBase = Array.isArray(nextEntitiesForRef) ? nextEntitiesForRef : [];
+          const targetWithoutPlayers = targetBase.filter(
+            (e) => !mpEntityIdSet.has(String(e?.id ?? "").trim())
+          );
+          const movedPlayers = [];
+          for (const mpId of mpEntityIds) {
+            const ent = movedMpById.get(mpId);
+            if (ent) movedPlayers.push(ent);
+          }
+          const targetWithPlayers = [...targetWithoutPlayers, ...movedPlayers];
+          rememberRoomEntitiesSnapshot(nextRoomId, targetWithPlayers);
+          nextEntitiesForRef = targetWithPlayers;
+        }
+      } else {
+        rememberRoomEntitiesSnapshot(currentRoomId, entities);
+      }
 
       setCurrentRoomId(nextRoomId);
       if (nextSceneName) setCurrentSceneName(nextSceneName);
       if (typeof nextScene === "string") setCurrentScene(nextScene);
+      setSceneVersion((v) => v + 1);
       setCurrentSceneImage("/file.svg");
       replaceEntities(nextEntitiesForRef);
       nextGameMode = "exploration";
@@ -6071,6 +6668,9 @@ export default function ChatInterface() {
       combatOrder: nextCombatOrder,
       combatTurnIndex: nextTurnIndex,
     };
+    if (multiplayerSessionId) {
+      void flushMultiplayerSharedState();
+    }
   }
 
   // Décompte quota 429
@@ -6469,7 +7069,9 @@ export default function ChatInterface() {
           hp: hpOut,
           ac: getCombatantArmorClass(combatant),
           position: context?.playerPosition ?? "theater_of_mind",
-          distance: inMelee ? "melee" : context?.distance ?? "unknown",
+          // Uniquement si CE PJ est au contact de CET ennemi (ne pas réutiliser context.distance : c'était global et marquait « melee » pour tout le monde).
+          distance: inMelee ? "melee" : "unknown",
+          inMeleeWithThisEnemy: inMelee,
           isAlive: isAliveTactic,
           unconsciousAt0Hp: deathSnap.unconscious === true && deathSnap.dead !== true,
         });
@@ -6490,6 +7092,13 @@ export default function ChatInterface() {
       if (playerRows.length === 0 && player) {
         pushTacticianPlayerRow("player", player.name);
       }
+
+      const meleePairsRaw = buildUndirectedMeleePairsForTactics(meleeState);
+      const meleeEngagementsForPayload = meleePairsRaw.map(([a, b]) => ({
+        combatantIdA: a,
+        combatantIdB: b,
+        label: `${resolveCombatantDisplayName({ id: a }, pool, player?.name ?? null)} ↔ ${resolveCombatantDisplayName({ id: b }, pool, player?.name ?? null)}`,
+      }));
 
       const enemyTemplateId = inferBestiaryTemplateIdForEntity(enemy);
       const enemyTemplate = enemyTemplateId && BESTIARY?.[enemyTemplateId] ? BESTIARY[enemyTemplateId] : null;
@@ -6551,6 +7160,7 @@ export default function ChatInterface() {
             ? enemy.entityClass
             : enemyTemplate?.entityClass ?? enemy.entityClass ?? "",
           surprised: !!enemy.surprised,
+          combatTimedStates: normalizeCombatTimedStates(enemy.combatTimedStates),
           hp: enemy.hp,
           ac: enemy.ac ?? null,
           stats: enemy.stats ?? enemyTemplate?.stats ?? null,
@@ -6575,6 +7185,8 @@ export default function ChatInterface() {
         battleState: {
           gameMode,
           engagedWith: engagedWithEnemy,
+          /** Toutes les paires au corps à corps sur le champ de bataille (graphe mêlée moteur). */
+          meleeEngagements: meleeEngagementsForPayload,
           inMelee: engagedWithEnemy.some((tid) => controllerForCombatantId(tid, pool) === "player"),
           playerCanOpportunityAttack:
             hasReaction(localCombatantId) && !!turnResourcesRef.current?.reaction,
@@ -6852,7 +7464,7 @@ export default function ChatInterface() {
       chosenWeapon,
       " (attaque d'opportunité)",
       null,
-      { type: "reaction", name: chosenWeapon.name, target: target.id }
+      { type: "reaction", name: chosenWeapon.name, target: target.id, skipShieldPrompt: true }
     );
     const liveTarget = getRuntimeCombatant(target.id);
     return {
@@ -6956,6 +7568,55 @@ export default function ChatInterface() {
       makeMsgId()
     );
     resolver({ performed: false, targetAlive: target?.isAlive !== false });
+  }
+
+  const SHIELD_SPELL_NAME = "Bouclier";
+
+  function defenderCanCastShieldReaction(target) {
+    if (!target?.id) return { ok: false, reason: "" };
+    const canon = canonicalizeSpellNameAgainstCombatant(target, SHIELD_SPELL_NAME);
+    if (!canon || !SPELLS?.[canon]) return { ok: false, reason: "" };
+    const spell = SPELLS[canon];
+    const level = spell?.level ?? 1;
+    if (!combatantHasSpellSlotAtOrAbove(target, level)) {
+      return { ok: false, reason: "Pas d'emplacement de sort disponible pour Bouclier." };
+    }
+    const trMap = gameStateRef.current?.turnResourcesByCombatantId ?? turnResourcesByCombatantId ?? {};
+    const tr = normalizeTurnResourcesInput(trMap[target.id]);
+    if (!tr.reaction || !hasReaction(target.id)) {
+      return { ok: false, reason: "Réaction indisponible." };
+    }
+    const compV = validateSpellCastingComponents(target, canon);
+    if (!compV.ok) return { ok: false, reason: compV.reason };
+    if (
+      normalizeCombatTimedStates(target.combatTimedStates).some(
+        (e) => e.stateId === COMBAT_TIMED_STATE_IDS.BOUCLIER
+      )
+    ) {
+      return { ok: false, reason: "Bouclier déjà actif." };
+    }
+    return { ok: true, canon };
+  }
+
+  function promptPlayerShieldReaction(defender, attacker, chosenWeapon, atkTotal, baseAc) {
+    return new Promise((resolve) => {
+      shieldReactionPromptResolverRef.current = resolve;
+      setShieldReactionPrompt({
+        defenderId: defender?.id ?? "",
+        attackerName: attacker?.name ?? "",
+        weaponName: chosenWeapon?.name ?? "",
+        defenderName: defender?.name ?? "Vous",
+        atkTotal,
+        baseAc,
+      });
+    });
+  }
+
+  function settlePlayerShieldReactionPrompt(choice) {
+    const resolver = shieldReactionPromptResolverRef.current;
+    shieldReactionPromptResolverRef.current = null;
+    setShieldReactionPrompt(null);
+    if (typeof resolver === "function") resolver(choice);
   }
 
   async function processOpportunityAttacksForLeavingCombatant(movingCombatantId, reactorIds = []) {
@@ -7062,6 +7723,8 @@ export default function ChatInterface() {
     atkBonus,
     atkTotal,
     targetAc,
+    comparisonAc = null,
+    acSuffix = "",
     dice,
     lastDmgRoll,
     lastDmgTotal,
@@ -7069,6 +7732,7 @@ export default function ChatInterface() {
     maxHp,
     rollMeta = null,
   }) {
+    const acVs = comparisonAc != null ? comparisonAc : targetAc;
     const advDisNote =
       rollMeta?.nat2 != null && rollMeta.mode && rollMeta.mode !== "normal"
         ? rollMeta.mode === "cancelled"
@@ -7100,11 +7764,11 @@ export default function ChatInterface() {
       return lines.join("\n");
     }
     lines.push(
-      `Jet d'attaque : ${nat} ${fmtMod(atkBonus)} = **${atkTotal}** vs CA **${targetAc}**${advDisNote} — ${
-        atkTotal >= targetAc ? "**touche**" : "**raté**"
+      `Jet d'attaque : ${nat} ${fmtMod(atkBonus)} = **${atkTotal}** vs CA **${acVs}**${acSuffix}${advDisNote} — ${
+        atkTotal >= acVs ? "**touche**" : "**raté**"
       }.`
     );
-    if (atkTotal >= targetAc && lastDmgTotal > 0 && lastDmgRoll && !lastDmgRoll.crit) {
+    if (atkTotal >= acVs && lastDmgTotal > 0 && lastDmgRoll && !lastDmgRoll.crit) {
       lines.push(formatDmgRoll(dice, lastDmgRoll.rolls, chosenWeapon.damageBonus ?? 0));
       lines.push(`PV de ${target.name} après le coup : **${currentHp}** / ${maxHp}.`);
     }
@@ -7172,6 +7836,81 @@ export default function ChatInterface() {
       narrativeOutcome = nat === 20 || autoCritOnUnconsciousTarget ? "critical_hit" : "hit";
     }
 
+    let comparisonAc = targetAc;
+    let acSuffix = "";
+    const entsForCtrl = gameStateRef.current?.entities ?? entities ?? [];
+    const targetCtrl = controllerForCombatantId(target?.id, entsForCtrl);
+    const attackerCtrl = controllerForCombatantId(attacker?.id, entsForCtrl);
+    const attackerIsHostileToPlayer =
+      attackerCtrl !== "player" && (attacker?.type === "hostile" || attackerCtrl === "ai");
+
+    if (
+      narrativeOutcome === "hit" &&
+      !tacticalAction?.skipShieldPrompt &&
+      targetCtrl === "player" &&
+      attackerIsHostileToPlayer &&
+      isLocalPlayerCombatantId(target?.id)
+    ) {
+      const liveTarget = getRuntimeCombatant(target.id) ?? target;
+      const canShield = defenderCanCastShieldReaction(liveTarget);
+      if (canShield.ok) {
+        await yieldCombatUiSync();
+        const choice = await promptPlayerShieldReaction(
+          liveTarget,
+          attacker,
+          chosenWeapon,
+          atkTotal,
+          targetAc
+        );
+        await yieldCombatUiSync();
+        if (choice === "shield") {
+          const canon =
+            canShield.canon ??
+            canonicalizeSpellNameAgainstCombatant(liveTarget, SHIELD_SPELL_NAME) ??
+            SHIELD_SPELL_NAME;
+          const compV = validateSpellCastingComponents(liveTarget, canon);
+          const slotResult = spendSpellSlotForCombatant(liveTarget.id, SPELLS[canon]?.level ?? 1);
+          if (compV.ok && slotResult.ok) {
+            setReactionFor(liveTarget.id, false);
+            const orderLen = Math.max(
+              1,
+              (gameStateRef.current?.combatOrder ?? combatOrder ?? []).length
+            );
+            const nextStates = upsertCombatTimedState(
+              liveTarget.combatTimedStates,
+              COMBAT_TIMED_STATE_IDS.BOUCLIER,
+              orderLen
+            );
+            applyEntityUpdates([
+              { id: liveTarget.id, action: "update", combatTimedStates: nextStates },
+            ]);
+            const oldTimedAc = getAcBonusFromCombatTimedStates(liveTarget.combatTimedStates);
+            const newTimedAc = getAcBonusFromCombatTimedStates(nextStates);
+            comparisonAc = targetAc - oldTimedAc + newTimedAc;
+            acSuffix = " (Bouclier +5)";
+            addMessage(
+              "ai",
+              `🛡️ **${liveTarget.name ?? "Vous"}** lance *Bouclier* en réaction (+5 CA, ${orderLen} pas d’initiative restants).`,
+              "enemy-turn",
+              makeMsgId()
+            );
+            if (atkTotal < comparisonAc) {
+              narrativeOutcome = "miss";
+            }
+          } else {
+            addMessage(
+              "ai",
+              `🛡️ *Bouclier* ne peut pas être lancé : ${
+                !compV.ok ? compV.reason : "emplacement de sort indisponible."
+              }`,
+              "enemy-turn",
+              makeMsgId()
+            );
+          }
+        }
+      }
+    }
+
     if (narrativeOutcome === "critical_hit") {
       const r1 = rollDiceDetailed(dice);
       const r2 = rollDiceDetailed(dice);
@@ -7198,6 +7937,8 @@ export default function ChatInterface() {
       atkBonus,
       atkTotal,
       targetAc,
+      comparisonAc,
+      acSuffix,
       dice,
       lastDmgRoll,
       lastDmgTotal,
@@ -7317,6 +8058,8 @@ export default function ChatInterface() {
           atkBonus,
           atkTotal,
           targetAc,
+          comparisonAc,
+          acSuffix,
           damageDice: dice,
           damageBonus: dmgBonus,
           damageRoll: lastDmgRoll,
@@ -7581,6 +8324,8 @@ export default function ChatInterface() {
     let effectiveInMeleeWithPlayer = getMeleeWith(enemy.id).some(
       (tid) => controllerForCombatantId(tid, entsForMelee) === "player"
     );
+    /** Miroir synchrone des ids au contact de cet ennemi (getMeleeWith peut être périmé dans la boucle). */
+    let localMeleeNeighbors = new Set(getMeleeWith(enemy.id));
 
     const pickOffensiveOptionForAction = (act, targetCombatant) => {
       const spellName = canonicalizeSpellNameAgainstCombatant(enemy, act?.name ?? "");
@@ -7596,12 +8341,13 @@ export default function ChatInterface() {
       if (!chosenWeapon && enemyWeapons.length > 0) {
         chosenWeapon = enemyWeapons[0];
       }
-      const inMelee = effectiveInMeleeWithPlayer;
-      if (chosenWeapon && inMelee && isRangedWeapon(chosenWeapon)) {
+      const targetIdStr = targetCombatant?.id != null ? String(targetCombatant.id).trim() : "";
+      const inMeleeWithTarget = targetIdStr && localMeleeNeighbors.has(targetIdStr);
+      if (chosenWeapon && effectiveInMeleeWithPlayer && isRangedWeapon(chosenWeapon)) {
         chosenWeapon = enemyWeapons.find((w) => !isRangedWeapon(w)) ?? chosenWeapon;
       }
       let canAttack = !!chosenWeapon && !!targetCombatant;
-      if (chosenWeapon && !inMelee && !isRangedWeapon(chosenWeapon)) {
+      if (chosenWeapon && !inMeleeWithTarget && !isRangedWeapon(chosenWeapon)) {
         canAttack = false;
       }
       return { kind: "weapon", chosenWeapon, canAttack };
@@ -7666,7 +8412,18 @@ export default function ChatInterface() {
           await pauseEnemyTacticalStep();
           continue;
         }
-        const approachTargetId = firstAlivePlayerCombatantIdFromOrder();
+        const resolveApproachTargetIdFromAct = () => {
+          const raw = typeof act?.targetId === "string" ? act.targetId.trim() : "";
+          if (raw) {
+            if (controllerForCombatantId(raw, entsForMelee) !== "player") {
+              return firstAlivePlayerCombatantIdFromOrder();
+            }
+            const c = getRuntimeCombatant(raw, entsForMelee);
+            if (c && c.isAlive !== false) return raw;
+          }
+          return firstAlivePlayerCombatantIdFromOrder();
+        };
+        const approachTargetId = resolveApproachTargetIdFromAct();
         const hiddenArrApproach = gameStateRef.current?.combatHiddenIds ?? combatHiddenIds ?? [];
         const hiddenSetApproach = new Set(
           (Array.isArray(hiddenArrApproach) ? hiddenArrApproach : [])
@@ -7678,53 +8435,115 @@ export default function ChatInterface() {
           hiddenSetApproach.has(approachTargetId) || approachTargetRt?.hidden === true;
         enemyMovementAvailable = false;
         markEnemyMovementSpent();
-        if (!effectiveInMeleeWithPlayer) {
-          if (cannotCloseOnHidden) {
-            addMessage(
-              "ai",
-              `⚔️ ${enemy.name} ne parvient pas à engager au corps à corps : la cible n'est pas localisée (cachée / camouflée).`,
-              "enemy-turn",
-              makeMsgId()
+
+        const approachDisplayName = resolveCombatantDisplayName(
+          { id: approachTargetId, name: approachTargetRt?.name },
+          entsForMelee,
+          player?.name ?? null
+        );
+
+        if (localMeleeNeighbors.has(approachTargetId)) {
+          addMessage(
+            "ai",
+            `⚔️ ${enemy.name} reste au contact de ${approachDisplayName}.`,
+            "enemy-turn",
+            makeMsgId()
+          );
+          await pauseEnemyTacticalStep();
+          continue;
+        }
+
+        if (cannotCloseOnHidden) {
+          addMessage(
+            "ai",
+            `⚔️ ${enemy.name} ne parvient pas à engager au corps à corps : la cible n'est pas localisée (cachée / camouflée).`,
+            "enemy-turn",
+            makeMsgId()
+          );
+          emitMeleeGraphDebugChat({
+            label: "ennemi mouvement (échec rapprochement — cible non localisée)",
+            moverId: enemy.id,
+            moverName: enemy.name,
+            meleeStateSim: cloneMeleeStateShallow(meleeState),
+            getMeleeWith,
+            entities: entsForMelee,
+            combatOrder: gameStateRef.current?.combatOrder ?? combatOrder,
+            localCombatantIdForNames: localCombatantId,
+            localPlayerDisplayName: player?.name ?? null,
+            addMessage,
+            makeMsgId,
+          });
+          await pauseEnemyTacticalStep();
+          continue;
+        }
+
+        const prevPartners = [...localMeleeNeighbors];
+
+        if (prevPartners.length === 0) {
+          clearMeleeFor(enemy.id);
+          addMeleeMutual(enemy.id, approachTargetId);
+          localMeleeNeighbors = new Set([approachTargetId]);
+          effectiveInMeleeWithPlayer =
+            controllerForCombatantId(approachTargetId, entsForMelee) === "player";
+          addMessage(
+            "ai",
+            `⚔️ ${enemy.name} se rapproche au corps à corps.`,
+            "enemy-turn",
+            makeMsgId()
+          );
+          const simEn = cloneMeleeStateShallow(meleeState);
+          linkMeleePairInCopy(simEn, enemy.id, approachTargetId);
+          emitMeleeGraphDebugChat({
+            label: "ennemi rapprochement au contact",
+            moverId: enemy.id,
+            moverName: enemy.name,
+            meleeStateSim: simEn,
+            getMeleeWith,
+            entities: entsForMelee,
+            combatOrder: gameStateRef.current?.combatOrder ?? combatOrder,
+            localCombatantIdForNames: localCombatantId,
+            localPlayerDisplayName: player?.name ?? null,
+            addMessage,
+            makeMsgId,
+          });
+        } else {
+          if (!hasDisengaged) {
+            const moverSurvived = await processOpportunityAttacksForLeavingCombatant(
+              enemy.id,
+              prevPartners
             );
-            emitMeleeGraphDebugChat({
-              label: "ennemi mouvement (échec rapprochement — cible non localisée)",
-              moverId: enemy.id,
-              moverName: enemy.name,
-              meleeStateSim: cloneMeleeStateShallow(meleeState),
-              getMeleeWith,
-              entities: entsForMelee,
-              combatOrder: gameStateRef.current?.combatOrder ?? combatOrder,
-              localCombatantIdForNames: localCombatantId,
-              localPlayerDisplayName: player?.name ?? null,
-              addMessage,
-              makeMsgId,
-            });
+            if (!moverSurvived || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) {
+              return;
+            }
           } else {
             clearMeleeFor(enemy.id);
-            addMeleeMutual(enemy.id, approachTargetId);
-            effectiveInMeleeWithPlayer = true;
-            addMessage(
-              "ai",
-              `⚔️ ${enemy.name} se rapproche au corps à corps.`,
-              "enemy-turn",
-              makeMsgId()
-            );
-            const simEn = cloneMeleeStateShallow(meleeState);
-            linkMeleePairInCopy(simEn, enemy.id, approachTargetId);
-            emitMeleeGraphDebugChat({
-              label: "ennemi rapprochement au contact",
-              moverId: enemy.id,
-              moverName: enemy.name,
-              meleeStateSim: simEn,
-              getMeleeWith,
-              entities: entsForMelee,
-              combatOrder: gameStateRef.current?.combatOrder ?? combatOrder,
-              localCombatantIdForNames: localCombatantId,
-              localPlayerDisplayName: player?.name ?? null,
-              addMessage,
-              makeMsgId,
-            });
           }
+          localMeleeNeighbors.clear();
+          addMeleeMutual(enemy.id, approachTargetId);
+          localMeleeNeighbors.add(approachTargetId);
+          effectiveInMeleeWithPlayer =
+            controllerForCombatantId(approachTargetId, entsForMelee) === "player";
+          addMessage(
+            "ai",
+            `⚔️ ${enemy.name} se rapproche de ${approachDisplayName} au corps à corps.`,
+            "enemy-turn",
+            makeMsgId()
+          );
+          const simSw = cloneMeleeStateShallow(meleeState);
+          linkMeleePairInCopy(simSw, enemy.id, approachTargetId);
+          emitMeleeGraphDebugChat({
+            label: "ennemi changement de cible au contact",
+            moverId: enemy.id,
+            moverName: enemy.name,
+            meleeStateSim: simSw,
+            getMeleeWith,
+            entities: entsForMelee,
+            combatOrder: gameStateRef.current?.combatOrder ?? combatOrder,
+            localCombatantIdForNames: localCombatantId,
+            localPlayerDisplayName: player?.name ?? null,
+            addMessage,
+            makeMsgId,
+          });
         }
         await pauseEnemyTacticalStep();
         continue;
@@ -7794,6 +8613,7 @@ export default function ChatInterface() {
         effectiveInMeleeWithPlayer = getMeleeWith(enemy.id).some(
           (tid) => controllerForCombatantId(tid, entsForMelee) === "player"
         );
+        localMeleeNeighbors = new Set(getMeleeWith(enemy.id));
         if (inMelee) {
           const fleeMsg =
             hasDisengaged || engagedReactors.length > 0
@@ -7842,6 +8662,7 @@ export default function ChatInterface() {
       });
       if (engagedReactors.length > 0) clearMeleeFor(enemy.id);
       effectiveInMeleeWithPlayer = false;
+      localMeleeNeighbors.clear();
       addMessage(
         "ai",
         `⚔️ ${enemy.name} se retire prudemment après s'être désengagé.`,
@@ -7881,7 +8702,9 @@ export default function ChatInterface() {
     if (enemyStillAlive() && !spentEnemyAction && !hasDisengaged) {
       const inMelee = effectiveInMeleeWithPlayer;
       const fleeInPlan = actions.some((a) => typeOf(a) === "movement" && isFleeNameStr(nameOf(a)));
-      if (inMelee && enemyWeapons.length > 0 && !fleeInPlan && fallbackPlayerTarget) {
+      const fbFromMelee =
+        localMeleeNeighbors.size > 0 ? getRuntimeCombatant([...localMeleeNeighbors][0], entsForMelee) : null;
+      if (inMelee && enemyWeapons.length > 0 && !fleeInPlan && fbFromMelee && fbFromMelee.isAlive !== false) {
         let chosenWeapon = enemyWeapons[0];
         if (isRangedWeapon(chosenWeapon)) {
           chosenWeapon = enemyWeapons.find((w) => !isRangedWeapon(w)) ?? chosenWeapon;
@@ -7890,7 +8713,7 @@ export default function ChatInterface() {
         if (canAttack && chosenWeapon) {
           const result = await resolveCombatantWeaponAttack(
             enemy,
-            fallbackPlayerTarget,
+            fbFromMelee,
             chosenWeapon,
             label,
             tactical,
@@ -7979,11 +8802,15 @@ export default function ChatInterface() {
   function ensureCombatState(currentEntities, maybeOrder = null, options = null) {
     const liveMode = gameStateRef.current?.gameMode ?? gameMode;
     const anyCombatReadyHostile = hasAnyCombatReadyHostile(currentEntities);
+    const anyHostileAlive = hasAnyHostileAlive(currentEntities);
     if (!anyCombatReadyHostile) {
       const entLen = Array.isArray(currentEntities) ? currentEntities.length : 0;
       const orderLen =
         (Array.isArray(gameStateRef.current?.combatOrder) ? gameStateRef.current.combatOrder.length : 0) ||
         (combatOrder?.length ?? 0);
+      // Ne jamais sortir du combat juste parce que `awareOfPlayer` est temporairement faux
+      // (arbiter/sync). Tant qu'un hostile vivant existe et qu'un ordre est actif, le segment continue.
+      const preserveCombatWithLivingHostiles = liveMode === "combat" && anyHostileAlive && orderLen > 0;
       // Après un jet joueur → arbitre (porte, obstacle…), la salle peut avoir entities=[] sans que le
       // combat soit terminé : ne pas traiter "aucune entité" comme "plus aucun hostile" et effacer l'initiative.
       const skipEmptyRoomCleanup =
@@ -7991,7 +8818,7 @@ export default function ChatInterface() {
         entLen === 0 &&
         orderLen > 0 &&
         liveMode === "combat";
-      if (skipEmptyRoomCleanup) {
+      if (skipEmptyRoomCleanup || preserveCombatWithLivingHostiles) {
         return;
       }
       if (liveMode === "combat") {
@@ -8025,7 +8852,7 @@ export default function ChatInterface() {
   }
 
   function isCombatOver(currentEntities) {
-    return !currentEntities.some((e) => isHostileReadyForCombat(e));
+    return !currentEntities.some((e) => e?.type === "hostile" && e.isAlive);
   }
 
   function nextAliveTurnIndex(order, idx, currentEntities) {
@@ -9247,7 +10074,8 @@ export default function ChatInterface() {
     actingPlayerOverride = null,
     rollAttribution = null,
     meleeCombatantIdForResolve = null,
-    turnResourcesOverrideForResolve = null
+    turnResourcesOverrideForResolve = null,
+    multiplayerPendingCommandIdForEngine = null
   ) {
     if (!apiIntent || typeof apiIntent !== "object") {
       addMessage("ai", "Intention non reconnue.", "intent-error", makeMsgId());
@@ -9494,10 +10322,14 @@ export default function ChatInterface() {
       combatEngagementSeqRef,
       combatRoundInEngagementRef,
       combatTurnIndexLiveRef,
+      multiplayerPendingCommandId: multiplayerPendingCommandIdForEngine,
     });
 
     if (!intentResult.ok) {
-      if (!shouldSkipDuplicateClientActionErrorEcho(intentResult.userMessage)) {
+      const fromMpPendingCommand = !!String(multiplayerPendingCommandIdForEngine ?? "").trim();
+      // MP : ne jamais "silencer" la seule erreur visible, sinon le joueur voit
+      // le spinner "MJ réfléchit…" sans explication en cas de cible/salle désynchronisée.
+      if (fromMpPendingCommand || !shouldSkipDuplicateClientActionErrorEcho(intentResult.userMessage)) {
         addMessage("ai", intentResult.userMessage, multiplayerSessionId ? "meta" : "intent-error", makeMsgId());
       }
       return;
@@ -9569,7 +10401,8 @@ export default function ChatInterface() {
     actingPlayerOverride = null,
     rollAttribution = null,
     meleeCombatantIdForResolve = null,
-    turnResourcesOverrideForResolve = null
+    turnResourcesOverrideForResolve = null,
+    multiplayerPendingCommandIdForArbiter = null
   ) {
     if (!apiDecision || typeof apiDecision !== "object") {
       addMessage("ai", "Décision d'arbitrage invalide.", "intent-error", makeMsgId());
@@ -9931,7 +10764,8 @@ export default function ChatInterface() {
         effectiveActingPlayer,
         rollAttribution,
         meleeCombatantIdForResolve,
-        turnResourcesOverrideForResolve
+        turnResourcesOverrideForResolve,
+        multiplayerPendingCommandIdForArbiter
       );
       return;
     }
@@ -9983,6 +10817,7 @@ export default function ChatInterface() {
               bypassIntentParser: true,
               skipAutoPlayerTurn: true,
               skipGmContinue: true,
+              skipSceneRulesResolvedPipeline: true,
               actingPlayer: effectiveActingPlayer,
               entities: resolved?.nextEntities ?? baseEntities,
               currentRoomId: resolved?.nextRoomId ?? baseRoomId,
@@ -10044,7 +10879,26 @@ export default function ChatInterface() {
       }
       const skill = rr.skill ?? null;
       const computed = computeCheckBonus({ player: effectiveActingPlayer, stat: rr.stat, skill });
-      const normalizedRoll = { ...rr, skill: skill ?? undefined, totalBonus: computed };
+      const audienceRaw = String(rr?.audience ?? "single").trim().toLowerCase();
+      let audience =
+        audienceRaw === "global" ? "global" : audienceRaw === "selected" ? "selected" : "single";
+      const rawTargets = Array.isArray(rr.rollTargetEntityIds) ? rr.rollTargetEntityIds : [];
+      const entityIdSet = buildEntityIdSetForMpRollTargetSanitize(
+        baseEntities,
+        multiplayerSessionId,
+        multiplayerParticipantProfilesRef.current
+      );
+      let rollTargetEntityIds = [
+        ...new Set(rawTargets.map((x) => String(x ?? "").trim()).filter((id) => entityIdSet.has(id))),
+      ];
+      if (audience === "selected" && rollTargetEntityIds.length === 0) audience = "single";
+      if ((audience === "global" || audience === "selected") && rr.kind !== "check") {
+        audience = "single";
+        rollTargetEntityIds = [];
+      }
+      let normalizedRoll = { ...rr, skill: skill ?? undefined, totalBonus: computed };
+      delete normalizedRoll.audience;
+      delete normalizedRoll.rollTargetEntityIds;
       // En exploration, après le d20 le moteur doit enchaîner avec l’arbitre de scène
       // (secrets du lieu : dégâts de piège, 1d6 de chute, etc.) — voir parse-intent « ne pas gérer les règles du lieu ».
       if (baseGameModeForResolve === "exploration") {
@@ -10066,6 +10920,35 @@ export default function ChatInterface() {
             },
           },
         };
+      }
+      const canIntentGroupRoll =
+        rr.kind === "check" &&
+        (audience === "global" || audience === "selected") &&
+        normalizedRoll.returnToArbiter === true;
+      if (canIntentGroupRoll) {
+        const globalRaisonPrefix =
+          audience === "global"
+            ? "**Jet de groupe** — chaque joueur connecté lance ce test ; le MJ interprète l’ensemble des résultats. "
+            : "**Jet multi-PJ** — les personnages désignés lancent chacun ce test ; le MJ interprète l’ensemble des résultats. ";
+        const globalRollId = `intent_grp_${String(baseRoomId ?? "").trim() || "room"}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+        const raisonBase = String(rr.raison ?? "").trim() || "Action incertaine";
+        normalizedRoll = {
+          ...normalizedRoll,
+          id: globalRollId,
+          audience,
+          ...(audience === "selected" ? { rollTargetEntityIds } : {}),
+          globalRollsByClientId: {},
+          raison: `${globalRaisonPrefix}${raisonBase}`,
+        };
+        pendingRollRef.current = normalizedRoll;
+        setPendingRoll(normalizedRoll);
+        addMessage(
+          "ai",
+          `[DEBUG] Arbiter → pendingRoll (groupe intent)\n` + safeJson(normalizedRoll),
+          "debug",
+          makeMsgId()
+        );
+        return;
       }
       const stamped = stampPendingRollForActor(
         normalizedRoll,
@@ -10169,37 +11052,10 @@ export default function ChatInterface() {
       const room = tid && GOBLIN_CAVE[tid] ? GOBLIN_CAVE[tid] : null;
       const baseTrim = String(baseRoomId ?? "").trim();
       if (room && tid !== baseTrim) {
-        sceneUpdateSnapshot = sceneUpdate;
-        rememberRoomEntitiesSnapshot(baseRoomId, nextEntities);
-        nextRoomId = tid;
-        nextScene = room.description ?? baseScene;
-        nextSceneName = room.title ?? currentSceneName;
-        nextEntities = tid === "scene_journey" ? [] : takeEntitiesForRoom(tid);
-        setCurrentRoomId(tid);
-        if (nextSceneName) setCurrentSceneName(nextSceneName);
-        if (nextScene) setCurrentScene(nextScene);
-        replaceEntities(nextEntities);
-        gameStateRef.current = {
-          ...gameStateRef.current,
-          currentRoomId: nextRoomId,
-          currentScene: nextScene,
-          currentSceneName: nextSceneName,
-          entities: nextEntities,
-        };
-        engineEvent = {
-          kind: "scene_transition",
-          fromRoomId: baseRoomId,
-          targetRoomId: tid,
-          playerAction: userTextForResolve,
-          reason: apiDecision.reason ?? null,
-        };
-        if (multiplayerSessionId) {
-          try {
-            await flushMultiplayerSharedState();
-          } catch {
-            /* sync best-effort */
-          }
-        }
+        // IMPORTANT: on ne change JAMAIS de salle ici.
+        // Parse-intent ne fait qu'émettre une intention de transition ; la validation finale
+        // (porte fermée, conditions de passage, verrou, etc.) doit passer par GM Arbitre.
+        sceneUpdateSnapshot = { hasChanged: true, targetRoomId: tid };
       }
     }
 
@@ -10236,7 +11092,7 @@ export default function ChatInterface() {
           intentDecision: {
             resolution: apiDecision.resolution,
             reason: apiDecision.reason ?? null,
-            sceneUpdate: hadIntentSceneTransition ? null : sceneUpdate ?? null,
+            sceneUpdate: hadIntentSceneTransition ? null : sceneUpdateSnapshot ?? null,
             parseIntentNavigationApplied: hadIntentSceneTransition ? true : undefined,
           },
             actingPlayerOverride: effectiveActingPlayer,
@@ -10282,8 +11138,12 @@ export default function ChatInterface() {
     }
 
     // Point unique de prose MJ après parse-intent : moteur + arbitre(s) ont fini (jets secrets, spawns, scènes).
+    // Si une navigation a déjà été appliquée (sceneUpdate parse-intent), on n'envoie PAS le texte joueur brut
+    // au narrateur pour éviter la double prose « je me déplace » puis « j'entre dans la salle ».
+    // On force un trigger d'entrée de scène, afin de ne garder que la narration post-transition.
+    const narratorInputAfterIntent = hadIntentSceneTransition ? "[SceneEntered]" : userTextForResolve;
     // skipSceneRulesResolvedPipeline évite un 2e /api/chat [SceneRulesResolved] si la réponse JSON reprend un sceneUpdate.
-    await callApi(userTextForResolve, "meta", false, {
+    await callApi(narratorInputAfterIntent, "meta", false, {
       hideUserMessage: true,
       bypassIntentParser: true,
       skipAutoPlayerTurn: true,
@@ -10371,9 +11231,11 @@ export default function ChatInterface() {
     activeRoomId,
     activeEntities,
     crossRoomEntityUpdates,
+    crossRoomMoves,
     crossRoomMemoryAppend,
   }) {
     let nextActiveEntities = Array.isArray(activeEntities) ? activeEntities : [];
+    let activeEntitiesTouched = false;
 
     if (Array.isArray(crossRoomEntityUpdates)) {
       for (const entry of crossRoomEntityUpdates) {
@@ -10385,6 +11247,7 @@ export default function ChatInterface() {
         if (targetRoomId === activeRoomId) {
           nextActiveEntities = applyUpdatesLocally(nextActiveEntities, roomUpdates);
           applyEntityUpdates(roomUpdates);
+          activeEntitiesTouched = true;
           continue;
         }
 
@@ -10393,6 +11256,58 @@ export default function ChatInterface() {
         const nextSnapshot = applyUpdatesLocally(existingSnapshot, roomUpdates);
         rememberRoomEntitiesSnapshot(targetRoomId, nextSnapshot);
       }
+    }
+
+    if (Array.isArray(crossRoomMoves)) {
+      for (const move of crossRoomMoves) {
+        if (!move || typeof move !== "object") continue;
+        const entityId = String(move.entityId ?? "").trim();
+        const fromRoomId = String(move.fromRoomId ?? "").trim();
+        const toRoomId = String(move.toRoomId ?? "").trim();
+        if (!entityId || !fromRoomId || !toRoomId || fromRoomId === toRoomId) continue;
+        const patch =
+          move.patch && typeof move.patch === "object" && !Array.isArray(move.patch) ? move.patch : null;
+
+        const sourceEntities =
+          fromRoomId === activeRoomId ? nextActiveEntities : fromRoomId === "scene_journey" ? [] : takeEntitiesForRoom(fromRoomId);
+        const sourceList = Array.isArray(sourceEntities) ? sourceEntities : [];
+        const baseEntity = sourceList.find((e) => e && String(e.id ?? "").trim() === entityId) ?? null;
+        if (!baseEntity) continue;
+
+        const movedEntity = {
+          ...baseEntity,
+          ...(patch ? patch : {}),
+          id: entityId,
+        };
+
+        const sourceNext = sourceList.filter((e) => String(e?.id ?? "").trim() !== entityId);
+        if (fromRoomId === activeRoomId) {
+          nextActiveEntities = sourceNext;
+          activeEntitiesTouched = true;
+        } else {
+          rememberRoomEntitiesSnapshot(fromRoomId, sourceNext);
+        }
+
+        const destEntities =
+          toRoomId === activeRoomId ? nextActiveEntities : toRoomId === "scene_journey" ? [] : takeEntitiesForRoom(toRoomId);
+        const destList = Array.isArray(destEntities) ? destEntities : [];
+        const existingIdx = destList.findIndex((e) => String(e?.id ?? "").trim() === entityId);
+        const destNext =
+          existingIdx >= 0
+            ? destList.map((e, idx) => (idx === existingIdx ? { ...e, ...movedEntity, id: entityId } : e))
+            : [...destList, movedEntity];
+
+        if (toRoomId === activeRoomId) {
+          nextActiveEntities = destNext;
+          activeEntitiesTouched = true;
+        } else {
+          rememberRoomEntitiesSnapshot(toRoomId, destNext);
+        }
+      }
+    }
+
+    if (activeEntitiesTouched) {
+      replaceEntities(nextActiveEntities);
     }
 
     if (Array.isArray(crossRoomMemoryAppend)) {
@@ -10700,6 +11615,19 @@ export default function ChatInterface() {
         const statOk = ["FOR", "DEX", "CON", "INT", "SAG", "CHA"].includes(stat) ? stat : "SAG";
         const skillRaw = rr?.skill != null ? String(rr.skill).trim() : "";
         const skill = skillRaw || null;
+        const audienceRaw = String(rr?.audience ?? "single").trim().toLowerCase();
+        let audience =
+          audienceRaw === "global" ? "global" : audienceRaw === "selected" ? "selected" : "single";
+        const entSetGm = buildEntityIdSetForMpRollTargetSanitize(
+          entitiesAtEntry,
+          multiplayerSessionId,
+          multiplayerParticipantProfilesRef.current
+        );
+        const rawTg = Array.isArray(rr.rollTargetEntityIds) ? rr.rollTargetEntityIds : [];
+        let rollTargetEntityIdsGm = [
+          ...new Set(rawTg.map((x) => String(x ?? "").trim()).filter((id) => entSetGm.has(id))),
+        ];
+        if (audience === "selected" && rollTargetEntityIdsGm.length === 0) audience = "single";
         let dc = Number(rr?.dc);
         const stealthLike =
           !!skill &&
@@ -10708,7 +11636,14 @@ export default function ChatInterface() {
         let mechanicalStealthVsHostiles = false;
         let stealthOppName = null;
         if (stealthLike) {
-          if (baseGameMode === "combat") {
+          if ((audience === "global" || audience === "selected") && baseGameMode === "combat") {
+            const ppInfo = maxPassivePerceptionAmongHostilesForStealth(entitiesAtEntry);
+            if (ppInfo.found && ppInfo.dc != null && Number.isFinite(ppInfo.dc)) {
+              dc = ppInfo.dc;
+              mechanicalStealthVsHostiles = true;
+              stealthOppName = ppInfo.oppName;
+            }
+          } else if (baseGameMode === "combat") {
             const hiderId =
               String(arbiterTrigger?.actorId ?? "").trim() ||
               String(localCombatantId ?? "").trim() ||
@@ -10741,29 +11676,42 @@ export default function ChatInterface() {
               ? `Discrétion vs Perception passive adverse (${stealthOppName ?? "ennemis"}) — **DD ${dc}**.${baseRaison ? ` ${baseRaison}` : ""}`
               : `Discrétion vs Perception passive adverse (${stealthOppName ?? "ennemis présents"}) — **DD ${dc}** (même règle qu’en combat).${baseRaison ? ` ${baseRaison}` : ""}`
             : baseRaison || "Règle du lieu";
-        const pendingFromSceneArbiter = stampPendingRollForActor(
-          {
-            kind: "check",
-            stat: statOk,
-            skill,
-            dc,
-            raison: raisonStealth,
-            totalBonus: computedBonus,
-            returnToArbiter: true,
-            sceneArbiterContext: {
-              roomId,
-              scene,
-              sceneName,
-              sourceAction,
-              baseGameMode,
-              intentDecision: intentDecision ?? null,
-              arbiterTrigger: arbiterTrigger ?? null,
-              narrateAfterResolution: arbiterTrigger == null && !mechanicalStealthVsHostiles,
-            },
+        const globalRaisonPrefix =
+          audience === "global"
+            ? "**Jet de groupe** — chaque joueur connecté lance ce test ; le MJ interprète l’ensemble des résultats. "
+            : audience === "selected"
+              ? "**Jet multi-PJ** — les personnages désignés lancent chacun ce test ; le MJ interprète l’ensemble des résultats. "
+              : "";
+        const globalRollId = `arb_global_${String(roomId ?? "").trim() || "room"}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+        const pendingCore = {
+          id: globalRollId,
+          kind: "check",
+          stat: statOk,
+          skill,
+          dc,
+          raison: `${globalRaisonPrefix}${raisonStealth}`,
+          totalBonus: computedBonus,
+          audience,
+          ...(audience === "selected" ? { rollTargetEntityIds: rollTargetEntityIdsGm } : {}),
+          globalRollsByClientId: audience === "global" || audience === "selected" ? {} : undefined,
+          returnToArbiter: true,
+          sceneArbiterContext: {
+            roomId,
+            scene,
+            sceneName,
+            sourceAction,
+            baseGameMode,
+            intentDecision: intentDecision ?? null,
+            arbiterTrigger: arbiterTrigger ?? null,
+            // Toujours enchaîner le narrateur après résolution du jet (y compris entrée `scene_entered` :
+            // sinon le 2ᵉ POST gm-arbiter applique la scène mais aucun callApi — pas de prose MJ).
+            narrateAfterResolution: !mechanicalStealthVsHostiles,
           },
-          effectiveActingPlayer,
-          clientId
-        );
+        };
+        const pendingFromSceneArbiter =
+          audience === "global" || audience === "selected"
+            ? pendingCore
+            : stampPendingRollForActor(pendingCore, effectiveActingPlayer, clientId);
         pendingRollRef.current = pendingFromSceneArbiter;
         setPendingRoll(pendingFromSceneArbiter);
         addMessage(
@@ -10820,7 +11768,6 @@ export default function ChatInterface() {
     }
 
     let nextEntities = Array.isArray(entitiesAtEntry) ? entitiesAtEntry : [];
-    const sourceRoomEntitiesBeforeTransition = nextEntities;
     let nextRoomId = roomId;
     let nextScene = scene;
     let nextSceneName = sceneName;
@@ -10883,6 +11830,7 @@ export default function ChatInterface() {
       activeRoomId: nextRoomId,
       activeEntities: nextEntities,
       crossRoomEntityUpdates: finalDecision?.crossRoomEntityUpdates ?? null,
+      crossRoomMoves: finalDecision?.crossRoomMoves ?? null,
       crossRoomMemoryAppend: finalDecision?.crossRoomMemoryAppend ?? null,
     });
 
@@ -10894,20 +11842,20 @@ export default function ChatInterface() {
       if (tRoom) {
         const isSameRoomTransition = tid === nextRoomId;
         if (!isSameRoomTransition) {
-          rememberRoomEntitiesSnapshot(nextRoomId, sourceRoomEntitiesBeforeTransition);
+          // IMPORTANT:
+          // - `nextEntities` contient l'état le plus récent de la salle source (entityUpdates + cross-room déjà appliqués).
+          // - on doit snapshot CET état côté salle source avant de changer de room.
+          // Utiliser `sourceRoomEntitiesBeforeTransition` (pré-updates) perdait ces changements
+          // et la logique ci-dessous pouvait ensuite "embarquer" les entités source dans la salle cible.
+          rememberRoomEntitiesSnapshot(nextRoomId, nextEntities);
         }
         nextRoomId = tid;
         nextScene = tRoom.description ?? nextScene;
         nextSceneName = tRoom.title ?? nextSceneName;
-
-        // Si entityUpdates ont été appliqués ce tour sur la salle d'origine, nextEntities contient déjà
-        // le groupe et la rencontre : ne pas écraser avec takeEntitiesForRoom (sinon disparition des spawns).
-        // Sans entityUpdates, on charge l'état connu de la salle de destination (takeEntitiesForRoom gère
-        // les segments « vides » comme le trajet sans snapshot persistant).
         if (!isSameRoomTransition) {
-          if (updates.length === 0) {
-            nextEntities = takeEntitiesForRoom(tid);
-          }
+          // Un sceneUpdate change de salle: les entités actives deviennent celles de la salle cible.
+          // Garder `nextEntities` (salle source) ici provoque un "TP" visuel/métier des créatures.
+          nextEntities = takeEntitiesForRoom(tid);
         }
 
         setCurrentRoomId(nextRoomId);
@@ -10916,6 +11864,15 @@ export default function ChatInterface() {
         if (!isSameRoomTransition) {
           replaceEntities(nextEntities);
         }
+        // MP: setState React est async; si un flush Firestore part tout de suite après,
+        // il peut republier l'ancienne salle et provoquer un "retour arrière" visuel.
+        gameStateRef.current = {
+          ...gameStateRef.current,
+          currentRoomId: nextRoomId,
+          currentScene: nextScene,
+          currentSceneName: nextSceneName,
+          entities: nextEntities,
+        };
       }
     }
 
@@ -11187,6 +12144,186 @@ export default function ChatInterface() {
       release();
     }
   }
+  runSceneEntryGmArbiterRef.current = runSceneEntryGmArbiter;
+
+  /**
+   * MP — jet de compétence arbitre `audience: global|selected` : une seule dépendance primitive (longueur stable),
+   * évite l'erreur React « useEffect changed size between renders » (HMR / évolutions du tableau de deps).
+   */
+  const globalMpGroupArbiterTriggerKey = useMemo(() => {
+    if (!multiplayerSessionId) return "";
+    const pr = pendingRoll;
+    if (!pr || typeof pr !== "object") return "";
+    if (
+      pr.kind !== "check" ||
+      (pr.audience !== "global" && pr.audience !== "selected") ||
+      pr.returnToArbiter !== true
+    ) {
+      return "";
+    }
+    const ctx = pr.sceneArbiterContext;
+    if (!ctx || typeof ctx !== "object") return "";
+    const expected = getGroupSkillCheckExpectedClientIds(
+      multiplayerSessionId,
+      multiplayerParticipantProfilesRef.current,
+      clientId,
+      pr
+    );
+    const map =
+      pr.globalRollsByClientId && typeof pr.globalRollsByClientId === "object"
+        ? pr.globalRollsByClientId
+        : {};
+    if (!expected.length || !expected.every((eid) => map[eid] != null)) return "";
+    if (
+      !shouldRunGlobalArbiterFollowup({
+        multiplayerSessionId,
+        clientId,
+        hostClientId: multiplayerHostClientId,
+        expectedClientIds: expected,
+      })
+    ) {
+      return "";
+    }
+    const rid = String(pr.id ?? "").trim();
+    if (!rid) return "";
+    const rolloutSummary = expected
+      .map((eid) => {
+        const v = map[eid];
+        if (v == null) return `${eid}:x`;
+        const tot = typeof v.total === "number" && Number.isFinite(v.total) ? Math.trunc(v.total) : "";
+        const ok = v.success === true ? "1" : v.success === false ? "0" : "?";
+        return `${eid}:${tot}:${ok}`;
+      })
+      .join(";");
+    return `${rid}|${rolloutSummary}|${debugMode ? "1" : "0"}|${String(gameMode ?? "")}`;
+  }, [
+    multiplayerSessionId,
+    pendingRoll,
+    multiplayerParticipantProfilesRollGateKey,
+    clientId,
+    multiplayerHostClientId,
+    debugMode,
+    gameMode,
+  ]);
+
+  useEffect(() => {
+    if (!globalMpGroupArbiterTriggerKey) return;
+    const pr = pendingRollRef.current;
+    if (
+      !pr ||
+      pr.kind !== "check" ||
+      (pr.audience !== "global" && pr.audience !== "selected") ||
+      pr.returnToArbiter !== true
+    ) {
+      return;
+    }
+    const ctx = pr.sceneArbiterContext;
+    if (!ctx || typeof ctx !== "object") return;
+    const map =
+      pr.globalRollsByClientId && typeof pr.globalRollsByClientId === "object"
+        ? pr.globalRollsByClientId
+        : {};
+    const rid = String(pr.id ?? "").trim();
+    if (!rid) return;
+    if (globalSkillGroupArbiterResolvedIdsRef.current.has(rid)) return;
+    globalSkillGroupArbiterResolvedIdsRef.current.add(rid);
+
+    (async () => {
+      try {
+        setIsTyping(true);
+        const rollOutcome = buildGlobalPlayerCheckGroupRollOutcome({
+          roll: pr,
+          globalRollsByClientId: map,
+          dc: typeof pr.dc === "number" ? pr.dc : null,
+        });
+        const nextEntities = Array.isArray(gameStateRef.current?.entities)
+          ? gameStateRef.current.entities
+          : [];
+        const skillLabel = pr.skill ? `${pr.skill} (groupe)` : String(pr.stat ?? "");
+        const resolved = await runSceneEntryGmArbiterRef.current({
+          roomId: ctx.roomId,
+          scene: ctx.scene,
+          sceneName: ctx.sceneName,
+          entitiesAtEntry: nextEntities,
+          sourceAction: ctx.sourceAction,
+          baseGameMode: ctx.baseGameMode ?? gameStateRef.current?.gameMode ?? gameMode,
+          rollResultOverride: rollOutcome,
+          intentDecision: ctx.intentDecision ?? null,
+          arbiterTrigger: ctx.arbiterTrigger ?? null,
+        });
+        if (resolved?.awaitingPlayerRoll === true) {
+          globalSkillGroupArbiterResolvedIdsRef.current.delete(rid);
+          setIsTyping(false);
+          return;
+        }
+        pendingRollRef.current = null;
+        setPendingRoll(null);
+        const gmMode = gameStateRef.current?.gameMode ?? gameMode;
+        const enrichedEngineEvent =
+          resolved.engineEvent && typeof resolved.engineEvent === "object"
+            ? {
+                ...resolved.engineEvent,
+                playerSkillRoll: {
+                  skillLabel,
+                  group: true,
+                  summary: rollOutcome.summary,
+                  byClientId: rollOutcome.byClientId,
+                },
+              }
+            : {
+                kind: "scene_rule_resolution",
+                reason: resolved?.reason ?? null,
+                playerSkillRoll: {
+                  skillLabel,
+                  group: true,
+                  summary: rollOutcome.summary,
+                  byClientId: rollOutcome.byClientId,
+                },
+              };
+        if (ctx.narrateAfterResolution !== false) {
+          await callApi(ctx.sourceAction ?? "", "meta", false, {
+            skipSessionLock: true,
+            hideUserMessage: true,
+            bypassIntentParser: true,
+            skipAutoPlayerTurn: true,
+            skipGmContinue: true,
+            skipSceneRulesResolvedPipeline: true,
+            entities: resolved.nextEntities,
+            currentRoomId: resolved.nextRoomId,
+            currentScene: resolved.nextScene,
+            currentSceneName: resolved.nextSceneName,
+            gameMode: resolved.nextGameMode ?? gmMode,
+            engineEvent: enrichedEngineEvent,
+          });
+        } else if (debugMode) {
+          const visibleReason = String(enrichedEngineEvent?.reason ?? "").trim();
+          if (visibleReason) {
+            addMessage("ai", visibleReason, "meta-reply", makeMsgId());
+          }
+          setIsTyping(false);
+        } else {
+          setIsTyping(false);
+        }
+      } catch (e) {
+        globalSkillGroupArbiterResolvedIdsRef.current.delete(rid);
+        setIsTyping(false);
+        addMessage(
+          "ai",
+          `[DEBUG] Erreur GM Arbitre (jet de groupe) : ${String(e?.message ?? e)}`,
+          "debug",
+          makeMsgId()
+        );
+      } finally {
+        if (multiplayerSessionId) {
+          try {
+            await flushMultiplayerSharedState();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    })();
+  }, [globalMpGroupArbiterTriggerKey]);
 
   function isPurelyProceduralNarratorReason(text) {
     const t = String(text ?? "").trim().toLowerCase();
@@ -11288,6 +12425,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           skipSessionLock: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
+          skipSceneRulesResolvedPipeline: true,
           entities: resolved?.nextEntities ?? activeEntities,
           currentRoomId: resolved?.nextRoomId ?? activeRoomId,
           currentScene: resolved?.nextScene ?? activeScene,
@@ -11363,6 +12501,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           skipSessionLock: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
+          skipSceneRulesResolvedPipeline: true,
           entities: resolved?.nextEntities ?? activeEntities,
           currentRoomId: resolved?.nextRoomId ?? activeRoomId,
           currentScene: resolved?.nextScene ?? activeScene,
@@ -11445,7 +12584,9 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     const preexistingUserMessage = overrides?.preexistingUserMessage === true;
     /** Si true : la réponse /api/chat ne doit pas enchaîner arbitre → [SceneRulesResolved] (déjà fait dans processArbiterDecision après parse-intent). */
     const skipSceneRulesResolvedPipeline = overrides?.skipSceneRulesResolvedPipeline === true;
-    const isNaturalCall = !msgType && !isDebug;
+    /** Toute prose joueur doit rester sans msgType (ou ancien alias) pour enchaîner sur /api/parse-intent. */
+    const isNaturalCall =
+      (!msgType || String(msgType).trim() === "player-utterance") && !isDebug;
     const naturalNormText = String(userContent ?? "").trim().toLowerCase();
     const naturalSubmitterKey = String(rollSubmitterClientId ?? clientId ?? "").trim();
     const naturalParserReplayKey =
@@ -11875,7 +13016,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               actingPlayer,
               { submitterClientId: rollSubmitterClientId },
               actingMeleeCombatantId,
-              turnResourcesForResolve
+              turnResourcesForResolve,
+              mpCmdIdForParse || null
             );
           }
         } catch (e) {
@@ -12274,6 +13416,22 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           if (!spawnUpdate || spawnUpdate.action !== "spawn") return spawnUpdate;
           const templateId = String(spawnUpdate.templateId ?? "").trim();
           if (!templateId || !BESTIARY?.[templateId]) return spawnUpdate;
+          // pnj_generique : le MJ pose nom, fiction, PV, race, traits ; on garde le gabarit pour les attaques.
+          if (templateId === "pnj_generique") {
+            const {
+              attackBonus,
+              damageDice,
+              damageBonus,
+              weapons,
+              stats,
+              selectedSpells,
+              spellSlots,
+              spellAttackBonus,
+              spellSaveDc,
+              ...safeSpawn
+            } = spawnUpdate;
+            return safeSpawn;
+          }
           // Spawn piloté par template: le moteur initialise les stats de combat.
           const {
             attackBonus,
@@ -13496,6 +14654,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                         bypassIntentParser: true,
                         skipAutoPlayerTurn: true,
                         skipGmContinue: true,
+                        skipSceneRulesResolvedPipeline: true,
                         entities: resolved?.nextEntities ?? finalEntities,
                         currentRoomId: resolved?.nextRoomId ?? tid,
                         currentScene: resolved?.nextScene ?? finalDesc,
@@ -13792,6 +14951,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             bypassIntentParser: true,
             skipAutoPlayerTurn: true,
             skipGmContinue: true,
+            skipSceneRulesResolvedPipeline: true,
             entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
             currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
             currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
@@ -13851,6 +15011,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           bypassIntentParser: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
+          skipSceneRulesResolvedPipeline: true,
           actingPlayer: p.actingPlayerOverride ?? player ?? null,
           entities: resolved?.nextEntities ?? p.entitiesAtEntry,
           currentRoomId: resolved?.nextRoomId ?? p.roomId,
@@ -13925,6 +15086,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               bypassIntentParser: true,
               skipAutoPlayerTurn: true,
               skipGmContinue: true,
+              skipSceneRulesResolvedPipeline: true,
               entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
               currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
               currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
@@ -14221,7 +15383,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       if (
         autoRollEnabledRef.current &&
           !useManualRollInputRef.current &&
-        pendingRollTargetsLocalPlayer(pr, player, clientId, !!multiplayerSessionId)
+        pendingRollTargetsLocalPlayer(
+          pr,
+          player,
+          clientId,
+          !!multiplayerSessionId,
+          multiplayerSessionId,
+          multiplayerParticipantProfilesRef.current
+        )
       ) {
         void handleRoll();
       }
@@ -15379,7 +16548,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       return;
     }
     if (
-      !pendingRollTargetsLocalPlayer(pending, player, clientId, !!multiplayerSessionId)
+      !pendingRollTargetsLocalPlayer(
+        pending,
+        player,
+        clientId,
+        !!multiplayerSessionId,
+        multiplayerSessionId,
+        multiplayerParticipantProfilesRef.current
+      )
     ) {
       lastAutoRollKeyRef.current = null;
       return;
@@ -15402,6 +16578,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     player,
     clientId,
     multiplayerSessionId,
+    multiplayerParticipantProfilesRollGateKey,
   ]);
 
   async function handleSend() {
@@ -15925,7 +17102,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       setPendingRollUiHiddenKey((prev) => (prev === rollStableKey ? null : prev));
     };
     if (rollStableKey) setPendingRollUiHiddenKey(rollStableKey);
-    const forMe = pendingRollTargetsLocalPlayer(roll, player, clientId, !!multiplayerSessionId);
+    const forMe = pendingRollTargetsLocalPlayer(
+      roll,
+      player,
+      clientId,
+      !!multiplayerSessionId,
+      multiplayerSessionId,
+      multiplayerParticipantProfilesRef.current
+    );
     if (!forMe) return;
     if (roll.kind === "death_save" && !isPlayerTurnNow()) return;
     // En multi, `isTyping` peut rester true pendant que le serveur est en train de traiter
@@ -16121,6 +17305,16 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         consumeResource,
         setTurnResourcesSynced,
         gameMode: gameStateRef.current?.gameMode ?? gameMode,
+        consumeInventoryItemByName: (itemName) => {
+          const name = String(itemName ?? "").trim();
+          if (!name) return false;
+          const inv = Array.isArray(player?.inventory) ? player.inventory : [];
+          if (!inventoryHasStackedItem(inv, name)) return false;
+          const removed = removeOneStackedItem(inv, name);
+          if (!removed) return false;
+          updatePlayer({ inventory: stackInventory(removed) });
+          return true;
+        },
         stampPendingRollForActor,
         clientId,
         setPendingRoll,
@@ -16138,7 +17332,19 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         fmtMod,
         setSneakAttackArmed,
         setSneakAttackUsedThisTurn,
+        syncEntitiesImmediate: (nextEntities) => {
+          gameStateRef.current = {
+            ...gameStateRef.current,
+            entities: Array.isArray(nextEntities) ? nextEntities : gameStateRef.current?.entities ?? [],
+          };
+        },
         safeJson,
+        localCombatantId,
+        multiplayerParticipantProfiles: Array.isArray(multiplayerParticipantProfiles)
+          ? multiplayerParticipantProfiles
+          : [],
+        patchParticipantProfileHp,
+        multiplayerSessionId,
       });
       if (handled) return;
     }
@@ -17084,7 +18290,12 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     }
 
     // Jet de compétence en combat : une Action (évite plusieurs tests gratuits le même tour ; sync MP).
-    if (roll.kind === "check") {
+    const skipCombatActionForGlobalArbiter =
+      roll.kind === "check" &&
+      (roll.audience === "global" || roll.audience === "selected") &&
+      roll.returnToArbiter === true &&
+      roll.sceneArbiterContext;
+    if (roll.kind === "check" && !skipCombatActionForGlobalArbiter) {
       const gm = gameStateRef.current?.gameMode ?? gameMode;
       const co = gameStateRef.current?.combatOrder ?? combatOrder;
       const idx = combatTurnIndexLiveRef.current;
@@ -17160,8 +18371,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     })();
     const nat = Math.trunc(rolledNat);
     if (debugNextRoll !== null) setDebugNextRoll(null);
-    const total = nat + roll.totalBonus;
-    const bonus = fmtMod(roll.totalBonus);
+    const bonusForCheck =
+      roll.kind === "check" &&
+      (roll.audience === "global" || roll.audience === "selected") &&
+      player
+        ? computeCheckBonus({ player, stat: roll.stat, skill: roll.skill })
+        : roll.totalBonus;
+    const total = nat + bonusForCheck;
+    const bonus = fmtMod(bonusForCheck);
 
     const dc = typeof roll.dc === "number" ? roll.dc : null;
     const success = dc != null ? total >= dc : null;
@@ -17590,6 +18807,129 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       typeof roll.sceneArbiterContext === "object"
     ) {
       const ctx = roll.sceneArbiterContext;
+      const isGlobalGroup =
+        roll.kind === "check" && (roll.audience === "global" || roll.audience === "selected");
+      if (isGlobalGroup) {
+        const myCid = String(clientId ?? "").trim();
+        const prevMap =
+          roll.globalRollsByClientId && typeof roll.globalRollsByClientId === "object"
+            ? { ...roll.globalRollsByClientId }
+            : {};
+        if (myCid) {
+          prevMap[myCid] = {
+            nat,
+            total,
+            success,
+            playerName: player?.name != null ? String(player.name).trim() : null,
+          };
+        }
+        const expected = getGroupSkillCheckExpectedClientIds(
+          multiplayerSessionId,
+          multiplayerParticipantProfilesRef.current,
+          clientId,
+          roll
+        );
+        const allDone = expected.length > 0 && expected.every((eid) => prevMap[eid] != null);
+        const diceMsgId = makeMsgId();
+        addMessage("ai", content, "dice", diceMsgId);
+        messagesRef.current = [
+          ...messagesRef.current,
+          { id: diceMsgId, role: "ai", content, type: "dice" },
+        ];
+        if (!allDone) {
+          const nextPending = { ...roll, globalRollsByClientId: prevMap };
+          pendingRollRef.current = nextPending;
+          setPendingRoll(nextPending);
+          if (multiplayerSessionId) {
+            await new Promise((r) => setTimeout(r, 0));
+            await flushMultiplayerSharedState();
+          }
+          return;
+        }
+        if (multiplayerSessionId) {
+          pendingRollRef.current = { ...roll, globalRollsByClientId: prevMap };
+          setPendingRoll(pendingRollRef.current);
+          await new Promise((r) => setTimeout(r, 0));
+          await flushMultiplayerSharedState();
+          return;
+        }
+        pendingRollRef.current = null;
+        setPendingRoll(null);
+        const rollOutcome = buildGlobalPlayerCheckGroupRollOutcome({
+          roll,
+          globalRollsByClientId: prevMap,
+          dc,
+        });
+        const skillLabelGroup = roll.skill ? `${roll.skill} (groupe)` : roll.stat;
+        try {
+          const resolved = await runSceneEntryGmArbiter({
+            roomId: ctx.roomId,
+            scene: ctx.scene,
+            sceneName: ctx.sceneName,
+            entitiesAtEntry: nextEntities,
+            sourceAction: ctx.sourceAction,
+            baseGameMode: ctx.baseGameMode ?? gameMode,
+            rollResultOverride: rollOutcome,
+            intentDecision: ctx.intentDecision ?? null,
+            arbiterTrigger: ctx.arbiterTrigger ?? null,
+          });
+          if (resolved?.awaitingPlayerRoll === true) {
+            return;
+          }
+          const gmMode = gameStateRef.current?.gameMode ?? gameMode;
+          const enrichedEngineEvent =
+            resolved.engineEvent && typeof resolved.engineEvent === "object"
+              ? {
+                  ...resolved.engineEvent,
+                  playerSkillRoll: {
+                    skillLabel: skillLabelGroup,
+                    group: true,
+                    summary: rollOutcome.summary,
+                    byClientId: rollOutcome.byClientId,
+                  },
+                }
+              : {
+                  kind: "scene_rule_resolution",
+                  reason: resolved?.reason ?? null,
+                  playerSkillRoll: {
+                    skillLabel: skillLabelGroup,
+                    group: true,
+                    summary: rollOutcome.summary,
+                    byClientId: rollOutcome.byClientId,
+                  },
+                };
+          if (ctx.narrateAfterResolution !== false) {
+            await callApi(ctx.sourceAction ?? "", "meta", false, {
+              skipSessionLock: true,
+              hideUserMessage: true,
+              bypassIntentParser: true,
+              skipAutoPlayerTurn: true,
+              skipGmContinue: true,
+              skipSceneRulesResolvedPipeline: true,
+              entities: resolved.nextEntities,
+              currentRoomId: resolved.nextRoomId,
+              currentScene: resolved.nextScene,
+              currentSceneName: resolved.nextSceneName,
+              gameMode: resolved.nextGameMode ?? gmMode,
+              engineEvent: enrichedEngineEvent,
+            });
+          } else {
+            const visibleReason = String(enrichedEngineEvent?.reason ?? "").trim();
+            if (debugMode && visibleReason) {
+              addMessage("ai", visibleReason, "meta-reply", makeMsgId());
+            }
+          }
+        } catch (e) {
+          addMessage(
+            "ai",
+            `[DEBUG] Erreur GM Arbitre après jet joueur : ${String(e?.message ?? e)}`,
+            "debug",
+            makeMsgId()
+          );
+        }
+        return;
+      }
+
       pendingRollRef.current = null;
       setPendingRoll(null);
       const rollOutcome = {
@@ -17655,6 +18995,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             bypassIntentParser: true,
             skipAutoPlayerTurn: true,
             skipGmContinue: true,
+            skipSceneRulesResolvedPipeline: true,
             entities: resolved.nextEntities,
             currentRoomId: resolved.nextRoomId,
             currentScene: resolved.nextScene,
@@ -17876,8 +19217,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     activeIdForTurnGate != null
       ? controllerForCombatantId(activeIdForTurnGate, gameStateRef.current?.entities ?? entities)
       : null;
+  const groupSkillAllRollsRecorded = isGlobalOrSelectedGroupSkillAllRollsRecorded(
+    pendingRoll,
+    multiplayerSessionId,
+    multiplayerParticipantProfiles,
+    clientId
+  );
   const isAnyPlayerExpectedToAct =
-    !!pendingRoll ||
+    (!!pendingRoll && !groupSkillAllRollsRecorded) ||
     awaitingPlayerInitiative ||
     (isInCombat && hasOrder && activeControllerForTurn === "player");
   const showGmThinkingIndicator = multiplayerSessionId
@@ -17890,7 +19237,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     sceneEnteredPipelineDepthRef.current > 0 ||
     retryCountdown > 0 ||
     flowBlocked ||
-    !!pendingRoll ||
+    (!!pendingRoll && !groupSkillAllRollsRecorded) ||
     awaitingPlayerInitiative ||
     !isMyTurn ||
     playerDeadOrOver;
@@ -18514,12 +19861,20 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       {pendingRoll &&
         !waitForGmNarrationForInitiative &&
         getPendingRollStableKey(pendingRoll) !== pendingRollUiHiddenKey &&
+        !groupSkillAllRollsRecorded &&
         (() => {
         const forMe = pendingRollTargetsLocalPlayer(
           pendingRoll,
           player,
           clientId,
-          !!multiplayerSessionId
+          !!multiplayerSessionId,
+          multiplayerSessionId,
+          multiplayerParticipantProfiles
+        );
+        const groupWaitTitle = formatGroupSkillCheckWaitTitle(
+          pendingRoll,
+          entities,
+          pendingRoll.forPlayerName
         );
         const diceDesc = getPendingRollDiceDescriptor(pendingRoll);
         let rollNotation = diceDesc.rollNotation;
@@ -18669,7 +20024,13 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           <div className={`text-xs leading-relaxed ${bannerTextTone}`}>
             <p className={`font-semibold ${bannerTitleTone}`}>
               {repairMojibakeForDisplay("ðŸŽ²")}{" "}
-              {forMe ? "Jet requis" : `Jet en attente (${pendingRoll.forPlayerName || "un joueur"})`} :{" "}
+              {forMe
+                ? "Jet requis"
+                : pendingRoll.kind === "check" &&
+                    (pendingRoll.audience === "global" || pendingRoll.audience === "selected")
+                  ? `Jet en attente — ${groupWaitTitle}`
+                  : `Jet en attente (${pendingRoll.forPlayerName || "un joueur"})`}{" "}
+              :{" "}
               {getPublicPendingRollTitle(pendingRoll).replace(/^Jet de\s+/i, "")}
             </p>
             {pendingRoll.kind !== "damage_roll" ? (
@@ -18806,8 +20167,11 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               </button>
             </div>
           ) : (
-            <span className="shrink-0 text-[11px] text-slate-500 italic max-w-[140px] text-right">
-              Le joueur concerné doit lancer.
+            <span className="shrink-0 text-[11px] text-slate-500 italic max-w-[200px] text-right">
+              {pendingRoll.kind === "check" &&
+              (pendingRoll.audience === "global" || pendingRoll.audience === "selected")
+                ? "Chaque joueur concerné doit lancer depuis son onglet."
+                : "Le joueur concerné doit lancer."}
             </span>
           )}
         </div>
@@ -19118,6 +20482,42 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         </div>
       )}
 
+      {shieldReactionPrompt && gameMode === "combat" && (
+        <div className="border-t border-sky-700/60 bg-sky-950/40 px-4 py-3 flex flex-wrap items-center gap-2 shrink-0">
+          <div className="text-xs text-sky-100 flex-1 min-w-[220px]">
+            <span className="font-semibold text-sky-200">Réaction</span>
+            {" — "}
+            <span className="font-medium text-sky-50">{shieldReactionPrompt.attackerName}</span> vous touche avec{" "}
+            {shieldReactionPrompt.weaponName} (total <strong>{shieldReactionPrompt.atkTotal}</strong> vs votre CA{" "}
+            <strong>{shieldReactionPrompt.baseAc}</strong>). Lancer <em>Bouclier</em> (+5 CA, 1 sort de niveau 1) avant
+            les dégâts ?
+          </div>
+          <button
+            type="button"
+            onClick={() => settlePlayerShieldReactionPrompt("shield")}
+            disabled={
+              playerDeadOrOver ||
+              !shieldReactionPrompt.defenderId ||
+              !normalizeTurnResourcesInput(turnResourcesByCombatantId?.[shieldReactionPrompt.defenderId] ?? {})
+                .reaction ||
+              !hasReaction(shieldReactionPrompt.defenderId)
+            }
+            className="rounded-md bg-sky-600 px-3 py-2 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Consommer votre réaction et un emplacement de sort de niveau 1"
+          >
+            Bouclier (réaction)
+          </button>
+          <button
+            type="button"
+            onClick={() => settlePlayerShieldReactionPrompt("skip")}
+            disabled={playerDeadOrOver}
+            className="rounded-md border border-sky-500/50 px-3 py-2 text-xs font-semibold text-sky-100 hover:bg-sky-900/60 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Non
+          </button>
+        </div>
+      )}
+
       {initiativePhaseActive && !hasLocalInitiativeRoll && !waitForGmNarrationForInitiative && (() => {
         const dexMod = Math.floor(((player?.stats?.DEX ?? 10) - 10) / 2);
         const manualIniParsed =
@@ -19253,7 +20653,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                     ? "Le Maître du Jeu réfléchitâ€¦"
                     : isAutoPlayerThinking
                       ? "L'IA joueur réfléchitâ€¦"
-                      : pendingRoll
+                      : pendingRoll && !groupSkillAllRollsRecorded
                         ? "Lancez d'abord le dé demandé par le MJâ€¦"
                         : initiativePhaseActive
                           ? hasLocalInitiativeRoll

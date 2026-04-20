@@ -26,7 +26,7 @@ Sortie obligatoire :
   "resolution": "combat_intent" | "requires_roll" | "trivial_success" | "impossible" | "unclear_input",
   "reason": "texte court",
   "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"use_item"|"stabilize"|"short_rest"|"end_short_rest"|"long_rest"|"wait"|"wait_until_recover_1hp"|"end_turn"|"loot", "targetId": "" | null, "weapon": "" },
-  "rollRequest": null | { "kind": "check"|"save"|"attack"|"gm_secret", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Athlétisme", "dc": <nombre>, "raison": "...", "roll": "1d100" },
+  "rollRequest": null | { "kind": "check"|"save"|"attack"|"gm_secret", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Athlétisme", "dc": <nombre>, "raison": "...", "roll": "1d100", "audience": "single"|"global"|"selected", "rollTargetEntityIds": ["id_entité_pj", "..."] },
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "..." }
 }
 
@@ -42,15 +42,25 @@ PAROLE RP vs DESCRIPTION D'ACTION (obligatoire) :
 
 RÈGLE ANTI-CHAÎNE (1 SEULE action majeure par tour) :
 - Si le message enchaîne plusieurs actions majeures différentes (ex: « j’attaque X puis je pars vers Y puis je fouille Z »), ne traite que la PREMIÈRE dans l’ordre du texte.
-- EXCEPTION OBLIGATOIRE — NAVIGATION + AUTRE CHOSE DANS LE MÊME MESSAGE : si le joueur combine une réaction sociale courte (main sur l’épaule, remerciement, promesse à un PNJ, etc.) ET une formulation claire de départ / trajet / prise de direction vers une zone couverte par les sorties autorisées (voir liste d’indices ci-dessous), tu dois prioriser le changement de lieu pour ce tour : "trivial_success" et sceneUpdate avec "hasChanged": true et "targetRoomId" égal à l’id exact d’une sortie autorisée. Ne réduis pas le message entier au seul geste social : si la partie « je pars / direction / chemin » est présente et matche une sortie, le sceneUpdate est requis.
+- EXCEPTION OBLIGATOIRE — NAVIGATION + AUTRE CHOSE DANS LE MÊME MESSAGE : si le joueur combine une réaction sociale courte (main sur l’épaule, remerciement, promesse à un PNJ, etc.) ET une formulation claire de départ / trajet / prise de direction vers une zone couverte par les sorties autorisées (voir liste d’indices ci-dessous), tu dois prioriser le changement de lieu pour ce tour : renseigne sceneUpdate avec "hasChanged": true et "targetRoomId" égal à l’id exact d’une sortie autorisée. Ne réduis pas le message entier au seul geste social : si la partie « je pars / direction / chemin » est présente et matche une sortie, le sceneUpdate est requis.
 - Si la première proposition du message est déjà une navigation vers une sortie autorisée, utilise sceneUpdate et ignore la suite (autres actions).
 - Si la première proposition est sociale mais une clause suivante (souvent après « puis », « et », virgule ou phrase suivante) exprime le départ vers l’ouest/nord/etc. ou « vers les collines / la piste / rattraper » en cohérence avec une sortie listée, applique l’EXCEPTION ci-dessus.
+- EXCEPTION À L’EXCEPTION (priorité plus haute) — SEUIL DE PORTE / PASSAGE SANS TRAVERSÉE : si le message décrit un déplacement **le long d’un couloir / passage** vers une porte ou un seuil **et en même temps** une action **au seuil sans entrer** dans la pièce derrière (écouter à la porte, coller ou tendre l’oreille, épier, regarder par l’entrebâillement ou le trou de la serrure, « percevoir des bruits derrière », inspecter le chambranle/loquet depuis l’extérieur), alors **sceneUpdate = null** : le groupe **reste** dans currentRoomId. Ce n’est **pas** un changement de salle ; l’arbitre de scène gérera Perception ou la fiction au seuil. Exemple : « je suis le couloir ouest et j’écoute à la porte sombre » = suivre le couloir jusqu’à la porte puis écouter, **sans** targetRoomId de la salle au-delà.
+- FRANCHISSEMENT EXPLICITE (seul cas sceneUpdate vers l’id de sortie) : formulations du type « j’entre », « je passe / traverse / franchis », « nous empruntons la porte », « j’ouvre et j’avance », « je pousse la porte et je vais dedans », « on va dans [la pièce] » quand c’est clairement la pièce **derrière** l’issue. Seules ces intentions (ou équivalent sans ambiguïté) déclenchent sceneUpdate vers la sortie correspondante.
 
 INDICES DE DÉPART / CHANGEMENT DE LIEU (exploration, à croiser avec « Sorties autorisées » du contexte) :
-- Formulations typiques : « je prends la direction de », « je pars vers », « je me mets en route », « je quitte [le village / la forge / les lieux] », « sans attendre vers », « en direction de l’ouest / du nord », « je pars à leur suite », « je rattrape », « je longe la piste », « je suis le chemin vers ».
-- Dès qu’une telle intention correspond à une sortie autorisée (même direction ou description compatible), renseigne sceneUpdate avec le targetRoomId de cette sortie. Une seule sortie : choisis-la par correspondance direction/description ; ne pas inventer d’id.
+- Formulations typiques : « je prends la direction de », « je pars vers », « je me mets en route », « je quitte [le village / la forge / les lieux] », « sans attendre vers », « en direction de l’ouest / du nord », « je pars à leur suite », « je rattrape », « je longe la piste », « je suis le chemin vers » (départ réel vers une **autre zone**).
+- **Ne confonds pas** « je suis le couloir [direction] » / « j’avance dans le couloir » + action au **seuil** d’une porte (voir règle SEUIL ci-dessus) avec un départ vers la roomId derrière cette porte.
+- Dès qu’une intention de **franchissement explicite** correspond à une sortie autorisée, renseigne sceneUpdate avec le targetRoomId de cette sortie. Si le message est ambigu entre « jusqu’à la porte » et « dans la pièce », **ne** fais **pas** sceneUpdate ; préfère trivial_success sans sceneUpdate ou unclear_input factuel. Une seule sortie : choisis-la par correspondance direction/description ; ne pas inventer d’id.
 
-Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée. EXCEPTION OBLIGATOIRE : "stabiliser / aider / secourir un allié à 0 PV" doit retourner combat_intent (type "stabilize") MEME si MODE=exploration, avec rollRequest=null. Capacités/repos : "second souffle" -> combat_intent + type second_wind ; "repos court", "courte pause pour souffler/se ressourcer" -> combat_intent + type short_rest ; "repos long", "dormir 8h/se reposer pour la nuit" -> combat_intent + type long_rest ; "j'attends Xh / X minutes" sans mention de repos -> combat_intent + type wait (weapon contient les minutes à attendre). Si le joueur dit qu'il attend jusqu'à ce qu'un allié explicitement nommé reprenne connaissance / récupère 1 PV, renvoie combat_intent + type wait_until_recover_1hp avec targetId = id exact de cet allié (si identifiable dans Entités). Ne confonds jamais "courte pause/repos court" avec second_wind. Loot/fouille corps → trivial_success. Déplacement vers sortie listée → trivial_success + sceneUpdate(targetRoomId) ; matcher direction ou description aux sorties autorisées ; ne pas inventer de sortie. SÉMANTIQUE DE NAVIGATION À RESPECTER STRICTEMENT : "je me dirige vers", "je vais vers", "je m'approche de", "je me rapproche de", "je marche jusqu'à" une porte / issue / sortie = seulement s'en approcher, jamais l'ouvrir, la franchir, la crocheter ni la forcer. "j'ouvre", "je pousse la porte", "je tente la porte", "j'essaie d'ouvrir", "je crochette", "je force", "j'enfonce" = interaction avec la porte ; si le verrou ou la résistance créent une incertitude, alors seulement requires_roll ou impossible. "j'entre", "je passe", "je franchis", "je traverse", "je vais dedans", "j'y vais" = franchissement / passage vers l'autre salle, mais seulement si l'historique récent montre que le personnage est déjà au seuil ou qu'une seule issue immédiate cohérente est en train d'être suivie ; sinon interpréter "j'y vais" comme trop ambigu plutôt que comme une nouvelle action technique. N'infère jamais de crochetage ou de forçage uniquement parce que les secrets mentionnent une serrure, une clef, un verrou ou un DD : il faut une intention explicite du joueur d'ouvrir malgré l'obstacle ou d'interagir avec la serrure. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason factuelle et procédurale (destinée au moteur/narrateur, pas au joueur) qui résume brièvement l'ambiguïté. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Même logique pour une parole RP adressée à un groupe/ennemi ("Où sont les gobelins ?", "Rendez-vous !", "Qui est là ?") : traiter comme prise de parole, pas comme action physique implicite. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
+Exploration : trivial_success (sans enjeu) / impossible / requires_roll + rollRequest si conséquence incertaine. DC PHB : 5 très facile, 10 facile, 15 moyen, 20 difficile, 25 très difficile, 30 quasi impossible ; un DC explicite dans le contexte prime. intent=null sauf capacité déclarée.
+
+JETS DE COMPÉTENCE — PLUSIEURS PJ (kind \"check\" uniquement) :
+- \"audience\": \"single\" (défaut) = seul le PJ qui a écrit le message lance le jet.
+- \"audience\": \"global\" = chaque joueur connecté doit lancer le même test (même DD, même compétence/carac) ; rollTargetEntityIds omis.
+- \"audience\": \"selected\" = uniquement certains PJ : remplis \"rollTargetEntityIds\" avec les **id exacts** du bloc Entités (pour les fiches multijoueur : \"mp-player-…\"). Ex. « on fait tous les deux un backflip », « Elyndra et Thorin sautent » : requires_roll + Acrobaties + audience \"selected\" + rollTargetEntityIds listant chaque PJ concerné présent dans Entités. Si tu ne peux pas mapper les noms à des id listés, utilise \"global\" quand toute l’équipe présente doit tenter, sinon \"single\".
+
+EXCEPTION OBLIGATOIRE : "stabiliser / aider / secourir un allié à 0 PV" doit retourner combat_intent (type "stabilize") MEME si MODE=exploration, avec rollRequest=null. Capacités/repos : "second souffle" -> combat_intent + type second_wind ; "repos court", "courte pause pour souffler/se ressourcer" -> combat_intent + type short_rest ; "repos long", "dormir 8h/se reposer pour la nuit" -> combat_intent + type long_rest ; "j'attends Xh / X minutes" sans mention de repos -> combat_intent + type wait (weapon contient les minutes à attendre). Si le joueur dit qu'il attend jusqu'à ce qu'un allié explicitement nommé reprenne connaissance / récupère 1 PV, renvoie combat_intent + type wait_until_recover_1hp avec targetId = id exact de cet allié (si identifiable dans Entités). Ne confonds jamais "courte pause/repos court" avec second_wind. Loot/fouille corps → trivial_success. **Franchissement** vers sortie listée (voir règles SEUIL / FRANCHISSEMENT ci-dessus) → renseigne sceneUpdate(targetRoomId), mais ne considère jamais ce changement de salle comme automatiquement acquis ; il sera validé par GM Arbitre. SÉMANTIQUE DE NAVIGATION À RESPECTER STRICTEMENT : "je me dirige vers", "je vais vers", "je m'approche de", "je me rapproche de", "je marche jusqu'à" une porte / issue / sortie = seulement s'en approcher ou rester au seuil, jamais l'ouvrir, la franchir, la crocheter ni la forcer ; couplé à « écouter / épier / regarder par… » → **pas** de sceneUpdate. "j'ouvre", "je pousse la porte", "je tente la porte", "j'essaie d'ouvrir", "je crochette", "je force", "j'enfonce" = interaction avec la porte ; si le verrou ou la résistance créent une incertitude, alors seulement requires_roll ou impossible. "j'entre", "je passe", "je franchis", "je traverse", "je vais dedans", "j'y vais" = franchissement / passage vers l'autre salle, mais seulement si l'historique récent montre que le personnage est déjà au seuil ou qu'une seule issue immédiate cohérente est en train d'être suivie ; sinon interpréter "j'y vais" comme trop ambigu plutôt que comme une nouvelle action technique. N'infère jamais de crochetage ou de forçage uniquement parce que les secrets mentionnent une serrure, une clef, un verrou ou un DD : il faut une intention explicite du joueur d'ouvrir malgré l'obstacle ou d'interagir avec la serrure. Si le joueur dit juste "j'avance / j'explore / je continue" et que plusieurs sorties sont possibles sans précision unique, ne choisis jamais à sa place : renvoie unclear_input avec une reason factuelle et procédurale (destinée au moteur/narrateur, pas au joueur) qui résume brièvement l'ambiguïté. Quand le joueur parle à un PNJ présent ou lui pose une question, ce n'est presque jamais un jet joueur : par défaut renvoie trivial_success (ou impossible si la demande n'a aucun sens), avec intent=null et rollRequest=null. Même logique pour une parole RP adressée à un groupe/ennemi ("Où sont les gobelins ?", "Rendez-vous !", "Qui est là ?") : traiter comme prise de parole, pas comme action physique implicite. Une réplique très courte qui réagit au dernier message d'un PNJ doit être interprétée à la lumière de l'historique récent comme une demande de précision ou une continuation de dialogue, même si elle n'exprime pas une intention complète toute seule. Exemples : "Heu si quoi ?", "Comment ça ?", "Pardon ?", "Qui ça ?", "De quoi tu parles ?" → trivial_success, pas unclear_input, si le dernier message assistant contient une réplique PNJ ou une phrase inachevée. Pour ces questions sociales, ton reason doit rester procédural et neutre : décris que le joueur demande une précision, relance la dernière réplique, ou interroge un PNJ / des villageois sur tel sujet ; ne décide pas toi-même du contenu vrai de la réponse. N'invente jamais un skillcheck pour un PNJ, les skillcheck sont pour les joueurs ; si l'incertitude porte sur ce que le PNJ sait, croit, ose dire ou se rappelle, ne demande pas de check/save joueur. Pièges/patrouilles/d100 imposés par le lieu : ne pas utiliser gm_secret ici (l’arbitre de scène et les secrets s’en occupent) ; si besoin, requires_roll avec check/save joueur. [SceneEntered] = navigation déjà traitée, pas de jet MJ ici.
 
 OBJET (exploration ou combat) : boire / utiliser une potion ou consommable listé dans l'inventaire joueur → resolution="combat_intent", intent.type="use_item", weapon = nom exact ou proche (ex. "Potion de soins"), targetId = id de la créature alliée si le joueur la cible explicitement, sinon "" pour soi-même. En combat, donner une potion à un allié n'est valide que si son id figure dans playerMeleeTargets (contact) ; sinon impossible avec reason courte.
 
@@ -154,8 +164,12 @@ function normalizeMessagesForPrompt(messages) {
       const role = m.role === "user" ? "user" : "assistant";
       const content = String(m.content ?? "").trim();
       if (!content) return null;
+      const senderName = String(m.senderName ?? "").trim();
+      const speaker =
+        role === "assistant" ? "MJ" : senderName || "Joueur";
       return {
         role,
+        speaker,
         type: m.type ?? null,
         content,
       };
@@ -260,7 +274,10 @@ function buildUserContent({
     messages.length === 0
       ? "(Aucun historique fourni.)"
       : messages
-          .map((m) => `- ${m.role}${m.type ? ` [${m.type}]` : ""}: ${m.content}`)
+          .map((m) => {
+            const speaker = String(m?.speaker ?? "").trim() || (m.role === "assistant" ? "MJ" : "Joueur");
+            return `- ${speaker}${m.type ? ` [${m.type}]` : ""}: ${m.content}`;
+          })
           .join("\n");
 
   return [
@@ -294,7 +311,7 @@ function buildUserContent({
     `Sorties autorisées :`,
     exitsBlock,
     allowedExits.length > 0
-      ? `Si le texte joueur exprime un départ / une direction / un trajet qui correspond à une sortie ci-dessus, resolution = trivial_success et sceneUpdate obligatoire avec hasChanged: true et targetRoomId = l’id de cette sortie (y compris si le même message commence par un geste ou un dialogue court).`
+      ? `Si le texte joueur exprime un **franchissement explicite** ou un départ sans ambiguïté vers une autre zone (et **pas** une action au seuil : écouter à la porte, épier, etc. — voir règles système SEUIL), sceneUpdate doit être renseigné avec hasChanged: true et targetRoomId = l’id de cette sortie. Ce sceneUpdate est une intention de navigation à valider ensuite par GM Arbitre (pas une transition automatiquement acquise). Si le message mélange couloir + écoute / observation à la porte fermée, sceneUpdate = null.`
       : ``,
     ``,
     `Réponds par un seul objet JSON valide au format imposé.`,
@@ -413,6 +430,22 @@ function safeParseArbiterJson(raw) {
               ? "Action incertaine"
               : String(data.rollRequest.raison).trim(),
         };
+        if (kindRoll === "check") {
+          const audRaw = String(data.rollRequest.audience ?? "single").trim().toLowerCase();
+          const audience =
+            audRaw === "global" ? "global" : audRaw === "selected" ? "selected" : "single";
+          const rawTids = data.rollRequest.rollTargetEntityIds;
+          const rollTargetEntityIds =
+            audience === "selected" && Array.isArray(rawTids)
+              ? [...new Set(rawTids.map((x) => String(x ?? "").trim()).filter(Boolean))]
+              : undefined;
+          if (audience === "global") {
+            rollRequest.audience = "global";
+          } else if (audience === "selected" && rollTargetEntityIds?.length) {
+            rollRequest.audience = "selected";
+            rollRequest.rollTargetEntityIds = rollTargetEntityIds;
+          }
+        }
       }
     }
 
@@ -451,6 +484,34 @@ function tryExtractDcFromSecrets(secrets, regex) {
   if (!match) return null;
   const n = Number(match[1]);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Filtre audience/rollTargetEntityIds sur les id réellement présents dans Entités. */
+function sanitizeIntentRollRequestAgainstEntities(rollRequest, entList) {
+  if (!rollRequest || rollRequest.kind !== "check") return rollRequest;
+  const entityIds = new Set(
+    (Array.isArray(entList) ? entList : [])
+      .map((e) => (e && e.id != null ? String(e.id).trim() : ""))
+      .filter(Boolean)
+  );
+  const aud = String(rollRequest.audience ?? "single").trim().toLowerCase();
+  if (aud === "global") {
+    const { rollTargetEntityIds: _t, ...rest } = rollRequest;
+    return { ...rest, audience: "global" };
+  }
+  if (aud === "selected") {
+    const raw = rollRequest.rollTargetEntityIds;
+    const ids = Array.isArray(raw)
+      ? [...new Set(raw.map((x) => String(x ?? "").trim()).filter((id) => entityIds.has(id)))]
+      : [];
+    if (!ids.length) {
+      const { audience: _a, rollTargetEntityIds: _r, ...rest } = rollRequest;
+      return rest;
+    }
+    return { ...rollRequest, audience: "selected", rollTargetEntityIds: ids };
+  }
+  const { audience: _a, rollTargetEntityIds: _r, ...rest } = rollRequest;
+  return rest;
 }
 
 // Aucune heuristique locale basée sur des mots-clés utilisateur ici.
@@ -575,6 +636,19 @@ export async function POST(request) {
     const parsed = safeParseArbiterJson(rawOut);
     let parsedDecision = parsed.ok ? parsed.parsed : null;
     if (parsedDecision) {
+      // Une navigation avec sceneUpdate est une intention à arbitrer, jamais une transition
+      // automatiquement acquise par parse-intent.
+      if (
+        parsedDecision.sceneUpdate?.hasChanged === true &&
+        parsedDecision.resolution === "trivial_success"
+      ) {
+        parsedDecision = {
+          ...parsedDecision,
+          resolution: "impossible",
+          reason:
+            "Navigation proposée : validation requise par l'arbitre de scène avant tout changement de salle.",
+        };
+      }
       const skillNorm = normalizeForIntentPostProcess(parsedDecision?.rollRequest?.skill ?? "");
       const intentTypeNorm = normalizeForIntentPostProcess(parsedDecision?.intent?.type ?? "");
       const mentionsStabilizeInReason = /stabilis|secour|aide/.test(
@@ -606,6 +680,12 @@ export async function POST(request) {
           rollRequest: null,
           sceneUpdate: null,
         };
+      }
+      if (parsedDecision?.rollRequest) {
+        parsedDecision.rollRequest = sanitizeIntentRollRequestAgainstEntities(
+          parsedDecision.rollRequest,
+          entList
+        );
       }
     }
 

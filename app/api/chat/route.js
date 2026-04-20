@@ -734,9 +734,14 @@ export async function POST(request) {
             exitDef && typeof exitDef === "object"
               ? String(exitDef.description ?? "").trim()
               : "";
+          const exitDirection =
+            exitDef && typeof exitDef === "object"
+              ? String(exitDef.direction ?? "").trim()
+              : "";
           const r = GOBLIN_CAVE[exitId];
           return r
             ? {
+                direction: exitDirection,
                 description: exitDesc || (r.description ?? ""),
               }
             : null;

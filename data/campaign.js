@@ -131,7 +131,7 @@ export const GOBLIN_CAVE = {
     id: "room_x",
     title: "Le Couloir piégé",
     description: "Un petit couloir",
-    secrets: "Le couloir qui file tout droit est piégé (emplacement marqué X). C’est une fosse simple, un trou creusé dans le sol et recouvert d'une large toile fixée sur les bords de la fosse, le tout camouflé avec de la terre et des débris. Un jet de Sagesse (Perception) DD 10 réussi permet de remarquer la fosse à temps. Dans le cas contraire, le premier personnage qui marche dessus tombe dans le trou profond de 3 mètres et subit 1d6 points de dégâts contondants.",
+    secrets: "Le couloir qui file tout droit est piégé. C’est une fosse simple, un trou creusé dans le sol et recouvert d'une large toile fixée sur les bords de la fosse, le tout camouflé avec de la terre et des débris. Un jet de Sagesse (Perception) DD 10 réussi permet de remarquer la fosse à temps. Dans le cas contraire, le premier personnage qui marche dessus tombe dans le trou profond de 3 mètres et subit 1d6 points de dégâts contondants. Au fond du couloir un il y a un tournant a gauche (ouest), mais il ne mene nulle part, c'est un cul de sac. ",
     exits: [
       {
         id: "room_1",
@@ -180,6 +180,7 @@ export const GOBLIN_CAVE = {
     id: "room_4",
     title: "La Salle de Torture",
     description: "Il y a ici un grand nombre d'instruments de torture et notamment un chevalet sur lequel a pris place un personnage que certains d’entre vous connaissent, le halfelin Gandelme le Dextre, qui était venu rendre visite à Fial à son frère Petit-Pinpin la semaine dernière ! D’après les marques qu’ils portent, le petit homme a visiblement été torturé.",
+    encounterEntities: [{ id: "gandelme", templateId: "pnj_generique" }],
     secrets: "Ici aussi, des torches sont accrochées aux murs, mais aucune n’est allumée. Gandelme est épuisé, affamé et déshydraté. On ne lui a rien donné à boire ni à manger depuis sa capture. Il est si faible (0 pv et épuisement niveau 4) qu’il ne peut pas marcher et encore moins combattre. Un sort de soins lui redonnera des points de vie et lui permettra de marcher, mais ne réduira pas ses niveaux d’épuisement. Il insistera pour que l’on retrouve son équipement. Celui-ci se trouve dans la chambre du chef, salle 17, mais il ne le sait pas, bien entendu.",
     exits: [
       {
@@ -360,7 +361,7 @@ export const GOBLIN_CAVE = {
         description: "Un mur de pierre brut à l'ouest."
       },
       {
-        id: "intersection_1",
+        id: "intersection_2",
         direction: "est",
         description: "À l'est, la porte donne sur une intersection de couloirs."
       }
