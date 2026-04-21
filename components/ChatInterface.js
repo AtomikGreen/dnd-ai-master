@@ -1282,12 +1282,8 @@ function computeEntitySaveBonus(entity, abilityKey) {
 }
 
 function spendSpellSlot(player, updatePlayer, spellLevel) {
-  if (spellLevel <= 0) {
+  if (!player || !player.spellSlots || spellLevel <= 0) {
     return { ok: true, usedLevel: null };
-  }
-  if (!player || !player.spellSlots || typeof player.spellSlots !== "object") {
-    // Sort de niveau >= 1 sans ressource d'emplacements configurée : refuser.
-    return { ok: false, usedLevel: null };
   }
   const slots = player.spellSlots;
   const levels = Object.keys(slots)
@@ -1745,13 +1741,21 @@ function resolveAdventuringConsumableByQuery(itemQuery) {
   return null;
 }
 
-function isSpellOffensiveForCombatOpening(spellMeta) {
-  const sp = spellMeta?.raw;
-  const hasDamage = !!String(sp?.damage ?? "").trim();
-  const hasSave = !!spellMeta?.save;
-  const attackHint = String(sp?.attack ?? spellMeta?.attackType ?? "").toLowerCase();
-  const hasAttackHint = /\b(sort|attaque|attack|distance|corps)\b/i.test(attackHint);
-  return hasDamage || hasSave || hasAttackHint;
+function rollHealFromGearEffect(effectStr) {
+  const m = String(effectStr ?? "").match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
+  if (!m) return 0;
+  return rollDice(m[1].replace(/\s+/g, ""));
+}
+
+function extractDiceAndFlatBonusFromText(text, fallbackRoll = "1d4") {
+  const raw = String(text ?? "");
+  const match = raw.match(/(\d+d\d+(?:\s*[+-]\s*\d+)?)/i);
+  const notation = match ? match[1].replace(/\s+/g, "") : fallbackRoll;
+  const split = splitDiceNotationAndFlatBonus(notation);
+  return {
+    diceNotation: split?.diceNotation || fallbackRoll,
+    flatBonus: Number(split?.flatBonus) || 0,
+  };
 }
 
 /** Évite double bulle / double consommation quand parse-intent et la réponse MJ appliquent la même intention (ex. Esquiver, repositionnement sans cible). */
@@ -1836,6 +1840,9 @@ function executeCombatActionIntent(intent, ctx) {
     emitMeleeMoveDebug,
     messagesRef = { current: [] },
     multiplayerParticipantProfilesRef = { current: [] },
+    multiplayerSessionId = null,
+    clientId = "",
+    patchParticipantProfileHp = null,
     combatEngagementSeqRef = { current: 0 },
     combatRoundInEngagementRef = { current: 0 },
     combatTurnIndexLiveRef = { current: 0 },
@@ -1875,93 +1882,21 @@ function executeCombatActionIntent(intent, ctx) {
 
   const findLivingTarget = (id) => {
     if (!id) return null;
-    const sid = String(id).trim();
-    const sidNorm = normalizeFr(sid);
     // Autorise le ciblage d'une cible cachée (non visible) : la pénalité est gérée par
     // le désavantage d'attaque (`targetHidden`) au moment de la résolution du jet.
-    const fromScene = postEntities.find((e) => e && e.id === sid && e.isAlive !== false) ?? null;
-    if (fromScene) return fromScene;
-    const fromSceneByName =
-      postEntities.find((e) => e && e.isAlive !== false && normalizeFr(String(e?.name ?? "")) === sidNorm) ??
-      postEntities.find((e) => {
-        if (!e || e.isAlive === false) return false;
-        const n = normalizeFr(String(e?.name ?? ""));
-        return !!n && !!sidNorm && (n.includes(sidNorm) || sidNorm.includes(n));
-      }) ??
-      null;
-    if (fromSceneByName) return fromSceneByName;
-    /** MP : les alliés `mp-player-<clientId>` sont dans le prompt parse-intent mais souvent absents de `entities`. */
-    const mpPrefix = "mp-player-";
-    if (!sid.startsWith(mpPrefix)) return null;
-    const cid = sid.slice(mpPrefix.length).trim();
-    if (!cid) return null;
-    if (String(localCombatantId ?? "").trim() === sid && player) {
-      const dead = player?.deathState?.dead === true;
-      if (dead) return null;
-      return {
-        ...player,
-        id: sid,
-        name: player.name ?? "Vous",
-        type: player.type ?? "friendly",
-        controller: "player",
-        visible: player.visible !== false,
-        isAlive: true,
-      };
-    }
-    const profs = multiplayerParticipantProfilesRef?.current;
-    const prof = Array.isArray(profs) ? profs.find((p) => String(p?.clientId ?? "").trim() === cid) : null;
-    if (!prof || prof.connected === false) return null;
-    const sheet = prof?.playerSnapshot && typeof prof.playerSnapshot === "object" ? prof.playerSnapshot : null;
-    const cur =
-      typeof prof.hpCurrent === "number" && Number.isFinite(prof.hpCurrent)
-        ? Math.trunc(prof.hpCurrent)
-        : typeof sheet?.hp?.current === "number" && Number.isFinite(sheet.hp.current)
-          ? Math.trunc(sheet.hp.current)
-          : null;
-    const max =
-      typeof prof.hpMax === "number" && Number.isFinite(prof.hpMax)
-        ? Math.trunc(prof.hpMax)
-        : typeof sheet?.hp?.max === "number" && Number.isFinite(sheet.hp.max)
-          ? Math.trunc(sheet.hp.max)
-          : cur != null
-            ? Math.max(1, cur)
-            : null;
-    const dead = sheet?.deathState?.dead === true;
-    if (dead) return null;
-    const hp = cur != null && max != null ? { current: cur, max } : sheet?.hp ?? null;
-    return {
-      id: sid,
-      name: String(prof.name ?? sheet?.name ?? "Joueur").trim() || "Joueur",
-      type: "friendly",
-      controller: "player",
-      visible: true,
-      isAlive: true,
-      hp,
-    };
+    return postEntities.find((e) => e.id === id && e.isAlive) ?? null;
   };
 
   const { type, targetId, itemName } = intent;
-  const spellMetaFromIntent =
-    gameMode !== "combat" && type === "spell"
-      ? (() => {
-          const resolved = resolveCombatItemForIntent("spell", itemName, player, userContent);
-          if (!resolved || resolved.kind !== "spell") return null;
-          return getSpellRuntimeMeta(resolved.spellName);
-        })()
-      : null;
   let effectiveMode = gameMode;
   const canOpenCombatFromExploration =
-    gameMode !== "combat" &&
-    (type === "attack" ||
-      type === "move_and_attack" ||
-      (type === "spell" && isSpellOffensiveForCombatOpening(spellMetaFromIntent)));
+    gameMode !== "combat" && ["attack", "spell", "move_and_attack"].includes(type);
 
   if (
     gameMode !== "combat" &&
     type !== "second_wind" &&
     type !== "use_item" &&
     type !== "stabilize" &&
-    type !== "spell" &&
     !canOpenCombatFromExploration
   ) {
     return fail("Action impossible : hors combat.");
@@ -2020,45 +1955,80 @@ function executeCombatActionIntent(intent, ctx) {
     if (!tid || tid === "player") tid = localCombatantId;
 
     const findPotionTargetEntity = (id) => {
-      const q = String(id ?? "").trim();
-      if (!q) return null;
-      const qNorm = normalizeFr(q);
-      const fromLiving = findLivingTarget(q);
-      if (fromLiving && fromLiving.visible !== false && String(fromLiving.type ?? "").toLowerCase() !== "hostile") {
-        const hpCur = typeof fromLiving.hp?.current === "number" ? fromLiving.hp.current : null;
-        if (!(fromLiving.isAlive === false && (hpCur == null || hpCur <= 0))) return fromLiving;
-      }
-      const e =
-        postEntities.find((x) => x && String(x.id ?? "").trim() === q && x.visible !== false) ??
-        postEntities.find(
-          (x) =>
-            x &&
-            x.visible !== false &&
-            normalizeFr(String(x?.name ?? "")) === qNorm
-        ) ??
-        postEntities.find((x) => {
-          if (!x || x.visible === false) return false;
-          const n = normalizeFr(String(x?.name ?? ""));
-          return !!n && !!qNorm && (n.includes(qNorm) || qNorm.includes(n));
-        }) ??
-        null;
-      if (!e || String(e.type ?? "").toLowerCase() === "hostile") return null;
+      const e = postEntities.find((x) => x && String(x.id) === String(id) && x.visible !== false);
+      if (!e || e.type === "hostile") return null;
       const hpCur = typeof e.hp?.current === "number" ? e.hp.current : null;
       if (e.isAlive === false && (hpCur == null || hpCur <= 0)) return null;
       return e;
     };
+    const participantProfilesLive = multiplayerParticipantProfilesRef.current;
+    const potionMpTargets = Array.isArray(participantProfilesLive)
+      ? participantProfilesLive
+          .map((p) => {
+            const cid = String(p?.clientId ?? "").trim();
+            if (!cid) return null;
+            const snap = p?.playerSnapshot && typeof p.playerSnapshot === "object" ? p.playerSnapshot : null;
+            const hp =
+              typeof p?.hpCurrent === "number" && Number.isFinite(p.hpCurrent)
+                ? Math.trunc(p.hpCurrent)
+                : typeof snap?.hp?.current === "number" && Number.isFinite(snap.hp.current)
+                  ? Math.trunc(snap.hp.current)
+                  : null;
+            const hpMax =
+              typeof p?.hpMax === "number" && Number.isFinite(p.hpMax)
+                ? Math.trunc(p.hpMax)
+                : typeof snap?.hp?.max === "number" && Number.isFinite(snap.hp.max)
+                  ? Math.trunc(snap.hp.max)
+                  : null;
+            const deathState = snap?.deathState && typeof snap.deathState === "object" ? snap.deathState : null;
+            return {
+              id: `mp-player-${cid}`,
+              cid,
+              name: String(p?.name ?? snap?.name ?? "").trim(),
+              hp,
+              hpMax,
+              dead: deathState?.dead === true,
+            };
+          })
+          .filter((x) => x && x.dead !== true)
+      : [];
 
     const isSelf = tid === localCombatantId;
+    const targetRefNorm = normalizeFr(tid);
     let targetEnt = null;
+    let targetMp = null;
     if (!isSelf) {
-      targetEnt = findPotionTargetEntity(tid);
-      if (!targetEnt) {
+      targetEnt =
+        findPotionTargetEntity(tid) ??
+        postEntities.find((e) => normalizeFr(String(e?.name ?? "")) === targetRefNorm) ??
+        postEntities.find((e) => {
+          const n = normalizeFr(String(e?.name ?? ""));
+          return !!n && targetRefNorm && (n.includes(targetRefNorm) || targetRefNorm.includes(n));
+        }) ??
+        null;
+      if (
+        targetEnt &&
+        (targetEnt.visible === false ||
+          String(targetEnt.type ?? "").toLowerCase() === "hostile" ||
+          targetEnt.isAlive === false)
+      ) {
+        targetEnt = null;
+      }
+      targetMp =
+        potionMpTargets.find((p) => p.id === tid) ??
+        potionMpTargets.find((p) => normalizeFr(String(p?.name ?? "")) === targetRefNorm) ??
+        potionMpTargets.find((p) => {
+          const n = normalizeFr(String(p?.name ?? ""));
+          return !!n && targetRefNorm && (n.includes(targetRefNorm) || targetRefNorm.includes(n));
+        }) ??
+        null;
+      if (!targetEnt && !targetMp) {
         return fail("Action impossible : cible introuvable ou non valide pour un soin.");
       }
-      tid = String(targetEnt?.id ?? tid).trim();
+      const resolvedTargetId = String(targetEnt?.id ?? targetMp?.id ?? tid).trim();
       if (gameMode === "combat") {
         const melee = getMeleeWith(localCombatantId);
-        if (!Array.isArray(melee) || !melee.includes(tid)) {
+        if (!Array.isArray(melee) || !melee.includes(resolvedTargetId)) {
           return fail(
             "Action impossible : en combat, la cible doit être **au contact** pour recevoir la potion."
           );
@@ -2066,31 +2036,36 @@ function executeCombatActionIntent(intent, ctx) {
       }
     }
 
-    const m = String(gear.effect ?? "").match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
-    if (!m) {
-      return fail("Action impossible : effet de soin non résolu pour cet objet.");
+    const removed = removeOneStackedItem(inv, gear.name);
+    if (!removed) {
+      return fail(`Action impossible : vous n'avez pas **${gear.name}**.`);
     }
-    const split = splitDiceNotationAndFlatBonus(m[1].replace(/\s+/g, ""));
-    return {
-      ok: true,
-      pendingRoll: buildPendingDiceRoll({
-        kind: "damage_roll",
-        roll: split.diceNotation,
-        totalBonus: split.flatBonus,
-        stat: "Soins",
-        skill: gear.name,
-        raison: `Soins (${gear.name} → ${isSelf ? player?.name ?? "vous" : targetEnt?.name ?? tid})`,
-        weaponName: gear.name,
-        targetId: isSelf ? String(localCombatantId ?? "player") : tid,
-        engineContext: {
-          stage: "item_heal_followup",
-          itemName: gear.name,
-          targetId: isSelf ? String(localCombatantId ?? "player") : tid,
-          targetName: isSelf ? player?.name ?? "vous" : targetEnt?.name ?? tid,
-          resourceKind: "action",
-        },
-      }),
-    };
+    updatePlayer({ inventory: stackInventory(removed) });
+
+    const giverName = player?.name ?? "Vous";
+    const healDice = extractDiceAndFlatBonusFromText(gear.effect, "1d4");
+    const effectiveTargetId = String(targetEnt?.id ?? targetMp?.id ?? tid).trim() || tid;
+    const tgtName = targetEnt?.name ?? targetMp?.name ?? (isSelf ? giverName : tid);
+    const healPending = buildPendingDiceRoll({
+      kind: "damage_roll",
+      roll: healDice.diceNotation,
+      totalBonus: healDice.flatBonus,
+      stat: "Soin",
+      skill: gear.name,
+      raison: `Soin (${gear.name} → ${isSelf ? "vous" : tgtName})`,
+      targetId: effectiveTargetId,
+      weaponName: gear.name,
+      engineContext: {
+        stage: "item_heal",
+        itemName: gear.name,
+        targetId: effectiveTargetId,
+        targetName: tgtName,
+        isSelf,
+      },
+    });
+
+    consumeRes(setTurnResources, gameMode, "action");
+    return { ok: true, pendingRoll: healPending };
   }
 
   if (type === "stabilize") {
@@ -2332,7 +2307,56 @@ function executeCombatActionIntent(intent, ctx) {
   if (!targetId) {
     return fail("Action impossible : aucune cible indiquée.");
   }
-  const targetEnt = findLivingTarget(targetId);
+  let targetEnt = findLivingTarget(targetId);
+  if (!targetEnt && type === "spell") {
+    const targetRefNorm = normalizeFr(String(targetId ?? ""));
+    const participantProfilesLive = multiplayerParticipantProfilesRef.current;
+    const mpSpellTarget = Array.isArray(participantProfilesLive)
+      ? participantProfilesLive.find((p) => {
+          const cid = String(p?.clientId ?? "").trim();
+          const pid = cid ? `mp-player-${cid}` : "";
+          const snap = p?.playerSnapshot && typeof p.playerSnapshot === "object" ? p.playerSnapshot : null;
+          const ds = snap?.deathState && typeof snap.deathState === "object" ? snap.deathState : null;
+          const dead = ds?.dead === true;
+          const pname = normalizeFr(String(p?.name ?? snap?.name ?? ""));
+          const idMatch = pid && pid === String(targetId ?? "").trim();
+          const nameMatch =
+            !!pname &&
+            !!targetRefNorm &&
+            (pname === targetRefNorm || pname.includes(targetRefNorm) || targetRefNorm.includes(pname));
+          return (idMatch || nameMatch) && !dead;
+        }) ?? null
+      : null;
+    if (mpSpellTarget) {
+      const cid = String(mpSpellTarget?.clientId ?? "").trim();
+      const snap =
+        mpSpellTarget?.playerSnapshot && typeof mpSpellTarget.playerSnapshot === "object"
+          ? mpSpellTarget.playerSnapshot
+          : null;
+      const hpCur =
+        typeof mpSpellTarget?.hpCurrent === "number" && Number.isFinite(mpSpellTarget.hpCurrent)
+          ? Math.trunc(mpSpellTarget.hpCurrent)
+          : typeof snap?.hp?.current === "number" && Number.isFinite(snap.hp.current)
+            ? Math.trunc(snap.hp.current)
+            : 0;
+      const hpMax =
+        typeof mpSpellTarget?.hpMax === "number" && Number.isFinite(mpSpellTarget.hpMax)
+          ? Math.max(1, Math.trunc(mpSpellTarget.hpMax))
+          : typeof snap?.hp?.max === "number" && Number.isFinite(snap.hp.max)
+            ? Math.max(1, Math.trunc(snap.hp.max))
+            : Math.max(1, hpCur);
+      targetEnt = {
+        id: cid ? `mp-player-${cid}` : String(targetId ?? "").trim(),
+        name: String(mpSpellTarget?.name ?? snap?.name ?? "allié").trim() || "allié",
+        type: "friendly",
+        visible: true,
+        isAlive: true,
+        hp: { current: hpCur, max: hpMax },
+        deathState:
+          snap?.deathState && typeof snap.deathState === "object" ? snap.deathState : undefined,
+      };
+    }
+  }
   if (!targetEnt) {
     return fail("Action impossible : cible introuvable, invisible ou hors combat.");
   }
@@ -2421,7 +2445,7 @@ function executeCombatActionIntent(intent, ctx) {
   const buildPendingAfterItem = (resolved, opts = {}) => {
     const assumeInMeleeWithTarget = opts.assumeInMeleeWithTarget === true;
     if (resolved.kind === "error") return fail(resolved.message);
-    if (effectiveMode === "combat" && !turnResources?.action) {
+    if (!turnResources?.action) {
       return fail(ACTION_CONSUMED_MESSAGE);
     }
 
@@ -2433,48 +2457,6 @@ function executeCombatActionIntent(intent, ctx) {
       const resourceKind = resourceKindForCastingTime(spellMeta.castingTime);
       if (!hasResource(turnResources, effectiveMode, resourceKind)) {
         return fail(ACTION_CONSUMED_MESSAGE);
-      }
-      // Sort non offensif (soin/buff) : utiliser le pipeline de dés joueur
-      // via pendingRoll (comme les autres résolutions), y compris hors combat.
-      if (!spellMeta.save && !isSpellOffensiveForCombatOpening(spellMeta)) {
-        const effectRaw = String(spell?.effect ?? "");
-        const healDiceMatch = effectRaw.match(/(\d+d\d+(?:\s*\+\s*\d+)?)/i);
-        const healDice = healDiceMatch ? healDiceMatch[1].replace(/\s+/g, "") : "";
-        const includesCastingMod = /mod\s*sort|modificateur\s*de\s*sort|mod\s*d['’]incantation/i.test(effectRaw);
-        const healBonus = includesCastingMod
-          ? abilityMod(player?.stats?.[spellcastingAbilityAbbrevForCombatant(player)])
-          : 0;
-        if (!healDice) {
-          consumeRes(setTurnResources, effectiveMode, resourceKind);
-          addMessage(
-            "ai",
-            `✨ ${player?.name ?? "Vous"} lance **${resolved.spellName}** sur ${targetEnt?.name ?? "la cible"}.`,
-            "meta",
-            makeMsgId()
-          );
-          return { ok: true, pendingRoll: null };
-        }
-        return {
-          ok: true,
-          pendingRoll: buildPendingDiceRoll({
-            kind: "damage_roll",
-            roll: healDice,
-            totalBonus: healBonus,
-            stat: "Soins",
-            skill: resolved.spellName,
-            raison: `Soins (${resolved.spellName} → ${targetEnt?.name ?? "cible"})`,
-            weaponName: resolved.spellName,
-            targetId: targetEnt.id,
-            engineContext: {
-              stage: "spell_heal_followup",
-              spellName: resolved.spellName,
-              targetId: targetEnt.id,
-              targetName: targetEnt?.name ?? "cible",
-              resourceKind,
-              spellLevel: typeof spell?.level === "number" ? spell.level : 0,
-            },
-          }),
-        };
       }
       if (spellMeta.save) {
         return { ok: true, pendingRoll: null, runSpellSave: { spellName: resolved.spellName, target: targetEnt } };
@@ -2490,6 +2472,36 @@ function executeCombatActionIntent(intent, ctx) {
         );
       }
       const dmgNotation = String(spell?.damage ?? "").trim();
+      const healDice = extractDiceAndFlatBonusFromText(String(spell?.effect ?? ""), "1d4");
+      const healLike =
+        /soign|récup|regagne|rendre\s+des?\s+points?\s+de\s+vie/i.test(String(spell?.effect ?? "")) &&
+        !dmgNotation &&
+        !spellMeta.save;
+      if (healLike) {
+        const healBonus =
+          healDice.flatBonus + abilityMod(player?.stats?.[spellcastingAbilityAbbrevForCombatant(player)]);
+        return {
+          ok: true,
+          pendingRoll: buildPendingDiceRoll({
+            kind: "damage_roll",
+            roll: healDice.diceNotation,
+            totalBonus: healBonus,
+            stat: "Soin",
+            skill: resolved.spellName,
+            raison: `Soin (${resolved.spellName} → ${targetEnt.name})`,
+            weaponName: resolved.spellName,
+            targetId: targetEnt.id,
+            engineContext: {
+              stage: "spell_heal",
+              spellName: resolved.spellName,
+              targetId: targetEnt.id,
+              targetName: targetEnt.name,
+              spellLevel: typeof spell?.level === "number" ? spell.level : 0,
+              resourceKind,
+            },
+          }),
+        };
+      }
       if (dmgNotation && spellRequiresAttackRoll(spell) === false) {
         return {
           ok: true,
@@ -2675,10 +2687,12 @@ function executeCombatActionIntent(intent, ctx) {
           )
         ) {
           addMessage(
-            "ai",
+            "user",
             `${pjName} se déplace au corps à corps de ${targetEnt.name}.`,
-            "meta",
-            moveEngageMsgId
+            "player-utterance",
+            moveEngageMsgId,
+            undefined,
+            pjName
           );
         }
       }
@@ -3099,14 +3113,16 @@ async function resolveSpellCastNow({
 /** Attache le PJ et le client concernés par un jet (session partagée). */
 function stampPendingRollForActor(roll, actingPlayer, submitterClientId) {
   if (!roll || typeof roll !== "object") return roll;
-  const sid =
-    submitterClientId != null && String(submitterClientId).trim()
-      ? String(submitterClientId).trim()
-      : null;
   const pid =
     actingPlayer?.id != null && String(actingPlayer.id).trim()
       ? String(actingPlayer.id).trim()
       : null;
+  const sidFromPid =
+    pid && /^mp-player-/i.test(pid) ? String(pid).replace(/^mp-player-/i, "").trim() : null;
+  const sid =
+    submitterClientId != null && String(submitterClientId).trim()
+      ? String(submitterClientId).trim()
+      : sidFromPid;
   const out = { ...roll };
   if (pid) out.forPlayerId = pid;
   if (sid) out.forClientId = sid;
@@ -3457,7 +3473,6 @@ export default function ChatInterface() {
     currentScene, setCurrentScene,
     currentSceneName,
     sceneVersion,
-    setSceneVersion,
     currentRoomId, setCurrentRoomId,
     entities,
     getEntitiesSnapshot,
@@ -3925,11 +3940,6 @@ export default function ChatInterface() {
       fin.id === cmdId &&
       Date.now() - fin.finishedAt < 180000;
     if (sameFinishedRecently) {
-      void setMultiplayerThinkingState({
-        active: false,
-        actor: null,
-        label: null,
-      });
       void clearMultiplayerPendingCommand(cmdId);
       return;
     }
@@ -3945,11 +3955,6 @@ export default function ChatInterface() {
     // En exploration, bloquer les doublons d'intention quasi simultanés même si cmdId diffère
     // (ex: deux auto-joueurs soumettent la même phrase à quelques ms d'intervalle).
     if (sigRecent && cmdMode === "exploration") {
-      void setMultiplayerThinkingState({
-        active: false,
-        actor: null,
-        label: null,
-      });
       void clearMultiplayerPendingCommand(cmdId);
       return;
     }
@@ -3969,11 +3974,6 @@ export default function ChatInterface() {
     if (busy && busy !== cmdId) {
       const inFlightSig = String(processingRemoteCommandSigRef.current ?? "");
       if (cmdSig && inFlightSig && cmdSig === inFlightSig && cmdMode === "exploration") {
-        void setMultiplayerThinkingState({
-          active: false,
-          actor: null,
-          label: null,
-        });
         void clearMultiplayerPendingCommand(cmdId);
       }
       mpPendingCmdResolutionIdsRef.current.delete(cmdId);
@@ -4043,8 +4043,9 @@ export default function ChatInterface() {
         }
 
         try {
+          const liveStateForCommand = gameStateRef.current ?? null;
           const liveEntitiesForCommand =
-            gameStateRef.current?.entities ?? entities ?? [];
+            liveStateForCommand?.entities ?? entities ?? [];
           // `submitMultiplayerCommand` met déjà thinkingState=gm dans la transaction Firestore.
           // skipSessionLock : le bail commandLease sérialise déjà ; un second verrou `processing`
           // sur le même doc peut faire échouer callApi immédiatement ou aggraver les courses.
@@ -4056,10 +4057,25 @@ export default function ChatInterface() {
               skipSessionLock: true,
               multiplayerPendingCommandId: cmdId,
               actingPlayer: cmd.playerSnapshot ?? null,
-              gameMode: cmd.gameModeSnapshot ?? undefined,
-              currentRoomId: cmd.currentRoomIdSnapshot ?? undefined,
-              currentScene: cmd.currentSceneSnapshot ?? undefined,
-              currentSceneName: cmd.currentSceneNameSnapshot ?? undefined,
+              // IMPORTANT MP: toujours résoudre sur l'état live au moment du lease.
+              // Les snapshots d'envoi (cmd.*Snapshot) peuvent être obsolètes si d'autres
+              // transitions ont eu lieu entre-temps.
+              gameMode:
+                liveStateForCommand?.gameMode ??
+                cmd.gameModeSnapshot ??
+                undefined,
+              currentRoomId:
+                liveStateForCommand?.currentRoomId ??
+                cmd.currentRoomIdSnapshot ??
+                undefined,
+              currentScene:
+                liveStateForCommand?.currentScene ??
+                cmd.currentSceneSnapshot ??
+                undefined,
+              currentSceneName:
+                liveStateForCommand?.currentSceneName ??
+                cmd.currentSceneNameSnapshot ??
+                undefined,
               // IMPORTANT MP: ne jamais exécuter sur le snapshot soumis par le joueur
               // (potentiellement obsolète de quelques ticks). Utiliser l'état live du résolveur.
               entities: Array.isArray(liveEntitiesForCommand) ? liveEntitiesForCommand : undefined,
@@ -6400,7 +6416,7 @@ export default function ChatInterface() {
     return [...ids];
   }
 
-  function applyGodmodeResponse(pack, originalCommand) {
+  async function applyGodmodeResponse(pack, originalCommand) {
     const teleport = pack?.teleport && typeof pack.teleport === "object" ? pack.teleport : null;
     const roomMemoryOps = Array.isArray(pack?.roomMemoryOps) ? pack.roomMemoryOps : [];
     const chatHistoryPatch =
@@ -6443,6 +6459,7 @@ export default function ChatInterface() {
     let nextTurnIndex = combatTurnIndex;
 
     if (teleport?.targetRoomId && teleport.targetRoomId !== currentRoomId) {
+      rememberRoomEntitiesSnapshot(currentRoomId, entities);
       nextRoomId = teleport.targetRoomId;
       nextSceneName =
         String(teleport.targetSceneName ?? "").trim() ||
@@ -6453,67 +6470,10 @@ export default function ChatInterface() {
           ? teleport.targetSceneDescription
           : String(GOBLIN_CAVE[nextRoomId]?.description ?? currentScene);
       nextEntitiesForRef = nextRoomId === "scene_journey" ? [] : takeEntitiesForRoom(nextRoomId);
-      if (multiplayerSessionId) {
-        const participantIds = Array.isArray(multiplayerParticipantProfiles)
-          ? multiplayerParticipantProfiles
-              .map((p) => String(p?.clientId ?? "").trim())
-              .filter(Boolean)
-          : [];
-        const mpEntityIds = participantIds.map((cid) => `mp-player-${cid}`);
-        const mpEntityIdSet = new Set(mpEntityIds);
-        if (mpEntityIdSet.size > 0) {
-          const allRoomIds = Object.keys(GOBLIN_CAVE ?? {});
-          const movedMpById = new Map();
-          const sourceCurrent = Array.isArray(entities) ? entities : [];
-
-          const currentRoomWithoutPlayers = sourceCurrent.filter(
-            (e) => !mpEntityIdSet.has(String(e?.id ?? "").trim())
-          );
-          rememberRoomEntitiesSnapshot(currentRoomId, currentRoomWithoutPlayers);
-
-          for (const entity of sourceCurrent) {
-            const eid = String(entity?.id ?? "").trim();
-            if (mpEntityIdSet.has(eid) && !movedMpById.has(eid)) movedMpById.set(eid, entity);
-          }
-
-          for (const roomId of allRoomIds) {
-            if (!roomId || roomId === "scene_journey" || roomId === currentRoomId || roomId === nextRoomId) continue;
-            const roomEntities = Array.isArray(takeEntitiesForRoom(roomId)) ? takeEntitiesForRoom(roomId) : [];
-            let changed = false;
-            const kept = [];
-            for (const entity of roomEntities) {
-              const eid = String(entity?.id ?? "").trim();
-              if (mpEntityIdSet.has(eid)) {
-                if (!movedMpById.has(eid)) movedMpById.set(eid, entity);
-                changed = true;
-                continue;
-              }
-              kept.push(entity);
-            }
-            if (changed) rememberRoomEntitiesSnapshot(roomId, kept);
-          }
-
-          const targetBase = Array.isArray(nextEntitiesForRef) ? nextEntitiesForRef : [];
-          const targetWithoutPlayers = targetBase.filter(
-            (e) => !mpEntityIdSet.has(String(e?.id ?? "").trim())
-          );
-          const movedPlayers = [];
-          for (const mpId of mpEntityIds) {
-            const ent = movedMpById.get(mpId);
-            if (ent) movedPlayers.push(ent);
-          }
-          const targetWithPlayers = [...targetWithoutPlayers, ...movedPlayers];
-          rememberRoomEntitiesSnapshot(nextRoomId, targetWithPlayers);
-          nextEntitiesForRef = targetWithPlayers;
-        }
-      } else {
-        rememberRoomEntitiesSnapshot(currentRoomId, entities);
-      }
 
       setCurrentRoomId(nextRoomId);
       if (nextSceneName) setCurrentSceneName(nextSceneName);
       if (typeof nextScene === "string") setCurrentScene(nextScene);
-      setSceneVersion((v) => v + 1);
       setCurrentSceneImage("/file.svg");
       replaceEntities(nextEntitiesForRef);
       nextGameMode = "exploration";
@@ -6669,7 +6629,11 @@ export default function ChatInterface() {
       combatTurnIndex: nextTurnIndex,
     };
     if (multiplayerSessionId) {
-      void flushMultiplayerSharedState();
+      try {
+        await flushMultiplayerSharedState();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -8250,8 +8214,13 @@ export default function ChatInterface() {
         );
       }
       applyEntityUpdates([{ id: eid, action: "update", surprised: false }]);
-      setReactionFor(eid, true);
       await yieldCombatUiSync();
+      if (multiplayerSessionId) {
+        // Flush seulement après propagation locale de l'update ; sinon on peut publier
+        // un snapshot encore `surprised:true` et figer l'ennemi sur les tours suivants.
+        await flushMultiplayerSharedState().catch(() => {});
+      }
+      setReactionFor(eid, true);
       return;
     }
 
@@ -8802,15 +8771,11 @@ export default function ChatInterface() {
   function ensureCombatState(currentEntities, maybeOrder = null, options = null) {
     const liveMode = gameStateRef.current?.gameMode ?? gameMode;
     const anyCombatReadyHostile = hasAnyCombatReadyHostile(currentEntities);
-    const anyHostileAlive = hasAnyHostileAlive(currentEntities);
     if (!anyCombatReadyHostile) {
       const entLen = Array.isArray(currentEntities) ? currentEntities.length : 0;
       const orderLen =
         (Array.isArray(gameStateRef.current?.combatOrder) ? gameStateRef.current.combatOrder.length : 0) ||
         (combatOrder?.length ?? 0);
-      // Ne jamais sortir du combat juste parce que `awareOfPlayer` est temporairement faux
-      // (arbiter/sync). Tant qu'un hostile vivant existe et qu'un ordre est actif, le segment continue.
-      const preserveCombatWithLivingHostiles = liveMode === "combat" && anyHostileAlive && orderLen > 0;
       // Après un jet joueur → arbitre (porte, obstacle…), la salle peut avoir entities=[] sans que le
       // combat soit terminé : ne pas traiter "aucune entité" comme "plus aucun hostile" et effacer l'initiative.
       const skipEmptyRoomCleanup =
@@ -8818,7 +8783,7 @@ export default function ChatInterface() {
         entLen === 0 &&
         orderLen > 0 &&
         liveMode === "combat";
-      if (skipEmptyRoomCleanup || preserveCombatWithLivingHostiles) {
+      if (skipEmptyRoomCleanup) {
         return;
       }
       if (liveMode === "combat") {
@@ -8852,7 +8817,7 @@ export default function ChatInterface() {
   }
 
   function isCombatOver(currentEntities) {
-    return !currentEntities.some((e) => e?.type === "hostile" && e.isAlive);
+    return !currentEntities.some((e) => isHostileReadyForCombat(e));
   }
 
   function nextAliveTurnIndex(order, idx, currentEntities) {
@@ -9190,6 +9155,17 @@ export default function ChatInterface() {
               );
             }
           }
+          // MP/resync : même si le tour a déjà été traité ailleurs, on doit garder un journal
+          // local cohérent (sinon le PNJ "saute" sans trace visible côté client observateur).
+          const endEid = String(entry?.id ?? liveEnemy?.id ?? "").trim() || "unknown";
+          const turnEndMsgId = `npc-turn-end:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${endEid}`;
+          const turnEndDivId = `npc-turn-end-div:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${endEid}`;
+          if (!messagesRef.current.some((m) => m && m.id === turnEndMsgId)) {
+            addMessage("ai", `**${liveEnemy.name}** met fin à son tour.`, "turn-end", turnEndMsgId);
+          }
+          if (!messagesRef.current.some((m) => m && m.id === turnEndDivId)) {
+            addMessage("ai", "", "turn-divider", turnEndDivId);
+          }
           currentEntities = gameStateRef.current?.entities ?? entities;
           order = gameStateRef.current?.combatOrder ?? order;
           idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
@@ -9218,7 +9194,43 @@ export default function ChatInterface() {
       }
       currentEntities = gameStateRef.current?.entities ?? entities;
       order = gameStateRef.current?.combatOrder ?? order;
-      const entForTurnEnd = resolveCombatOrderEntity(entry, currentEntities, order);
+      let entForTurnEnd = resolveCombatOrderEntity(entry, currentEntities, order);
+      // Filet de sécurité surprise :
+      // si le tour ennemi a été court-circuité (anti-rejeu / resync), on doit quand même
+      // consommer l'état "surpris" et afficher le message associé une seule fois.
+      if (
+        entForTurnEnd &&
+        String(entForTurnEnd.type ?? "").toLowerCase() === "hostile" &&
+        entForTurnEnd.isAlive === true &&
+        entForTurnEnd.surprised === true
+      ) {
+        const endEid = String(entry?.id ?? entForTurnEnd?.id ?? "").trim() || "unknown";
+        const surprisedMsgId = `enemy-surprised-freeze:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${endEid}`;
+        if (!messagesRef.current.some((m) => m && m.id === surprisedMsgId)) {
+          addMessage(
+            "ai",
+            `${entForTurnEnd.name} est surpris et reste figé un instant.`,
+            "enemy-turn",
+            surprisedMsgId
+          );
+        }
+        applyEntityUpdates([{ id: endEid, action: "update", surprised: false }]);
+        await yieldCombatUiSync();
+        if (multiplayerSessionId) {
+          // Même contrainte ici : on flush après propagation locale pour ne pas repousser
+          // un `surprised:true` périmé dans l'état partagé.
+          await flushMultiplayerSharedState().catch(() => {});
+        }
+        setReactionFor(endEid, true);
+        currentEntities = gameStateRef.current?.entities ?? entities;
+        order = gameStateRef.current?.combatOrder ?? order;
+        entForTurnEnd = resolveCombatOrderEntity(entry, currentEntities, order);
+      }
+      const turnWriteSeqForTurnEnd =
+        typeof gameStateRef.current?.combatTurnWriteSeq === "number" &&
+        Number.isFinite(gameStateRef.current.combatTurnWriteSeq)
+          ? Math.trunc(gameStateRef.current.combatTurnWriteSeq)
+          : Math.trunc(combatTurnWriteSeq ?? 0);
       let postedNpcTurnEnd = false;
       const endHostileHp =
         entForTurnEnd &&
@@ -9235,8 +9247,8 @@ export default function ChatInterface() {
           (endHostileHp != null && endHostileHp > 0));
       if (npcTurnEndNarrationOk) {
         const endEid = String(entry?.id ?? entForTurnEnd?.id ?? "").trim() || "unknown";
-        const turnEndMsgId = `npc-turn-end:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${endEid}`;
-        const turnEndDivId = `npc-turn-end-div:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${endEid}`;
+        const turnEndMsgId = `npc-turn-end:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForTurnEnd}:${endEid}`;
+        const turnEndDivId = `npc-turn-end-div:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForTurnEnd}:${endEid}`;
         if (!messagesRef.current.some((m) => m && m.id === turnEndMsgId)) {
           addMessage("ai", `**${entForTurnEnd.name}** met fin à son tour.`, "turn-end", turnEndMsgId);
         }
@@ -9518,43 +9530,41 @@ export default function ChatInterface() {
       setHasDisengagedThisTurn(false);
       setSneakAttackArmed(false);
       setSneakAttackUsedThisTurn(false);
-      setIsTyping(true);
-      try {
-        const arbiterAtPlayerTurnStart = await runCombatTurnStartArbiter({
-          actorId: "player",
-          actorName: player?.name ?? "Vous",
-          actorType: "player",
-        });
-        if (arbiterAtPlayerTurnStart?.awaitingPlayerRoll === true) {
-          return;
-        }
-        if (await preparePlayerTurnStartState()) {
-          return;
-        }
-        const livePlayerAtTurnStart = gameStateRef.current?.player ?? player;
-        if (livePlayerAtTurnStart?.surprised === true) {
-          lockPlayerTurnResourcesForSurprise();
-          addMessage(
-            "ai",
-            `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
-            "turn-end",
-            makeMsgId()
-          );
-          addMessage("ai", "", "turn-divider", makeMsgId());
-          updatePlayer({ surprised: false });
-          const entsSnap = gameStateRef.current?.entities ?? entities;
-          postInitiativeSurprisedLocalHeadKickoffIdx = nextAliveTurnIndexFromActor(
-            merged,
-            0,
-            first.id,
-            entsSnap
-          );
-          commitCombatTurnIndex(postInitiativeSurprisedLocalHeadKickoffIdx);
-        } else {
-          grantPlayerTurnResources();
-        }
-      } finally {
-        setIsTyping(false);
+      // Ne pas utiliser setIsTyping ici : runCombatTurnStartArbiter est un hook mécanique
+      // (surprise, CA, etc.) sans narration MJ — l’API peut être longue (ex. Gemini) et
+      // bloquait handleSend / submitMultiplayerCommand en MP via isEngineResolvingNow.
+      const arbiterAtPlayerTurnStart = await runCombatTurnStartArbiter({
+        actorId: "player",
+        actorName: player?.name ?? "Vous",
+        actorType: "player",
+      });
+      if (arbiterAtPlayerTurnStart?.awaitingPlayerRoll === true) {
+        return;
+      }
+      if (await preparePlayerTurnStartState()) {
+        return;
+      }
+      const livePlayerAtTurnStart = gameStateRef.current?.player ?? player;
+      if (livePlayerAtTurnStart?.surprised === true) {
+        lockPlayerTurnResourcesForSurprise();
+        addMessage(
+          "ai",
+          `${player?.name ?? "Vous"} êtes surpris et perdez ce tour.`,
+          "turn-end",
+          makeMsgId()
+        );
+        addMessage("ai", "", "turn-divider", makeMsgId());
+        updatePlayer({ surprised: false });
+        const entsSnap = gameStateRef.current?.entities ?? entities;
+        postInitiativeSurprisedLocalHeadKickoffIdx = nextAliveTurnIndexFromActor(
+          merged,
+          0,
+          first.id,
+          entsSnap
+        );
+        commitCombatTurnIndex(postInitiativeSurprisedLocalHeadKickoffIdx);
+      } else {
+        grantPlayerTurnResources();
       }
     }
     if (postInitiativeSurprisedLocalHeadKickoffIdx != null) {
@@ -9857,11 +9867,15 @@ export default function ChatInterface() {
     if (!npcInitiativeDraft?.length) return;
     if (pendingRoll) return;
     if (waitForGmNarrationForInitiative) return;
+    // Évite d’enchaîner initiative / arbitre pendant qu’un parse-intent ou callApi MJ est encore en cours
+    // (sinon verrous session + isTyping mélangés avec l’ouverture de combat depuis l’exploration).
+    if (apiProcessingDepthRef.current > 0) return;
 
     queueMicrotask(() => {
       if (!autoPlayerEnabledRef.current) return;
       if (!autoRollEnabledRef.current) return;
       if (useManualInitiativeRollInputRef.current) return;
+      if (apiProcessingDepthRef.current > 0) return;
       handleCommitInitiativeRef.current(true);
     });
   }, [
@@ -10319,6 +10333,9 @@ export default function ChatInterface() {
       emitMeleeMoveDebug,
       messagesRef,
       multiplayerParticipantProfilesRef,
+      multiplayerSessionId,
+      clientId,
+      patchParticipantProfileHp,
       combatEngagementSeqRef,
       combatRoundInEngagementRef,
       combatTurnIndexLiveRef,
@@ -10326,10 +10343,7 @@ export default function ChatInterface() {
     });
 
     if (!intentResult.ok) {
-      const fromMpPendingCommand = !!String(multiplayerPendingCommandIdForEngine ?? "").trim();
-      // MP : ne jamais "silencer" la seule erreur visible, sinon le joueur voit
-      // le spinner "MJ réfléchit…" sans explication en cas de cible/salle désynchronisée.
-      if (fromMpPendingCommand || !shouldSkipDuplicateClientActionErrorEcho(intentResult.userMessage)) {
+      if (!shouldSkipDuplicateClientActionErrorEcho(intentResult.userMessage)) {
         addMessage("ai", intentResult.userMessage, multiplayerSessionId ? "meta" : "intent-error", makeMsgId());
       }
       return;
@@ -10817,7 +10831,6 @@ export default function ChatInterface() {
               bypassIntentParser: true,
               skipAutoPlayerTurn: true,
               skipGmContinue: true,
-              skipSceneRulesResolvedPipeline: true,
               actingPlayer: effectiveActingPlayer,
               entities: resolved?.nextEntities ?? baseEntities,
               currentRoomId: resolved?.nextRoomId ?? baseRoomId,
@@ -11052,9 +11065,8 @@ export default function ChatInterface() {
       const room = tid && GOBLIN_CAVE[tid] ? GOBLIN_CAVE[tid] : null;
       const baseTrim = String(baseRoomId ?? "").trim();
       if (room && tid !== baseTrim) {
-        // IMPORTANT: on ne change JAMAIS de salle ici.
-        // Parse-intent ne fait qu'émettre une intention de transition ; la validation finale
-        // (porte fermée, conditions de passage, verrou, etc.) doit passer par GM Arbitre.
+        // Parse-intent ne fait qu'émettre une intention de transition.
+        // La transition effective est décidée par le GM Arbitre.
         sceneUpdateSnapshot = { hasChanged: true, targetRoomId: tid };
       }
     }
@@ -11092,7 +11104,7 @@ export default function ChatInterface() {
           intentDecision: {
             resolution: apiDecision.resolution,
             reason: apiDecision.reason ?? null,
-            sceneUpdate: hadIntentSceneTransition ? null : sceneUpdateSnapshot ?? null,
+            sceneUpdate: hadIntentSceneTransition ? null : sceneUpdate ?? null,
             parseIntentNavigationApplied: hadIntentSceneTransition ? true : undefined,
           },
             actingPlayerOverride: effectiveActingPlayer,
@@ -11777,7 +11789,36 @@ export default function ChatInterface() {
     // rencontres « en chemin » ou avant le seuil se retrouvent dans la pièce d'arrivée par erreur.
     const entitiesBaseForPlannedUpdates = nextEntities;
 
-    const plannedUpdates = Array.isArray(finalDecision?.entityUpdates) ? finalDecision.entityUpdates : [];
+    const plannedUpdatesRaw = Array.isArray(finalDecision?.entityUpdates) ? finalDecision.entityUpdates : [];
+    const hookPhase = String(arbiterTrigger?.phase ?? "").trim();
+    const plannedUpdates =
+      hookPhase === "combat_turn_start" || hookPhase === "combat_turn_end"
+        ? plannedUpdatesRaw.filter((u) => {
+            if (!u || typeof u !== "object") return false;
+            if (String(u.action ?? "update").trim() !== "update") return true;
+            if (!Object.prototype.hasOwnProperty.call(u, "surprised")) return true;
+            if (u.surprised !== true) return true;
+            const uid = String(u.id ?? "").trim();
+            if (!uid) return true;
+            const cur = (Array.isArray(entitiesBaseForPlannedUpdates) ? entitiesBaseForPlannedUpdates : []).find(
+              (e) => String(e?.id ?? "").trim() === uid
+            );
+            // Hooks de tour combat : ne jamais réarmer `surprised:true` une fois consommé.
+            // Sinon un PNJ peut être re-surpris en boucle à chaque sync/tour joueur.
+            if (cur && cur.isAlive === true && cur.surprised === false) {
+              if (debugMode) {
+                addMessage(
+                  "ai",
+                  `[DEBUG] GM Arbitre ignoré (hook combat) : réapplication interdite de surprised=true sur ${cur.name ?? uid}.`,
+                  "debug",
+                  makeMsgId()
+                );
+              }
+              return false;
+            }
+            return true;
+          })
+        : plannedUpdatesRaw;
     const plannedEntitiesAfterLocalUpdates = plannedUpdates.length
       ? applyUpdatesLocally(entitiesBaseForPlannedUpdates, plannedUpdates)
       : entitiesBaseForPlannedUpdates;
@@ -11835,8 +11876,15 @@ export default function ChatInterface() {
     });
 
     const sUp = finalDecision?.sceneUpdate;
+    const sceneEnteredWithoutExplicitTransitionIntent =
+      arbiterTrigger?.phase === "scene_entered" &&
+      !(intentDecision?.sceneUpdate?.hasChanged === true);
     const roomBeforeSceneUpdate = nextRoomId;
-    if (sUp?.hasChanged && typeof sUp?.targetRoomId === "string") {
+    if (
+      !sceneEnteredWithoutExplicitTransitionIntent &&
+      sUp?.hasChanged &&
+      typeof sUp?.targetRoomId === "string"
+    ) {
       const tid = sUp.targetRoomId.trim();
       const tRoom = tid && GOBLIN_CAVE[tid] ? GOBLIN_CAVE[tid] : null;
       if (tRoom) {
@@ -11864,15 +11912,6 @@ export default function ChatInterface() {
         if (!isSameRoomTransition) {
           replaceEntities(nextEntities);
         }
-        // MP: setState React est async; si un flush Firestore part tout de suite après,
-        // il peut republier l'ancienne salle et provoquer un "retour arrière" visuel.
-        gameStateRef.current = {
-          ...gameStateRef.current,
-          currentRoomId: nextRoomId,
-          currentScene: nextScene,
-          currentSceneName: nextSceneName,
-          entities: nextEntities,
-        };
       }
     }
 
@@ -12287,7 +12326,6 @@ export default function ChatInterface() {
             bypassIntentParser: true,
             skipAutoPlayerTurn: true,
             skipGmContinue: true,
-            skipSceneRulesResolvedPipeline: true,
             entities: resolved.nextEntities,
             currentRoomId: resolved.nextRoomId,
             currentScene: resolved.nextScene,
@@ -12425,7 +12463,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           skipSessionLock: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
-          skipSceneRulesResolvedPipeline: true,
           entities: resolved?.nextEntities ?? activeEntities,
           currentRoomId: resolved?.nextRoomId ?? activeRoomId,
           currentScene: resolved?.nextScene ?? activeScene,
@@ -12501,7 +12538,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           skipSessionLock: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
-          skipSceneRulesResolvedPipeline: true,
           entities: resolved?.nextEntities ?? activeEntities,
           currentRoomId: resolved?.nextRoomId ?? activeRoomId,
           currentScene: resolved?.nextScene ?? activeScene,
@@ -12584,9 +12620,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     const preexistingUserMessage = overrides?.preexistingUserMessage === true;
     /** Si true : la réponse /api/chat ne doit pas enchaîner arbitre → [SceneRulesResolved] (déjà fait dans processArbiterDecision après parse-intent). */
     const skipSceneRulesResolvedPipeline = overrides?.skipSceneRulesResolvedPipeline === true;
-    /** Toute prose joueur doit rester sans msgType (ou ancien alias) pour enchaîner sur /api/parse-intent. */
-    const isNaturalCall =
-      (!msgType || String(msgType).trim() === "player-utterance") && !isDebug;
+    const isNaturalCall = !msgType && !isDebug;
     const naturalNormText = String(userContent ?? "").trim().toLowerCase();
     const naturalSubmitterKey = String(rollSubmitterClientId ?? clientId ?? "").trim();
     const naturalParserReplayKey =
@@ -13416,22 +13450,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           if (!spawnUpdate || spawnUpdate.action !== "spawn") return spawnUpdate;
           const templateId = String(spawnUpdate.templateId ?? "").trim();
           if (!templateId || !BESTIARY?.[templateId]) return spawnUpdate;
-          // pnj_generique : le MJ pose nom, fiction, PV, race, traits ; on garde le gabarit pour les attaques.
-          if (templateId === "pnj_generique") {
-            const {
-              attackBonus,
-              damageDice,
-              damageBonus,
-              weapons,
-              stats,
-              selectedSpells,
-              spellSlots,
-              spellAttackBonus,
-              spellSaveDc,
-              ...safeSpawn
-            } = spawnUpdate;
-            return safeSpawn;
-          }
           // Spawn piloté par template: le moteur initialise les stats de combat.
           const {
             attackBonus,
@@ -13807,6 +13825,9 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             emitMeleeMoveDebug: emitMeleeMoveDebugGm,
             messagesRef,
             multiplayerParticipantProfilesRef,
+            multiplayerSessionId,
+            clientId,
+            patchParticipantProfileHp,
             combatEngagementSeqRef,
             combatRoundInEngagementRef,
             combatTurnIndexLiveRef,
@@ -14585,6 +14606,12 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             if (tid && room) setCurrentRoomId(tid);
             if (finalName) setCurrentSceneName(finalName);
             if (finalDesc) setCurrentScene(finalDesc);
+            // Changement de salle => repartir sans ancien ordre d'initiative.
+            // Si la salle d'arrivée déclenche un combat, il sera recréé proprement.
+            setCombatOrder([]);
+            setGameMode("exploration", finalEntities, { force: true });
+            setCombatHiddenIds([]);
+            clearCombatStealthTotals();
 
             if (typeof safeSceneUpdate.newSceneImage === "string" && safeSceneUpdate.newSceneImage.trim()) {
               setCurrentSceneImage(safeSceneUpdate.newSceneImage.trim());
@@ -14644,7 +14671,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                     scene: finalDesc,
                     sceneName: finalName,
                     entitiesAtEntry: finalEntities,
-                    sourceAction: userContent,
+                    sourceAction: `[SceneEntered] ${tid}`,
                     baseGameMode: gameStateRef.current?.gameMode ?? baseGameMode,
                   })
                     .then((resolved) => {
@@ -14654,7 +14681,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                         bypassIntentParser: true,
                         skipAutoPlayerTurn: true,
                         skipGmContinue: true,
-                        skipSceneRulesResolvedPipeline: true,
                         entities: resolved?.nextEntities ?? finalEntities,
                         currentRoomId: resolved?.nextRoomId ?? tid,
                         currentScene: resolved?.nextScene ?? finalDesc,
@@ -14951,7 +14977,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             bypassIntentParser: true,
             skipAutoPlayerTurn: true,
             skipGmContinue: true,
-            skipSceneRulesResolvedPipeline: true,
             entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
             currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
             currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
@@ -15011,7 +15036,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           bypassIntentParser: true,
           skipAutoPlayerTurn: true,
           skipGmContinue: true,
-          skipSceneRulesResolvedPipeline: true,
           actingPlayer: p.actingPlayerOverride ?? player ?? null,
           entities: resolved?.nextEntities ?? p.entitiesAtEntry,
           currentRoomId: resolved?.nextRoomId ?? p.roomId,
@@ -15086,7 +15110,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               bypassIntentParser: true,
               skipAutoPlayerTurn: true,
               skipGmContinue: true,
-              skipSceneRulesResolvedPipeline: true,
               entities: resolved?.nextEntities ?? failedRequestPayload.entitiesAtEntry,
               currentRoomId: resolved?.nextRoomId ?? failedRequestPayload.roomId,
               currentScene: resolved?.nextScene ?? failedRequestPayload.scene,
@@ -16682,6 +16705,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       const mpCmd = {
         id: makeMsgId(),
         userContent: trimmed,
+        // Message joueur normal : doit rester sans type pour passer par parse-intent
+        // et utiliser le rendu utilisateur standard (bulle bleue).
         msgType: null,
         isDebug: false,
         senderName: liveSnap?.player?.name ?? player?.name ?? "Joueur",
@@ -17299,26 +17324,20 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         getEntities: () => getEntitiesSnapshot(),
         getTurnResources: () => turnResourcesRef.current,
         player,
+        setHp,
+        playerHpRef,
         updatePlayer,
         spendSpellSlot,
         hasResource,
         consumeResource,
         setTurnResourcesSynced,
         gameMode: gameStateRef.current?.gameMode ?? gameMode,
-        consumeInventoryItemByName: (itemName) => {
-          const name = String(itemName ?? "").trim();
-          if (!name) return false;
-          const inv = Array.isArray(player?.inventory) ? player.inventory : [];
-          if (!inventoryHasStackedItem(inv, name)) return false;
-          const removed = removeOneStackedItem(inv, name);
-          if (!removed) return false;
-          updatePlayer({ inventory: stackInventory(removed) });
-          return true;
-        },
         stampPendingRollForActor,
         clientId,
         setPendingRoll,
         pendingRollRef,
+        multiplayerSessionId,
+        patchParticipantProfileHp,
         applyEntityUpdates,
         applyUpdatesLocally,
         markSceneHostilesAware,
@@ -17332,19 +17351,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         fmtMod,
         setSneakAttackArmed,
         setSneakAttackUsedThisTurn,
-        syncEntitiesImmediate: (nextEntities) => {
-          gameStateRef.current = {
-            ...gameStateRef.current,
-            entities: Array.isArray(nextEntities) ? nextEntities : gameStateRef.current?.entities ?? [],
-          };
-        },
         safeJson,
-        localCombatantId,
-        multiplayerParticipantProfiles: Array.isArray(multiplayerParticipantProfiles)
-          ? multiplayerParticipantProfiles
-          : [],
-        patchParticipantProfileHp,
-        multiplayerSessionId,
       });
       if (handled) return;
     }
@@ -18905,7 +18912,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               bypassIntentParser: true,
               skipAutoPlayerTurn: true,
               skipGmContinue: true,
-              skipSceneRulesResolvedPipeline: true,
               entities: resolved.nextEntities,
               currentRoomId: resolved.nextRoomId,
               currentScene: resolved.nextScene,
@@ -18995,7 +19001,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             bypassIntentParser: true,
             skipAutoPlayerTurn: true,
             skipGmContinue: true,
-            skipSceneRulesResolvedPipeline: true,
             entities: resolved.nextEntities,
             currentRoomId: resolved.nextRoomId,
             currentScene: resolved.nextScene,
@@ -19158,7 +19163,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         throw new Error(String(data?.details ?? data?.error ?? `Erreur HTTP ${res.status}`));
       }
 
-      applyGodmodeResponse(data, trimmed);
+      await applyGodmodeResponse(data, trimmed);
     } catch (e) {
       const msg = String(e?.message ?? e);
       setError(msg);
@@ -19731,6 +19736,24 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             );
           }
 
+          // Réplique / intention joueur en scène (multijoueur) — centré, vert
+          if (msg.role === "user" && msg.type === "player-utterance") {
+            const senderLabel =
+              typeof msg.senderName === "string" && msg.senderName.trim()
+                ? msg.senderName.trim()
+                : "Vous";
+            return (
+              <div key={msg.id} className="flex justify-center">
+                <div className="max-w-[80%] rounded-xl border border-green-600/50 bg-green-950/60 px-4 py-2.5 text-sm text-green-200 shadow">
+                  <p className="text-center text-xs font-semibold text-green-300/90 mb-1">{senderLabel}</p>
+                  <p className="text-center leading-relaxed whitespace-pre-wrap">
+                    {repairMojibakeForDisplay(msg.content)}
+                  </p>
+                </div>
+              </div>
+            );
+          }
+
           // Message joueur â€” droite, bleu
           if (msg.role === "user") {
             const senderLabel =
@@ -19885,7 +19908,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         const effGmBanner = gameStateRef.current?.gameMode ?? gameMode;
         const hiddenArrBanner = gameStateRef.current?.combatHiddenIds ?? combatHiddenIds ?? [];
         const atkAdvBanner =
-          pendingRoll.kind === "attack"
+          forMe && pendingRoll.kind === "attack"
             ? computePlayerAttackAdvDisForPendingRoll({
                 pendingRoll,
                 gameMode: effGmBanner,
@@ -20201,35 +20224,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             >
               Envoyer
             </button>
-          </div>
-
-          {/* Forcer prochain D20 */}
-          <div className="flex items-center gap-2 text-xs text-teal-200">
-            <span className="text-teal-400 font-semibold">
-              {repairMojibakeForDisplay("ðŸŽ²")} Forcer le prochain D20 :
-            </span>
-            <input
-              type="number"
-              min={1}
-              max={20}
-              value={debugNextRoll ?? ""}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (!v) { setDebugNextRoll(null); return; }
-                const n = Math.max(1, Math.min(20, Number(v)));
-                setDebugNextRoll(Number.isNaN(n) ? null : n);
-              }}
-              className="w-16 rounded border border-teal-600/60 bg-teal-900/30 px-2 py-1 text-xs text-teal-100 placeholder-teal-700 outline-none focus:border-teal-400"
-              placeholder="1-20"
-            />
-            {debugNextRoll !== null && (
-              <button
-                onClick={() => setDebugNextRoll(null)}
-                className="rounded border border-teal-600/60 px-2 py-0.5 text-[10px] text-teal-200 hover:bg-teal-800/60"
-              >
-                Réinitialiser
-              </button>
-            )}
           </div>
 
         </div>

@@ -93,44 +93,6 @@ export const BESTIARY = {
       "Longbow: +3 pour toucher, portée 150/600 ft, 1d8+1 dégâts perforants.",
     ],
   },
-  /**
-   * Gabarit pour tout PNJ sans fiche monstre (module, improvisation). L’IA / l’arbitre fournit
-   * le nom affiché, la description, race, classe, PV, etc. au spawn ; les stats de combat restent
-   * volontairement modestes (civil / figurant).
-   */
-  pnj_generique: {
-    id: "pnj_generique",
-    name: "PNJ (gabarit)",
-    type: "npc",
-    race: "Humanoïde (à préciser à l’apparition)",
-    entityClass: "Civil ou figure de campagne",
-    cr: 0,
-    hp: { current: 4, max: 4 },
-    ac: 10,
-    stats: { FOR: 10, DEX: 10, CON: 10, INT: 10, SAG: 10, CHA: 10 },
-    attackBonus: 2,
-    damageDice: "1d4",
-    damageBonus: 0,
-    weapons: [
-      {
-        name: "Coup improvisé",
-        attackBonus: 2,
-        damageDice: "1d4",
-        damageBonus: 0,
-        kind: "melee",
-        reach: "1,50 m",
-      },
-    ],
-    stealthDc: null,
-    description:
-      "Personnage non-joueur générique : le MJ pose le nom, le portrait et l’état (PV, allié ou neutre) selon la fiction. Ne remplace pas une fiche de monstre ou de boss.",
-    senses: {
-      passivePerception: 10,
-    },
-    languages: ["commun"],
-    features: [],
-    actions: ["Coup improvisé : +2 pour toucher, allonge 1,50 m. Touché : 1d4 contondants."],
-  },
   elric: {
     id: "elric",
     name: "Elric",

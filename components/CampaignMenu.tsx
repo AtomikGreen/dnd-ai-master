@@ -31,6 +31,8 @@ type CampaignMenuProps = {
 /** Messages moteur / UI technique — pas d’aperçu « salon » (évite d’afficher les logs [DEBUG][ENGINE_RX], etc.). */
 function isMessageEligibleForLobbyPreview(m: Message): boolean {
   const t = m.type;
+  const id = String(m?.id ?? "").trim();
+  if (id.startsWith("initiative-order-")) return false;
   if (
     t === "debug" ||
     t === "scene-image-pending" ||
@@ -60,6 +62,7 @@ export default function CampaignMenu({ onStart, onBack, messages = [], multiplay
   }, [mp?.sessionId]);
 
   const lobbyPreview = useMemo(() => {
+    if (!mp?.sessionId || mp.connected !== true) return null;
     if (!Array.isArray(messages) || messages.length === 0) return null;
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const m = messages[i];

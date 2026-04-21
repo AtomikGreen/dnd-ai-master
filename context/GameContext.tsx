@@ -66,31 +66,14 @@ const MULTIPLAYER_AUTO_INTENT_STALE_MS = 120_000;
 const FIRESTORE_SHARED_MESSAGES_CAP = 48;
 
 /**
- * Dernière tranche pour Firestore : les bulles `initiative-order-*` doivent rester incluses
- * même si elles sont « vieilles » (sinon la carte sort du slice(-48) → snapshot sans initiative
- * → effet « réparation » qui recolle un 2e « Jet d'Initiative » en fin de journal après fin de tour).
+ * Dernière tranche pour Firestore.
+ * On ne force plus la conservation des anciennes bulles `initiative-order-*` :
+ * elles doivent disparaître naturellement de l'historique partagé.
  */
 function sliceMessagesForSharedFirestorePayload(messages: Message[], cap: number): Message[] {
   if (!Array.isArray(messages) || messages.length === 0) return [];
   if (messages.length <= cap) return messages;
-  const tail = messages.slice(-cap);
-  const tailIds = new Set(tail.map((m) => String(m?.id ?? "").trim()).filter(Boolean));
-  const missingIni = messages.filter((m) => {
-    const id = String(m?.id ?? "").trim();
-    return id.startsWith("initiative-order-") && !tailIds.has(id);
-  });
-  if (missingIni.length === 0) return tail;
-  const room = cap - missingIni.length;
-  const rest = room > 0 ? messages.slice(-room) : [];
-  const seen = new Set<string>();
-  const out: Message[] = [];
-  for (const m of [...missingIni, ...rest]) {
-    const id = String(m?.id ?? "").trim();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    out.push(m);
-  }
-  return out;
+  return messages.slice(-cap);
 }
 
 /** Debounce synchro hôte : plus c'est long, moins on écrit sur Firestore (quota lectures + écritures). */
@@ -454,6 +437,24 @@ function shouldRetainLocalHitDiePendingRoll(
   return false;
 }
 
+function shouldRetainLocalDirectedPendingRoll(
+  inMultiplayerSession: boolean,
+  remotePr: PendingRoll | null | undefined,
+  localPr: PendingRoll | null | undefined,
+  playerSnapshot: Player | null | undefined,
+  clientIdStr: string | null | undefined
+): boolean {
+  if (!inMultiplayerSession) return false;
+  if (remotePr != null) return false;
+  if (!localPr) return false;
+  if (localPr.kind === "death_save" || localPr.kind === "hit_die") return false;
+  const pid = playerSnapshot?.id != null ? String(playerSnapshot.id).trim() : "";
+  const cid = clientIdStr != null ? String(clientIdStr).trim() : "";
+  if (localPr.forPlayerId && pid && String(localPr.forPlayerId).trim() === pid) return true;
+  if (localPr.forClientId && cid && String(localPr.forClientId).trim() === cid) return true;
+  return false;
+}
+
 function globalSkillPendingRollSignature(pr: PendingRoll | null | undefined): string {
   if (!pr || typeof pr !== "object") return "";
   const ctx = pr.sceneArbiterContext as Record<string, unknown> | null | undefined;
@@ -508,6 +509,8 @@ export interface Message {
   type?:
     | "dice"
     | "meta"
+    /** Réplique / action joueur en scène (combat) — bulle verte centrée (multijoueur). */
+    | "player-utterance"
     | "meta-reply"
     | "enemy-turn"
     | "combat-detail"
@@ -1328,30 +1331,6 @@ function isHostileReadyForCombat(entity: Entity | null | undefined): boolean {
   return !!entity && entity.type === "hostile" && entity.isAlive && entity.awareOfPlayer !== false;
 }
 
-function promoteHostilesAwareWhenInitiativeOpen(
-  entities: Entity[],
-  payload: {
-    awaitingPlayerInitiative?: boolean | null;
-    waitForGmNarrationForInitiative?: boolean | null;
-    gameMode?: GameMode | null;
-    combatOrder?: CombatEntry[] | null;
-  }
-): Entity[] {
-  const initiativeOpen =
-    payload?.awaitingPlayerInitiative === true ||
-    payload?.waitForGmNarrationForInitiative === true;
-  if (!initiativeOpen) return entities;
-
-  let changed = false;
-  const next = entities.map((ent) => {
-    if (!ent || ent.type !== "hostile" || ent.isAlive === false) return ent;
-    if (ent.awareOfPlayer === true) return ent;
-    changed = true;
-    return { ...ent, awareOfPlayer: true };
-  });
-  return changed ? next : entities;
-}
-
 /** Brouillon d'initiative PNJ : même ensemble d'ids que les hostiles prêts au combat (nouvelle escarmouche). */
 function npcInitiativeDraftMatchesHostiles(draft: CombatEntry[], hostiles: Entity[]): boolean {
   if (!Array.isArray(draft) || !Array.isArray(hostiles)) return false;
@@ -1495,36 +1474,45 @@ function appendLocalEntitiesAbsentFromRemote(local: Entity[], remote: unknown): 
 
 /**
  * Un snapshot Firestore peut arriver avant flushMultiplayerSharedState et réinjecter d'anciens PV.
- *
- * **Hostiles** : si le distant a plus de PV que le local (`ic > pc`), on garde le local — évite qu'un
- * snapshot retardé « ressuscite » un ennemi déjà blessé ici. Sinon on prend le distant (dégâts).
- *
- * **Non-hostiles** : cas fréquent MP — le journal affiche un soin (PV locaux à jour) puis un snapshot
- * distant encore à **0 PV** écrase l'affichage. Règle : si `ic === 0` et `pc > 0`, garder `pc`.
- * Sinon : si `ic > pc` prendre `ic` (soin / état réseau plus haut) ; si `ic < pc` prendre `ic`
- * (dégâts distants). Symétrique à l'hostile sauf le cas snapshot « 0 » périmé.
+ * On garde donc la valeur la plus basse entre local et remote pour éviter les "résurrections" visuelles
+ * (ex: ennemi à 0 PV qui remonte à 2/11 après un snapshot retardé).
  */
 function mergeIncomingEntitiesHpWithPrev(prevEnts: Entity[], incoming: Entity[]): Entity[] {
   const prevById = new Map(prevEnts.map((e) => [e.id, e]));
   return incoming.map((inc) => {
     const p = prevById.get(inc.id);
-    if (!p?.hp || !inc.hp) return inc;
+    // Anti-stale états de combat :
+    // si on a déjà consommé localement `surprised:false`, un snapshot Firestore en retard
+    // ne doit pas remettre `surprised:true` (sinon les ennemis sautent leurs tours en boucle).
+    const shouldKeepLocalUnsurprised =
+      p?.surprised === false && inc?.surprised === true;
+    // Idem : après engagement / première attaque, un snapshot en retard avec encore
+    // `awareOfPlayer:false` (ex. gobelins « endormis ») ne doit pas annuler la prise de conscience
+    // locale — sinon `isHostileReadyForCombat` retombe à faux, l’effet initiative vide le
+    // brouillon et le mode repasse en exploration.
+    const shouldKeepLocalAware =
+      p?.awareOfPlayer === true && inc?.awareOfPlayer === false;
+
+    const patchStaleCombatFlags = (base: Entity): Entity => {
+      if (!shouldKeepLocalUnsurprised && !shouldKeepLocalAware) return base;
+      return {
+        ...base,
+        ...(shouldKeepLocalUnsurprised ? { surprised: false as const } : {}),
+        ...(shouldKeepLocalAware ? { awareOfPlayer: true as const } : {}),
+      };
+    };
+
+    if (!p?.hp || !inc.hp) {
+      return patchStaleCombatFlags(inc);
+    }
     const pc = typeof p.hp.current === "number" ? p.hp.current : NaN;
     const ic = typeof inc.hp.current === "number" ? inc.hp.current : NaN;
-    if (!Number.isFinite(pc) || !Number.isFinite(ic)) return inc;
-    if (pc === ic) return inc;
-    const isHostile = String((inc as any)?.type ?? "").toLowerCase() === "hostile";
-    let mergedCurrent;
-    if (isHostile) {
-      mergedCurrent = ic > pc ? pc : ic;
-    } else if (ic === 0 && pc > 0) {
-      mergedCurrent = pc;
-    } else if (ic > pc) {
-      mergedCurrent = ic;
-    } else {
-      mergedCurrent = ic;
+    if (!Number.isFinite(pc) || !Number.isFinite(ic)) return patchStaleCombatFlags(inc);
+    if (pc === ic) return patchStaleCombatFlags(inc);
+    const mergedCurrent = ic > pc ? pc : ic;
+    if (mergedCurrent === ic) {
+      return patchStaleCombatFlags(inc);
     }
-    if (mergedCurrent === ic) return inc;
     const id = String(inc.id ?? "").trim();
     const controller = String((inc as any)?.controller ?? "").trim();
     const type = String((inc as any)?.type ?? "").trim();
@@ -1536,7 +1524,11 @@ function mergeIncomingEntitiesHpWithPrev(prevEnts: Entity[], incoming: Entity[])
         : isPlayerLike
           ? (typeof inc.isAlive === "boolean" ? inc.isAlive : true)
           : false;
-    return { ...inc, hp: { ...inc.hp, current: mergedCurrent }, isAlive: alive };
+    return patchStaleCombatFlags({
+      ...inc,
+      hp: { ...inc.hp, current: mergedCurrent },
+      isAlive: alive,
+    });
   });
 }
 
@@ -1731,10 +1723,11 @@ function isStickyEngineOrPlayerMessage(m: Message): boolean {
   const t = String(m?.type ?? "");
   const id = String(m?.id ?? "").trim();
   if (t === "continue") return false;
+  // Ne jamais réinjecter d'anciennes cartes d'initiative via le merge sticky.
+  if (id.startsWith("initiative-order-")) return false;
   if (
     t === "scene-image-pending" ||
     t === "scene-image" ||
-    id.startsWith("initiative-order-") ||
     t === "intent-error" ||
     t === "dice" ||
     t === "meta" ||
@@ -1791,8 +1784,12 @@ function mergeStickyLocalMessagesIntoRemote(prev: Message[], remote: Message[]):
   );
 
   const insertions: { afterId: string | null; msg: Message }[] = [];
+  // Évite l'effet "boomerang" : une bulle ancienne tombée hors cap Firestore ne doit pas
+  // réapparaître plusieurs tours plus tard en bas du chat.
+  const STICKY_LOOKBACK_COUNT = 40;
+  const startIdx = Math.max(0, prev.length - STICKY_LOOKBACK_COUNT);
 
-  for (let i = 0; i < prev.length; i++) {
+  for (let i = startIdx; i < prev.length; i++) {
     const m = prev[i];
     const id = String(m?.id ?? "").trim();
     if (!id || remoteIdSet.has(id)) continue;
@@ -1841,6 +1838,94 @@ function mergeStickyLocalMessagesIntoRemote(prev: Message[], remote: Message[]):
     seen.add(id);
     return true;
   });
+}
+
+/**
+ * Réinjecte des messages locaux explicitement listés (ex. `initiative-order-*` absents du snapshot
+ * à cause du cap Firestore) au bon endroit : même logique que mergeSticky (après le dernier
+ * prédécesseur présent dans `remote`). Évite `[...remote, ...missing]` qui recolle la carte
+ * d'initiative en bas du fil à chaque sync.
+ */
+function reinjectExplicitLocalMessagesIntoRemote(
+  prev: Message[],
+  remote: Message[],
+  explicitMissing: Message[]
+): Message[] {
+  const remoteList = Array.isArray(remote) ? [...remote] : [];
+  const remoteIdSet = new Set(
+    remoteList.map((m) => String(m?.id ?? "").trim()).filter(Boolean)
+  );
+
+  const insertions: { afterId: string | null; msg: Message }[] = [];
+  for (const m of explicitMissing) {
+    const id = String(m?.id ?? "").trim();
+    if (!id || remoteIdSet.has(id)) continue;
+    const i = prev.findIndex((x) => String(x?.id ?? "").trim() === id);
+    let afterId: string | null = null;
+    const startJ = i >= 0 ? i - 1 : prev.length - 1;
+    for (let j = startJ; j >= 0; j--) {
+      const pid = String(prev[j]?.id ?? "").trim();
+      if (pid && remoteIdSet.has(pid)) {
+        afterId = pid;
+        break;
+      }
+    }
+    insertions.push({ afterId, msg: m });
+  }
+
+  if (insertions.length === 0) return remoteList;
+
+  const byAfter = new Map<string | null, Message[]>();
+  for (const ins of insertions) {
+    const arr = byAfter.get(ins.afterId) ?? [];
+    arr.push(ins.msg);
+    byAfter.set(ins.afterId, arr);
+  }
+
+  const result: Message[] = [];
+  const headOrphans = byAfter.get(null);
+  if (headOrphans) {
+    for (const m of headOrphans) result.push(m);
+  }
+
+  for (const m of remoteList) {
+    result.push(m);
+    const mid = String(m?.id ?? "").trim();
+    const appended = mid ? byAfter.get(mid) : undefined;
+    if (appended) {
+      for (const x of appended) result.push(x);
+    }
+  }
+
+  const seen = new Set<string>();
+  return result.filter((m) => {
+    const id = String(m?.id ?? "").trim();
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+/** Nouvelle carte initiative : la placer avant le journal combat s'il a déjà commencé, sinon en fin de fil. */
+function insertInitiativeOrderMessageIntoTimeline(prev: Message[], initiativeMsg: Message): Message[] {
+  const mid = String(initiativeMsg?.id ?? "").trim();
+  if (!mid) return [...prev, initiativeMsg];
+  if (prev.some((m) => String(m?.id ?? "").trim() === mid)) return prev;
+
+  const isCombatTimelineAnchor = (m: Message) => {
+    const t = String(m?.type ?? "");
+    return (
+      t === "combat-detail" ||
+      t === "enemy-turn" ||
+      t === "turn-end" ||
+      t === "turn-divider"
+    );
+  };
+  const anchorIdx = prev.findIndex(isCombatTimelineAnchor);
+  if (anchorIdx >= 0) {
+    return [...prev.slice(0, anchorIdx), initiativeMsg, ...prev.slice(anchorIdx)];
+  }
+  return [...prev, initiativeMsg];
 }
 
 export function normalizeTurnResourcesInput(tr: TurnResources | null | undefined): TurnResources {
@@ -2166,31 +2251,52 @@ function cloneMeleeStateRecord(s: Record<string, string[]>): Record<string, stri
 }
 
 /**
- * Normalise le graphe de mêlée en paires DIRECTES symétriques (A<->B),
- * sans fermeture transitive (A-B et B-C n'impliquent pas A-C).
+ * Ferme transitivement la mêlée:
+ * si A est au contact de B et B de C, alors A, B et C sont tous mutuellement au contact.
  */
 function normalizeMeleeStateTransitive(raw: Record<string, string[]>): Record<string, string[]> {
+  const nodeSet = new Set<string>();
+  for (const [k, peers] of Object.entries(raw ?? {})) {
+    const kk = String(k ?? "").trim();
+    if (!kk) continue;
+    nodeSet.add(kk);
+    for (const p of Array.isArray(peers) ? peers : []) {
+      const pp = String(p ?? "").trim();
+      if (pp && pp !== kk) nodeSet.add(pp);
+    }
+  }
+  const nodes = [...nodeSet];
   const adj = new Map<string, Set<string>>();
-  const ensure = (id: string) => {
-    if (!adj.has(id)) adj.set(id, new Set<string>());
-  };
-
+  for (const n of nodes) adj.set(n, new Set<string>());
   for (const [k, peers] of Object.entries(raw ?? {})) {
     const a = String(k ?? "").trim();
-    if (!a) continue;
-    ensure(a);
+    if (!a || !adj.has(a)) continue;
     for (const p of Array.isArray(peers) ? peers : []) {
       const b = String(p ?? "").trim();
-      if (!b || b === a) continue;
-      ensure(b);
+      if (!b || b === a || !adj.has(b)) continue;
       adj.get(a)!.add(b);
       adj.get(b)!.add(a);
     }
   }
-
   const out: Record<string, string[]> = {};
-  for (const [id, peers] of adj.entries()) {
-    out[id] = [...peers].filter((x) => x !== id);
+  const seen = new Set<string>();
+  for (const start of nodes) {
+    if (seen.has(start)) continue;
+    const stack = [start];
+    const comp: string[] = [];
+    seen.add(start);
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      comp.push(cur);
+      for (const nxt of adj.get(cur) ?? []) {
+        if (seen.has(nxt)) continue;
+        seen.add(nxt);
+        stack.push(nxt);
+      }
+    }
+    for (const id of comp) {
+      out[id] = comp.filter((x) => x !== id);
+    }
   }
   return out;
 }
@@ -2714,6 +2820,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
   const messageSeqRef = useRef(0);
   const messagesStateRef = useRef<Message[]>(messages);
+  /** Anti-boomerang carte initiative : une fois vue pendant un combat, ne pas la réinsérer en bas du chat. */
+  const seenInitiativeCardsRef = useRef<Set<string>>(new Set());
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const participantProfileHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -2736,6 +2844,15 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const remoteIsGameStartedRef = useRef<boolean | null>(null);
   /** Snapshot immuable du personnage au moment de la sélection (sert aux resets d'aventure). */
   const playerInitialSnapshotRef = useRef<Player | null>(null);
+
+  useEffect(() => {
+    // Reset uniquement lors d'un vrai reset de session/partie, pas sur des bascules transitoires
+    // exploration<->combat liées aux snapshots MP retardés.
+    if (!multiplayerSessionId) return;
+    if (!isGameStarted) {
+      seenInitiativeCardsRef.current.clear();
+    }
+  }, [multiplayerSessionId, isGameStarted]);
 
   useEffect(() => {
     if (!awaitingPlayerInitiative) {
@@ -3001,12 +3118,27 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     if (Array.isArray(p.messages) && !skipRemotePendingRollApplyRef.current) {
       const cleanedRemote = p.messages.filter((m) => (m as Message).type !== "scene-image-pending");
+      const shouldKeepInitiativeCards =
+        p.gameMode === "combat" ||
+        p.awaitingPlayerInitiative === true ||
+        (Array.isArray(p.combatOrder) && p.combatOrder.length > 0);
+      const remoteForMerge = shouldKeepInitiativeCards
+        ? cleanedRemote
+        : cleanedRemote.filter(
+            (m) => !(typeof m?.id === "string" && m.id.startsWith("initiative-order-"))
+          );
+      for (const m of remoteForMerge) {
+        const mid = String(m?.id ?? "").trim();
+        if (mid.startsWith("initiative-order-")) {
+          seenInitiativeCardsRef.current.add(mid);
+        }
+      }
 
       const prev = Array.isArray(messagesStateRef.current) ? messagesStateRef.current : [];
       const localHasInitiativeDice = prev.some(
         (m) => typeof m?.id === "string" && m.id.startsWith("initiative-order-")
       );
-      const remoteHasInitiativeDice = cleanedRemote.some(
+      const remoteHasInitiativeDice = remoteForMerge.some(
         (m) => typeof m?.id === "string" && m.id.startsWith("initiative-order-")
       );
 
@@ -3023,30 +3155,34 @@ export function GameProvider({ children }: { children: ReactNode }) {
       // Salon multijoueur (room lobby) : remplacer le journal — sinon mergeSticky garde d'anciens
       // messages de combat issus de la sauvegarde locale d'une autre session / partie solo.
       if (isStartingAdventureTransition || isLobbyPayload) {
-        messagesStateRef.current = cleanedRemote;
-        setMessages(cleanedRemote);
+        messagesStateRef.current = remoteForMerge;
+        setMessages(remoteForMerge);
       } else if (remoteHasInitiativeDice) {
-        const merged = mergeStickyLocalMessagesIntoRemote(prev, cleanedRemote);
+        const merged = mergeStickyLocalMessagesIntoRemote(prev, remoteForMerge);
         messagesStateRef.current = merged;
         if (!chatMessagesVisualEqual(prev, merged)) {
           setMessages(merged);
         }
-      } else if (localHasInitiativeDice) {
-        const remoteIds = new Set(cleanedRemote.map((m) => String(m?.id ?? "").trim()).filter(Boolean));
+      } else if (localHasInitiativeDice && shouldKeepInitiativeCards) {
+        const remoteIds = new Set(remoteForMerge.map((m) => String(m?.id ?? "").trim()).filter(Boolean));
         const localMissingInitiative = prev.filter(
           (m) =>
             typeof m?.id === "string" &&
             m.id.startsWith("initiative-order-") &&
             !remoteIds.has(String(m.id ?? "").trim())
         );
-        const stitched = [...cleanedRemote, ...localMissingInitiative];
-        const merged = mergeStickyLocalMessagesIntoRemote(prev, stitched);
+        const withInitiative = reinjectExplicitLocalMessagesIntoRemote(
+          prev,
+          remoteForMerge,
+          localMissingInitiative
+        );
+        const merged = mergeStickyLocalMessagesIntoRemote(prev, withInitiative);
         messagesStateRef.current = merged;
         if (!chatMessagesVisualEqual(prev, merged)) {
           setMessages(merged);
         }
       } else {
-        const merged = mergeStickyLocalMessagesIntoRemote(prev, cleanedRemote);
+        const merged = mergeStickyLocalMessagesIntoRemote(prev, remoteForMerge);
         messagesStateRef.current = merged;
         if (!chatMessagesVisualEqual(prev, merged)) {
           setMessages(merged);
@@ -3075,6 +3211,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
           playerRef.current,
           clientId,
           (p.gameMode as GameMode | null | undefined) ?? (gameModeRef.current as GameMode | null | undefined)
+        )
+      ) {
+        nextPr = pendingRollRef.current;
+      } else if (
+        shouldRetainLocalDirectedPendingRoll(
+          !!multiplayerSessionId,
+          nextPr,
+          pendingRollRef.current,
+          playerRef.current,
+          clientId
         )
       ) {
         nextPr = pendingRollRef.current;
@@ -3109,26 +3255,20 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const localRoomBeforeApply = currentRoomIdLiveRef.current;
     const localSvBeforeApply = sceneVersionRef.current;
     const remoteSv = typeof p.sceneVersion === "number" ? p.sceneVersion : 0;
-    const incomingRoomId = typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village";
-    const staleRoomRegression =
-      remoteSv < localSvBeforeApply &&
-      typeof incomingRoomId === "string" &&
-      incomingRoomId.trim() &&
-      incomingRoomId.trim() !== localRoomBeforeApply;
-    if (staleRoomRegression) {
-      setCurrentRoomId(localRoomBeforeApply);
-      setCurrentSceneName(currentSceneNameLiveRef.current || DEFAULT_SCENE_NAME);
-      setCurrentScene(currentSceneLiveRef.current || DEFAULT_SCENE_DESCRIPTION);
-    } else {
-      setCurrentRoomId(incomingRoomId);
+    const canApplyRemoteSceneIdentity = remoteSv >= localSvBeforeApply;
+    if (canApplyRemoteSceneIdentity) {
       setCurrentSceneName(typeof p.currentSceneName === "string" ? p.currentSceneName : DEFAULT_SCENE_NAME);
       setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
+      setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
+    } else {
+      // Snapshot partagé en retard : ne pas écraser la salle/scène locales déjà plus récentes.
+      setCurrentSceneName(currentSceneNameLiveRef.current);
+      setCurrentScene(currentSceneLiveRef.current);
+      setCurrentRoomId(localRoomBeforeApply);
     }
-    const loadedEntitiesRaw = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
-    const loadedEntities = promoteHostilesAwareWhenInitiativeOpen(loadedEntitiesRaw, p);
-    const shouldApplyRemoteRoomScopedState = !staleRoomRegression;
-    let hostileCheckEntities: Entity[] = entitiesRef.current ?? [];
-    if (shouldApplyRemoteRoomScopedState && Array.isArray(p.entities)) {
+    const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
+    let hostileCheckEntities: Entity[] = loadedEntities;
+    if (Array.isArray(p.entities)) {
       const prevEnts = (entitiesRef.current ?? []) as Entity[];
       // Toujours fusionner : `mergeIncomingEntitiesHpWithPrev` empêche un snapshot Firestore « en retard »
       // (PV encore pleins avant flush local) d'écraser des dégâts déjà appliqués ici (ic > pc → garde pc).
@@ -3143,7 +3283,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
         localSvBeforeApply
       );
       const mergedWithLocalHp = mergeIncomingEntitiesHpWithPrev(prevEnts, mergedEntities);
-      const mergedWithInitiativeAwareness = promoteHostilesAwareWhenInitiativeOpen(mergedWithLocalHp, p);
       const incomingEmpty = mergedWithLocalHp.length === 0;
       const skipEmptyWipe =
         incomingEmpty &&
@@ -3152,16 +3291,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
         p.gameMode === "combat" &&
         (!Array.isArray(p.combatOrder) || p.combatOrder.length === 0);
       if (!skipEmptyWipe) {
-        entitiesRef.current = mergedWithInitiativeAwareness as Entity[];
-        setEntities(mergedWithInitiativeAwareness as Entity[]);
-        hostileCheckEntities = mergedWithInitiativeAwareness;
+        entitiesRef.current = mergedWithLocalHp as Entity[];
+        setEntities(mergedWithLocalHp as Entity[]);
+        hostileCheckEntities = mergedWithLocalHp;
       } else {
         hostileCheckEntities = prevEnts;
       }
     }
     setSceneVersion(Math.max(remoteSv, localSvBeforeApply));
 
-    if (!skipRemotePendingRollApplyRef.current && shouldApplyRemoteRoomScopedState) {
+    if (!skipRemotePendingRollApplyRef.current) {
       if (p.entitiesByRoom && typeof p.entitiesByRoom === "object" && !Array.isArray(p.entitiesByRoom)) {
         const nextMap: Record<string, Entity[]> = {};
         for (const [k, v] of Object.entries(p.entitiesByRoom)) {
@@ -3187,18 +3326,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setRoomMemoryByRoom({});
     }
     const hostileAlive = hostileCheckEntities.some((e) => isHostileReadyForCombat(e));
-    const hostilePresent = hostileCheckEntities.some(
-      (e) => e?.type === "hostile" && e.isAlive !== false
-    );
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
     const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
-    const localInitiativeFlowActive =
-      awaitingPlayerInitiativeRef.current ||
-      waitForGmNarrationForInitiativeRef.current ||
-      (Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0) ||
-      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
-      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3213,16 +3343,13 @@ export function GameProvider({ children }: { children: ReactNode }) {
       // parce qu'encore des hostiles vivants / un vieux combatOrder (sinon MJ reste en exploration).
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActive) {
+        } else if (!hostileAlive && !preserveCombatFromPayload) {
           // Ordre d'initiative distant souvent encore rempli alors que tous les hostiles sont morts :
           // sans ce garde, `hasCombatOrder` seul forçait le mode combat indéfiniment.
           setGameModeState("exploration");
         } else {
           const shouldCombat =
             hasCombatOrder ||
-            localInitiativeFlowActive ||
-            (want === "exploration" && hostileAlive) ||
-            (want === "combat" && hostilePresent) ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);
         }
@@ -3251,29 +3378,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
         ? Math.trunc(p.initiativeStateUpdatedAtMs)
         : 0;
     const hasCombatOrderInPayload = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
-    const hasLocalCombatOrder = Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0;
-    const mayBootstrapCombatOrder = hasCombatOrderInPayload && !hasLocalCombatOrder;
-    const mayRefreshCombatOrderWithSeq = hasCombatOrderInPayload && incomingTurnWriteSeq !== null;
     const hasAnyInitiativeRollInPayload =
       p.playerInitiativeRollsByEntityId &&
       typeof p.playerInitiativeRollsByEntityId === "object" &&
       !Array.isArray(p.playerInitiativeRollsByEntityId) &&
       Object.keys(p.playerInitiativeRollsByEntityId as Record<string, number>).length > 0;
-    const incomingInitiativeFlowOpen =
-      p.awaitingPlayerInitiative === true || p.waitForGmNarrationForInitiative === true;
-    // Anti-stale : par défaut on n'applique que si le snapshot est >= local.
-    // Autoriser aussi les snapshots qui portent un ordre/fusion de jets pour converger en multijoueur.
+    // Anti-stale : par défaut on n'applique que si le snapshot est >= local,
+    // mais on force l'application si le serveur a déjà progressé l'initiative
+    // (ordre final / rolls déjà reçus) : sinon l'UI redemande à tort sur reload.
     const canApplyIncomingInitiative =
-      incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current ||
-      mayBootstrapCombatOrder ||
-      mayRefreshCombatOrderWithSeq ||
-      (hasAnyInitiativeRollInPayload && incomingInitiativeFlowOpen);
+      incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current || hasCombatOrderInPayload || hasAnyInitiativeRollInPayload;
+    /** Ref locale (bump clear-wait, etc.) avant ce merge — ne pas réarmer `wait` depuis un snapshot plus vieux. */
+    const initiativeMsBaselineBeforeInitiativeMerge = initiativeStateUpdatedAtMsRef.current;
     if (canApplyIncomingInitiative) {
       initiativeStateUpdatedAtMsRef.current = Math.max(
         initiativeStateUpdatedAtMsRef.current,
         incomingInitiativeMs
       );
-      if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActive) {
+      if (!hostileAlive && !preserveCombatFromPayload) {
         setCombatOrderState([]);
         combatOrderRef.current = [];
         combatTurnWriteSeqRef.current = 0;
@@ -3333,16 +3455,19 @@ export function GameProvider({ children }: { children: ReactNode }) {
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {
-            awaitingPlayerInitiativeRef.current = false;
-            setAwaitingPlayerInitiativeState(false);
+            const trustIncomingAwaitingFalse =
+              incomingInitiativeMs >= initiativeMsBaselineBeforeInitiativeMerge ||
+              hasCombatOrderInPayload;
+            if (trustIncomingAwaitingFalse) {
+              awaitingPlayerInitiativeRef.current = false;
+              setAwaitingPlayerInitiativeState(false);
+            }
           } else {
-            const nextAwaiting =
-              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActive) &&
-              p.awaitingPlayerInitiative;
+            const nextAwaiting = (hostileAlive || hasCombatOrder) && p.awaitingPlayerInitiative;
             awaitingPlayerInitiativeRef.current = nextAwaiting;
             setAwaitingPlayerInitiativeState(nextAwaiting);
           }
-        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActive) {
+        } else if (!hostileAlive && !hasCombatOrder) {
           awaitingPlayerInitiativeRef.current = false;
           setAwaitingPlayerInitiativeState(false);
         }
@@ -3353,16 +3478,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
             nextWait = false;
           } else {
             const barrierMs = waitNarrationClearBarrierMsRef.current;
-            const mayRearmNarrationWait = incomingInitiativeMs > barrierMs || barrierMs === 0;
-            nextWait = !!(
-              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActive) &&
-              mayRearmNarrationWait
-            );
+            const mayRearmNarrationWait =
+              hasCombatOrderInPayload ||
+              incomingInitiativeMs > barrierMs ||
+              barrierMs === 0;
+            nextWait = !!((hostileAlive || hasCombatOrder) && mayRearmNarrationWait);
           }
           waitForGmNarrationForInitiativeSyncRef.current = nextWait;
           waitForGmNarrationForInitiativeRef.current = nextWait;
           setWaitForGmNarrationForInitiativeState(nextWait);
-        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActive) {
+        } else if (!hostileAlive && !hasCombatOrder) {
           waitForGmNarrationForInitiativeSyncRef.current = false;
           waitForGmNarrationForInitiativeRef.current = false;
           setWaitForGmNarrationForInitiativeState(false);
@@ -3543,8 +3668,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
     setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
     setSceneVersion(typeof p.sceneVersion === "number" ? p.sceneVersion : 0);
-    const loadedEntitiesRaw = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
-    const loadedEntities = promoteHostilesAwareWhenInitiativeOpen(loadedEntitiesRaw, p);
+    const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
     if (Array.isArray(p.entities)) {
       entitiesRef.current = loadedEntities as Entity[];
       setEntities(loadedEntities as Entity[]);
@@ -3574,16 +3698,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setRoomMemoryByRoom({});
     }
     const hostileAlive = loadedEntities.some((e) => isHostileReadyForCombat(e));
-    const hostilePresent = loadedEntities.some((e) => e?.type === "hostile" && e.isAlive !== false);
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
     const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
-    const localInitiativeFlowActiveP =
-      awaitingPlayerInitiativeRef.current ||
-      waitForGmNarrationForInitiativeRef.current ||
-      (Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0) ||
-      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
-      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3594,14 +3711,11 @@ export function GameProvider({ children }: { children: ReactNode }) {
         const want = p.gameMode;
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActiveP) {
+        } else if (!hostileAlive && !preserveCombatFromPayload) {
           setGameModeState("exploration");
         } else {
           const shouldCombat =
             hasCombatOrder ||
-            localInitiativeFlowActiveP ||
-            (want === "exploration" && hostileAlive) ||
-            (want === "combat" && hostilePresent) ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);
         }
@@ -3613,25 +3727,20 @@ export function GameProvider({ children }: { children: ReactNode }) {
           ? Math.trunc(p.initiativeStateUpdatedAtMs)
           : 0;
       const hasCombatOrderInPayloadP = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
-      const hasLocalCombatOrderP = Array.isArray(combatOrderRef.current) && combatOrderRef.current.length > 0;
-      const mayBootstrapCombatOrderP = hasCombatOrderInPayloadP && !hasLocalCombatOrderP;
-      const incomingTurnWriteSeqP =
-        typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
-          ? Math.trunc(p.combatTurnWriteSeq)
-          : null;
-      const mayRefreshCombatOrderWithSeqP = hasCombatOrderInPayloadP && incomingTurnWriteSeqP !== null;
       const hasAnyInitiativeRollInPayloadP =
         p.playerInitiativeRollsByEntityId &&
         typeof p.playerInitiativeRollsByEntityId === "object" &&
         !Array.isArray(p.playerInitiativeRollsByEntityId) &&
         Object.keys(p.playerInitiativeRollsByEntityId as Record<string, number>).length > 0;
-      const incomingInitiativeFlowOpenP =
-        p.awaitingPlayerInitiative === true || p.waitForGmNarrationForInitiative === true;
       const canApplyIncomingInitiativeP =
         incomingInitiativeMsP >= initiativeStateUpdatedAtMsRef.current ||
-        mayBootstrapCombatOrderP ||
-        mayRefreshCombatOrderWithSeqP ||
-        (hasAnyInitiativeRollInPayloadP && incomingInitiativeFlowOpenP);
+        hasCombatOrderInPayloadP ||
+        hasAnyInitiativeRollInPayloadP;
+      const initiativeMsBaselineBeforePersistInitiativeMerge = initiativeStateUpdatedAtMsRef.current;
+      const incomingTurnWriteSeqP =
+        typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
+          ? Math.trunc(p.combatTurnWriteSeq)
+          : null;
       const staleCombatTurnWriteP =
         incomingTurnWriteSeqP !== null && incomingTurnWriteSeqP < combatTurnWriteSeqRef.current;
       if (canApplyIncomingInitiativeP) {
@@ -3639,7 +3748,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           initiativeStateUpdatedAtMsRef.current,
           incomingInitiativeMsP
         );
-        if (!hostileAlive && !hostilePresent && !preserveCombatFromPayload && !localInitiativeFlowActiveP) {
+        if (!hostileAlive && !preserveCombatFromPayload) {
           setCombatOrderState([]);
           combatOrderRef.current = [];
           combatTurnWriteSeqRef.current = 0;
@@ -3699,23 +3808,25 @@ export function GameProvider({ children }: { children: ReactNode }) {
           typeof p.playerInitiativeRollsByEntityId === "object" &&
           !Array.isArray(p.playerInitiativeRollsByEntityId)
         ) {
-          const incoming = { ...(p.playerInitiativeRollsByEntityId as Record<string, number>) };
-          const merged = { ...(playerInitiativeRollsByEntityIdRef.current ?? {}), ...incoming };
-          playerInitiativeRollsByEntityIdRef.current = merged;
-          setPlayerInitiativeRollsByEntityIdState(merged);
+          const nextRolls = { ...p.playerInitiativeRollsByEntityId };
+          playerInitiativeRollsByEntityIdRef.current = nextRolls;
+          setPlayerInitiativeRollsByEntityIdState(nextRolls);
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {
-            awaitingPlayerInitiativeRef.current = false;
-            setAwaitingPlayerInitiativeState(false);
+            const trustIncomingAwaitingFalseP =
+              incomingInitiativeMsP >= initiativeMsBaselineBeforePersistInitiativeMerge ||
+              hasCombatOrderInPayloadP;
+            if (trustIncomingAwaitingFalseP) {
+              awaitingPlayerInitiativeRef.current = false;
+              setAwaitingPlayerInitiativeState(false);
+            }
           } else {
-            const nextAwaiting =
-              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActiveP) &&
-              p.awaitingPlayerInitiative;
+            const nextAwaiting = (hostileAlive || hasCombatOrder) && p.awaitingPlayerInitiative;
             awaitingPlayerInitiativeRef.current = nextAwaiting;
             setAwaitingPlayerInitiativeState(nextAwaiting);
           }
-        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActiveP) {
+        } else if (!hostileAlive && !hasCombatOrder) {
           awaitingPlayerInitiativeRef.current = false;
           setAwaitingPlayerInitiativeState(false);
         }
@@ -3726,16 +3837,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
             nextWait = false;
           } else {
             const barrierMsP = waitNarrationClearBarrierMsRef.current;
-            const mayRearmNarrationWaitP = incomingInitiativeMsP > barrierMsP || barrierMsP === 0;
-            nextWait = !!(
-              (hostileAlive || hostilePresent || hasCombatOrder || localInitiativeFlowActiveP) &&
-              mayRearmNarrationWaitP
-            );
+            const mayRearmNarrationWaitP =
+              hasCombatOrderInPayloadP ||
+              incomingInitiativeMsP > barrierMsP ||
+              barrierMsP === 0;
+            nextWait = !!((hostileAlive || hasCombatOrder) && mayRearmNarrationWaitP);
           }
           waitForGmNarrationForInitiativeSyncRef.current = nextWait;
           waitForGmNarrationForInitiativeRef.current = nextWait;
           setWaitForGmNarrationForInitiativeState(nextWait);
-        } else if (!hostileAlive && !hostilePresent && !hasCombatOrder && !localInitiativeFlowActiveP) {
+        } else if (!hostileAlive && !hasCombatOrder) {
           waitForGmNarrationForInitiativeSyncRef.current = false;
           waitForGmNarrationForInitiativeRef.current = false;
           setWaitForGmNarrationForInitiativeState(false);
@@ -4076,6 +4187,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const sessionId = normalizeMultiplayerSessionId(seed);
     if (!sessionId) return null;
     const payload = buildLobbySharedSessionPayload();
+    // Nouvelle session = nouveau contexte : forcer l'acceptation de l'identité de scène
+    // du payload lobby même si le sceneVersion local est plus élevé (ancienne partie).
+    sceneVersionRef.current = -1;
+    applySharedSessionPayload(payload);
     const profile = sanitizeForFirestore(buildLocalParticipantProfile());
     const sessionRef = doc(db, "sessions", sessionId);
     await setDoc(sessionRef, {
@@ -4111,7 +4226,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setMultiplayerPendingCommand(null);
     const me = String(clientId ?? "").trim();
     if (me) setMultiplayerHostClientId(me);
-    applySharedSessionPayload(payload);
     return sessionId;
   }, [applySharedSessionPayload, buildLocalParticipantProfile, clientId]);
 
@@ -4168,11 +4282,15 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
     if (!joinResult.ok) return joinResult;
 
+    // Join d'une session existante : vider immédiatement le contexte local pour éviter qu'un
+    // ancien currentRoomId/messages déclenchent parse-intent/arbiter avant le 1er snapshot Firestore.
+    sceneVersionRef.current = -1;
+    applySharedSessionPayload(buildLobbySharedSessionPayload());
     setMultiplayerSessionId(sessionId);
     setMultiplayerConnected(true);
     setMultiplayerPendingCommand(null);
     return { ok: true };
-  }, [buildLocalParticipantProfile, clientId]);
+  }, [applySharedSessionPayload, buildLocalParticipantProfile, clientId]);
 
   /** Retire ce client de `participants` ; le document Firestore n'est pas supprimé (l'hôte / derniers joueurs peuvent encore y être). */
   const leaveMultiplayerSession = useCallback(async () => {
@@ -6795,8 +6913,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
       .sort()
       .join("|")}`;
     const hadInitiativeCard = messagesStateRef.current.some((m) => m.id === msgId);
+    if (hadInitiativeCard) {
+      seenInitiativeCardsRef.current.add(msgId);
+    }
+    const initiativeAlreadySeenThisCombat = seenInitiativeCardsRef.current.has(msgId);
     /** Narration MJ d'abord (ChatInterface) : ne pas insérer la carte initiative tant que le MJ n'a pas parlé. */
-    if (!waitForGmNarrationForInitiativeRef.current) {
+    if (!waitForGmNarrationForInitiativeRef.current && !initiativeAlreadySeenThisCombat) {
       setMessages((prev) => {
         if (prev.some((m) => m.id === msgId)) return prev;
         const rankLabel = (i: number) => (i === 0 ? "1er" : `${i + 1}e`);
@@ -6811,10 +6933,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
           })
           .join("\n");
         const content = `🎲 **Jet d'Initiative**\n\n${orderText}\n\n⚔️ Le combat commence !`;
-        const next: Message[] = [
-          ...prev,
-          { id: msgId, role: "ai", content, type: "dice" },
-        ];
+        const initiativeMsg: Message = { id: msgId, role: "ai", content, type: "dice" };
+        const next = insertInitiativeOrderMessageIntoTimeline(prev, initiativeMsg);
+        seenInitiativeCardsRef.current.add(msgId);
         messagesStateRef.current = next;
         return next;
       });
@@ -6857,12 +6978,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
     if (waitForGmNarrationForInitiative) return;
     if (awaitingPlayerInitiative) return;
     if (combatOrder.length === 0) return;
+    // Ne pas recréer la carte d'initiative une fois le combat réellement démarré.
+    // Sinon, si la carte est tombée hors payload/messages cap, elle réapparaît en bas au moindre sync.
+    if ((typeof combatTurnWriteSeq === "number" && combatTurnWriteSeq > 0) || combatTurnIndex > 0) return;
 
     const msgId = `initiative-order-${combatOrder
       .map((e) => `${e.id}:${e.initiative}`)
       .sort()
       .join("|")}`;
     if (messagesStateRef.current.some((m) => m.id === msgId)) return;
+    if (seenInitiativeCardsRef.current.has(msgId)) return;
 
     setMessages((prev) => {
       if (prev.some((m) => m.id === msgId)) return prev;
@@ -6878,10 +7003,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
         })
         .join("\n");
       const content = `🎲 **Jet d'Initiative**\n\n${orderText}\n\n⚔️ Le combat commence !`;
-      const next: Message[] = [
-        ...prev,
-        { id: msgId, role: "ai", content, type: "dice" },
-      ];
+      const initiativeMsg: Message = { id: msgId, role: "ai", content, type: "dice" };
+      const next = insertInitiativeOrderMessageIntoTimeline(prev, initiativeMsg);
+      seenInitiativeCardsRef.current.add(msgId);
       messagesStateRef.current = next;
       return next;
     });
@@ -6911,12 +7035,17 @@ export function GameProvider({ children }: { children: ReactNode }) {
     if (awaitingPlayerInitiative) return;
     if (combatOrder.length === 0) return;
     if (waitForGmNarrationForInitiativeRef.current) return;
+    // MP sync tardif : ne jamais "réparer" la carte d'initiative au milieu/fin de combat.
+    if ((typeof combatTurnWriteSeq === "number" && combatTurnWriteSeq > 0) || combatTurnIndex > 0) return;
 
     const msgId = `initiative-order-${combatOrder
       .map((e) => `${e.id}:${e.initiative}`)
       .sort()
       .join("|")}`;
     if (messagesStateRef.current.some((m) => m.id === msgId)) return;
+    // Carte déjà affichée plus tôt dans ce combat puis purgée (cap Firestore/chat) :
+    // ne pas la réinsérer artificiellement en bas.
+    if (seenInitiativeCardsRef.current.has(msgId)) return;
 
     setMessages((prev) => {
       if (prev.some((m) => m.id === msgId)) return prev;
@@ -6932,10 +7061,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
         })
         .join("\n");
       const content = `🎲 **Jet d'Initiative**\n\n${orderText}\n\n⚔️ Le combat commence !`;
-      const next: Message[] = [
-        ...prev,
-        { id: msgId, role: "ai", content, type: "dice" },
-      ];
+      const initiativeMsg: Message = { id: msgId, role: "ai", content, type: "dice" };
+      const next = insertInitiativeOrderMessageIntoTimeline(prev, initiativeMsg);
+      seenInitiativeCardsRef.current.add(msgId);
       messagesStateRef.current = next;
       return next;
     });
@@ -6947,6 +7075,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
     gameMode,
     awaitingPlayerInitiative,
     combatOrderInitiativeSig,
+    combatTurnIndex,
+    combatTurnWriteSeq,
     flushMultiplayerSharedState,
     player?.name,
     setMessages,
@@ -6965,16 +7095,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
       return;
     }
     const hostiles = entities.filter((e) => isHostileReadyForCombat(e));
-    const hostilesPresent = entities.filter((e) => e?.type === "hostile" && e.isAlive !== false);
-    const initiativeFlowActive =
-      awaitingPlayerInitiativeRef.current ||
-      waitForGmNarrationForInitiativeRef.current ||
-      (Array.isArray(npcInitiativeDraftRef.current) && npcInitiativeDraftRef.current.length > 0) ||
-      Object.keys(playerInitiativeRollsByEntityIdRef.current ?? {}).length > 0;
-    const hostilesForOrderValidation =
-      hostiles.length > 0 || !initiativeFlowActive ? hostiles : hostilesPresent;
     if (combatOrder.length > 0) {
-      if (!combatOrderMatchesCurrentHostiles(combatOrder, hostilesForOrderValidation)) {
+      if (!combatOrderMatchesCurrentHostiles(combatOrder, hostiles)) {
         // Nouveau combat / nouveaux hostiles : l'ancien ordre ne correspond plus à la scène actuelle.
         initiativeDraftCacheRef.current = null;
         initiativeRemoteFinalizeSigRef.current = null;
@@ -6998,9 +7120,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     if (!player) return;
     if (hostiles.length === 0) {
-      if (hostilesPresent.length > 0 && initiativeFlowActive) {
-        return;
-      }
       // Plus aucun hostile engagé (repère le PJ) : ne pas garder le bandeau initiative ni le mode combat.
       initiativeDraftCacheRef.current = null;
       initiativeRemoteFinalizeSigRef.current = null;

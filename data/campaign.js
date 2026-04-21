@@ -180,7 +180,6 @@ export const GOBLIN_CAVE = {
     id: "room_4",
     title: "La Salle de Torture",
     description: "Il y a ici un grand nombre d'instruments de torture et notamment un chevalet sur lequel a pris place un personnage que certains d’entre vous connaissent, le halfelin Gandelme le Dextre, qui était venu rendre visite à Fial à son frère Petit-Pinpin la semaine dernière ! D’après les marques qu’ils portent, le petit homme a visiblement été torturé.",
-    encounterEntities: [{ id: "gandelme", templateId: "pnj_generique" }],
     secrets: "Ici aussi, des torches sont accrochées aux murs, mais aucune n’est allumée. Gandelme est épuisé, affamé et déshydraté. On ne lui a rien donné à boire ni à manger depuis sa capture. Il est si faible (0 pv et épuisement niveau 4) qu’il ne peut pas marcher et encore moins combattre. Un sort de soins lui redonnera des points de vie et lui permettra de marcher, mais ne réduira pas ses niveaux d’épuisement. Il insistera pour que l’on retrouve son équipement. Celui-ci se trouve dans la chambre du chef, salle 17, mais il ne le sait pas, bien entendu.",
     exits: [
       {
