@@ -341,7 +341,6 @@ const PREGENERATED_IDENTITY_SET = new Set(PREGENERATED.map(characterIdentityKey)
 
 export default function CharacterSelection({ onSelect }) {
   const [customCharacters, setCustomCharacters] = useState([]);
-  const [charactersLoaded, setCharactersLoaded] = useState(false);
   const [mode, setMode] = useState("list"); // "list" | "builder"
 
   useEffect(() => {
@@ -354,7 +353,6 @@ export default function CharacterSelection({ onSelect }) {
     } catch {
       // ignore
     }
-    setCharactersLoaded(true);
   }, []);
 
   const customNotDuplicatingPregens = customCharacters.filter(
@@ -372,14 +370,6 @@ export default function CharacterSelection({ onSelect }) {
     }
     setMode("list");
   };
-
-  if (!charactersLoaded) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-4">
-        <p className="text-sm text-slate-400">Chargement des personnages…</p>
-      </div>
-    );
-  }
 
   if (mode === "builder") {
     return (

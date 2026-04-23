@@ -11,7 +11,7 @@ const GEMINI_MODEL = "gemini-3-flash-preview";
 /** Narration publique : aucun chiffre mécanique (le détail chiffré est affiché à part pour le joueur cible). */
 const NARRATE_DRAMA_ONLY_SYSTEM = [
   "Tu es le Maître du Jeu d'une partie de Donjons & Dragons 5e.",
-  "Tu reçois un objet JSON avec : enemyName, weaponName, outcome, targetName.",
+  "Tu reçois un objet JSON avec : enemyName, weaponName, outcome, targetName, targetHpBefore, targetHpAfter, damageApplied, targetDowned, targetDead.",
   "outcome vaut exactement l'un de : fumble | miss | hit | critical_hit.",
   "Écris 2 à 4 phrases immersives en français.",
   "CONTRAINTE CRITIQUE : décris l'action du gobelin (ou de la créature) en 3e personne uniquement (ex: « Le gobelin... », « La créature... »).",
@@ -19,6 +19,10 @@ const NARRATE_DRAMA_ONLY_SYSTEM = [
   "CONTRAINTE CRITIQUE : la cible du coup est le personnage dont le nom est targetName. Jamais un autre gobelin.",
   "INTERDIT : mentionner l'ennemi (enemyName) comme cible (ex: « l'épaule du gobelin ... »). Ne mentionne enemyName que comme attaquant.",
   "Décris le geste, la tension et la réaction sensible du personnage joueur.",
+  "IMPORTANT NARRATIF :",
+  "- si targetDowned=true, la narration doit explicitement décrire que la cible s'effondre/est mise à terre/inconsciente (et pas seulement « grimace » ou « vacille »).",
+  "- si outcome=miss ou fumble, ne décris jamais une blessure réelle.",
+  "- si targetDowned=false, n'écris pas que la cible s'effondre.",
   "INTERDIT ABSOLU : tout chiffre (pas de d20, pas de total d'attaque, pas de CA, pas de dégâts numériques, pas de PV restants ou perdus, pas de « 3 dégâts », pas de « 10 points de vie »).",
   "INTERDIT : « JSON », « moteur », « API », « jet », « DD », « CA ».",
   "Si hit ou critical_hit : tu peux dire que le coup blesse ou fait très mal, sans quantifier.",
@@ -28,10 +32,12 @@ const NARRATE_DRAMA_ONLY_SYSTEM = [
 /** Créature / PNJ qui attaque une autre créature (pas le PJ). Même contraintes sans prose « joueur ». */
 const NARRATE_DRAMA_CREATURE_VS_CREATURE = [
   "Tu es le Maître du Jeu d'une partie de Donjons & Dragons 5e.",
-  "Tu reçois un objet JSON : enemyName (attaquant), targetName (défenseur), weaponName, outcome.",
+  "Tu reçois un objet JSON : enemyName (attaquant), targetName (défenseur), weaponName, outcome, targetHpBefore, targetHpAfter, damageApplied, targetDowned, targetDead.",
   "outcome vaut exactement l'un de : fumble | miss | hit | critical_hit.",
   "Écris 2 à 4 phrases immersives en français, en 3e personne uniquement.",
   "Les deux noms sont des créatures ou PNJ sur le champ de bataille ; décris l'échange (attaque, parade, esquive, impact) sans invoquer de personnage joueur ni « héros ».",
+  "IMPORTANT NARRATIF : si targetDowned=true, décris clairement la chute au sol / mise hors de combat immédiate ; si targetDowned=false, ne décris pas d'effondrement.",
+  "Si outcome=miss ou fumble, ne décris pas de blessure effective.",
   "INTERDIT : inventer des chiffres ou statistiques ; pas de « JSON », « moteur », « API », « jet », « DD », « CA ».",
   "Si hit ou critical_hit : tu peux dire que le coup blesse ou assomme un instant, sans quantifier les dégâts.",
   'Réponds uniquement en JSON : {"narrative":"..."}',
@@ -82,6 +88,14 @@ export async function POST(request) {
               typeof narrationContext.weaponName === "string" ? narrationContext.weaponName : "",
             outcome:
               typeof narrationContext.outcome === "string" ? narrationContext.outcome : "miss",
+            targetHpBefore:
+              typeof narrationContext.targetHpBefore === "number" ? narrationContext.targetHpBefore : null,
+            targetHpAfter:
+              typeof narrationContext.targetHpAfter === "number" ? narrationContext.targetHpAfter : null,
+            damageApplied:
+              typeof narrationContext.damageApplied === "number" ? narrationContext.damageApplied : null,
+            targetDowned: narrationContext.targetDowned === true,
+            targetDead: narrationContext.targetDead === true,
           }
         : null;
 
@@ -104,6 +118,11 @@ export async function POST(request) {
           enemyName: nc.enemyName,
           weaponName: nc.weaponName,
           outcome: nc.outcome,
+          targetHpBefore: nc.targetHpBefore,
+          targetHpAfter: nc.targetHpAfter,
+          damageApplied: nc.damageApplied,
+          targetDowned: nc.targetDowned === true,
+          targetDead: nc.targetDead === true,
           targetName:
             typeof targetName === "string" && targetName.trim()
               ? targetName.trim()
@@ -181,10 +200,14 @@ export async function POST(request) {
             ? `${tn} esquive ou pare l'assaut de ${nc.enemyName} (${nc.weaponName}).`
             : "Le coup ne trouve pas sa cible.",
           hit: nc
-            ? `${nc.enemyName} porte un coup au ${nc.weaponName} ; ${tn} vacille sous l'impact.`
+            ? nc.targetDowned
+              ? `${nc.enemyName} porte un coup au ${nc.weaponName} ; ${tn} s'effondre et ne tient plus debout.`
+              : `${nc.enemyName} porte un coup au ${nc.weaponName} ; ${tn} vacille sous l'impact.`
             : "Le coup porte.",
           critical_hit: nc
-            ? `${nc.enemyName} assène un coup dévastateur avec ${nc.weaponName} ; ${tn} chancelle gravement.`
+            ? nc.targetDowned
+              ? `${nc.enemyName} assène un coup dévastateur avec ${nc.weaponName} ; ${tn} s'écroule, hors d'état de poursuivre.`
+              : `${nc.enemyName} assène un coup dévastateur avec ${nc.weaponName} ; ${tn} chancelle gravement.`
             : "Un coup particulièrement violent s'abat sur la cible.",
         }
       : {
@@ -195,10 +218,14 @@ export async function POST(request) {
             ? `Le ${nc.enemyName} attaque au ${nc.weaponName}, mais ${tn} parvient à esquiver ou à parer à temps.`
             : "Le coup ne trouve pas sa cible.",
           hit: nc
-            ? `${tn} est touché par le ${nc.weaponName} du ${nc.enemyName} ; un impact le saisit.`
+            ? nc.targetDowned
+              ? `${tn} est frappé de plein fouet par le ${nc.weaponName} du ${nc.enemyName} et s'effondre au sol, inerte.`
+              : `${tn} est touché par le ${nc.weaponName} du ${nc.enemyName} ; un impact le saisit.`
             : "Le coup porte.",
           critical_hit: nc
-            ? `${tn} subit un coup brutal au ${nc.weaponName} ; l'impact le sonne un instant.`
+            ? nc.targetDowned
+              ? `${tn} encaisse un coup brutal au ${nc.weaponName} et s'écroule, incapable de rester conscient.`
+              : `${tn} subit un coup brutal au ${nc.weaponName} ; l'impact le sonne un instant.`
             : "Un coup particulièrement violent vous atteint.",
         };
     const fallback = dramaMode

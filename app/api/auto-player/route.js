@@ -63,7 +63,10 @@ function formatRecentChatScript(rawMessages, playerName = "Joueur") {
         if (m?.type === "auto-player-nudge") {
           return `[Consigne moteur — pas une réplique du PJ] : ${text}`;
         }
-        return `Moi (${playerName}) : ${text}`;
+        const sender = String(m?.senderName ?? "").trim();
+        if (!sender) return `Joueur : ${text}`;
+        if (sender === playerName) return `Moi (${playerName}) : ${text}`;
+        return `${sender} : ${text}`;
       }
       return null;
     })
@@ -329,6 +332,25 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot,
   const skills = Array.isArray(player?.skillProficiencies)
     ? player.skillProficiencies
     : [];
+  const classFeatures = Array.isArray(player?.classFeatures)
+    ? player.classFeatures.map((x) => String(x ?? "").trim()).filter(Boolean)
+    : [];
+  const selectedSpells = Array.isArray(player?.selectedSpells)
+    ? player.selectedSpells.map((x) => String(x ?? "").trim()).filter(Boolean)
+    : [];
+  const spellSlots = player?.spellSlots && typeof player.spellSlots === "object"
+    ? player.spellSlots
+    : null;
+  const spellSlotLines = spellSlots
+    ? Object.entries(spellSlots)
+        .map(([lvl, row]) => {
+          const rem = Number(row?.remaining);
+          const max = Number(row?.max);
+          if (!Number.isFinite(rem) || !Number.isFinite(max)) return null;
+          return `- Niveau ${lvl}: ${Math.trunc(rem)}/${Math.trunc(max)}`;
+        })
+        .filter(Boolean)
+    : [];
 
   const entityLines = (Array.isArray(entities) ? entities : [])
     .filter((e) => e && e.visible)
@@ -394,6 +416,11 @@ function buildAutoPlayerSystemPrompt(player, entities, gameMode, battleSnapshot,
       : ``,
     player?.description
       ? `Description RP courte: ${truncate(player.description, 300)}`
+      : ``,
+    classFeatures.length ? `Capacités de classe: ${classFeatures.join(", ")}.` : ``,
+    selectedSpells.length ? `Sorts connus/préparés: ${selectedSpells.join(", ")}.` : ``,
+    spellSlotLines.length
+      ? `Emplacements de sorts:\n${spellSlotLines.join("\n")}`
       : ``,
     ``,
     formatPartyPcsForPrompt(partyPcs),

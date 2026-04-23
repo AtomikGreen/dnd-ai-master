@@ -874,6 +874,8 @@ export const ARMORS = {
   "Armure de peaux": { type: "Intermédiaire", baseAC: 12, stealthDisadvantage: false, modifier: "DEX_MAX_2", strengthReq: 0 },
   "Chemise de mailles": { type: "Intermédiaire", baseAC: 13, stealthDisadvantage: false, modifier: "DEX_MAX_2", strengthReq: 0 },
   "Armure d'écailles": { type: "Intermédiaire", baseAC: 14, stealthDisadvantage: true, modifier: "DEX_MAX_2", strengthReq: 0 },
+  // Alias utilisé par les fiches existantes (ex: clerc prégénéré Aldéric).
+  "Cotte d'écailles": { type: "Intermédiaire", baseAC: 14, stealthDisadvantage: true, modifier: "DEX_MAX_2", strengthReq: 0 },
   "Cuirasse": { type: "Intermédiaire", baseAC: 14, stealthDisadvantage: false, modifier: "DEX_MAX_2", strengthReq: 0 },
   "Demi-plate": { type: "Intermédiaire", baseAC: 15, stealthDisadvantage: true, modifier: "DEX_MAX_2", strengthReq: 0 },
 
@@ -919,14 +921,14 @@ export const SPELLS = {
   // --- TOURS DE MAGIE (NIVEAU 0) ---
   "Amis": { level: 0, school: "Enchantement", castingTime: "1 action", range: "Perso", duration: "Concentration, 1 min", effect: "Avantage aux tests de CHA contre une créature non-hostile pendant la durée (puis elle peut se méfier).", classes: ["Barde", "Ensorceleur", "Magicien", "Occultiste"] },
   "Aspersion acide": { level: 0, school: "Invocation", castingTime: "1 action", range: "18m", duration: "Instantanée", save: "DEX", damage: "1d6", damageType: "Acide", classes: ["Ensorceleur", "Magicien"] },
-  "Assistance": { level: 0, school: "Divination", castingTime: "1 action", range: "Contact", duration: "Concentration, 1 min", effect: "+1d4 au prochain jet de carac", classes: ["Clerc", "Druide"] },
+  "Assistance": { level: 0, school: "Divination", castingTime: "1 action", range: "Contact", duration: "Concentration, 1 min", attack: "Aucun", effect: "+1d4 au prochain jet de carac", classes: ["Clerc", "Druide"] },
   "Bouffée de poison": { level: 0, school: "Invocation", castingTime: "1 action", range: "3m", duration: "Instantanée", save: "CON", damage: "1d12", damageType: "Poison", classes: ["Druide", "Ensorceleur", "Magicien", "Occultiste"] },
   "Contact glacial": { level: 0, school: "Nécromancie", castingTime: "1 action", range: "36m", duration: "1 round", attack: "Sort distance", damage: "1d8", damageType: "Nécrotique", classes: ["Ensorceleur", "Magicien", "Occultiste"] },
   "Coup au but": { level: 0, school: "Divination", castingTime: "1 action", range: "9m", duration: "Concentration, 1 round", effect: "Avantage au prochain jet d'attaque", classes: ["Barde", "Ensorceleur", "Magicien", "Occultiste"] },
   "Explosion occulte": { level: 0, school: "Évocation", castingTime: "1 action", range: "36m", duration: "Instantanée", attack: "Sort distance", damage: "1d10", damageType: "Force", classes: ["Occultiste"] },
-  "Flamme sacrée": { level: 0, school: "Évocation", castingTime: "1 action", range: "18m", duration: "Instantanée", save: "DEX", damage: "1d8", damageType: "Radiant", classes: ["Clerc"] },
+  "Flamme sacrée": { level: 0, school: "Évocation", castingTime: "1 action", range: "18m", duration: "Instantanée", save: "DEX", saveDamageOnSuccess: "none", damage: "1d8", damageType: "Radiant", classes: ["Clerc"] },
   "Illusion mineure": { level: 0, school: "Illusion", castingTime: "1 action", range: "9m", duration: "1 min", effect: "Crée une petite illusion simple (son OU image statique).", classes: ["Barde", "Ensorceleur", "Magicien", "Occultiste"] },
-  "Lumière": { level: 0, school: "Évocation", castingTime: "1 action", range: "Contact", duration: "1 heure", effect: "Objet brille sur 6m", classes: ["Barde", "Clerc", "Ensorceleur", "Magicien"] },
+  "Lumière": { level: 0, school: "Évocation", castingTime: "1 action", range: "Contact", duration: "1 heure", attack: "Aucun", effect: "Objet brille sur 6m", classes: ["Barde", "Clerc", "Ensorceleur", "Magicien"] },
   "Lumières dansantes": { level: 0, school: "Évocation", castingTime: "1 action", range: "36m", duration: "Concentration, 1 min", effect: "Crée jusqu'à 4 lumières mobiles (faible lumière).", classes: ["Barde", "Ensorceleur", "Magicien"] },
   "Main de mage": { level: 0, school: "Invocation", castingTime: "1 action", range: "9m", duration: "1 min", effect: "Main spectrale soulevant max 5kg", classes: ["Barde", "Ensorceleur", "Magicien", "Occultiste"] },
   "Message": { level: 0, school: "Transmutation", castingTime: "1 action", range: "36m", duration: "1 round", effect: "Chuchote un message à une cible; elle peut répondre.", classes: ["Barde", "Ensorceleur", "Magicien"] },
@@ -936,13 +938,13 @@ export const SPELLS = {
   "Trait de feu": { level: 0, school: "Évocation", castingTime: "1 action", range: "36m", duration: "Instantanée", attack: "Sort distance", damage: "1d10", damageType: "Feu", classes: ["Ensorceleur", "Magicien"] },
 
   // --- SORTS DE NIVEAU 1 ---
-  "Détection de la magie": { level: 1, school: "Divination", castingTime: "1 action", range: "Perso", duration: "Concentration, 10 min", effect: "Détecte les auras magiques proches et leur école.", classes: ["Barde", "Clerc", "Druide", "Ensorceleur", "Magicien", "Occultiste", "Paladin", "Rôdeur"] },
+  "Détection de la magie": { level: 1, school: "Divination", castingTime: "1 action", range: "Perso", duration: "Concentration, 10 min", attack: "Aucun", effect: "Détecte les auras magiques proches et leur école.", classes: ["Barde", "Clerc", "Druide", "Ensorceleur", "Magicien", "Occultiste", "Paladin", "Rôdeur"] },
   "Déguisement": { level: 1, school: "Illusion", castingTime: "1 action", range: "Perso", duration: "1 heure", effect: "Change l'apparence via illusion.", classes: ["Barde", "Ensorceleur", "Magicien", "Occultiste"] },
   "Identification": { level: 1, school: "Divination", castingTime: "1 minute", range: "Contact", duration: "Instantanée", effect: "Révèle les propriétés d'un objet magique ou d'un effet.", classes: ["Barde", "Magicien"] },
   "Image silencieuse": { level: 1, school: "Illusion", castingTime: "1 action", range: "18m", duration: "Concentration, 10 min", effect: "Crée une illusion visuelle simple (pas de son).", classes: ["Barde", "Ensorceleur", "Magicien"] },
   "Lueurs féeriques": { level: 1, school: "Évocation", castingTime: "1 action", range: "18m", duration: "Concentration, 1 min", save: "DEX", effect: "Illumine les créatures/objets; elles ne peuvent pas bénéficier d'invisibilité et donnent avantage.", classes: ["Barde", "Druide"] },
   "Armure de mage": { level: 1, school: "Abjuration", castingTime: "1 action", range: "Contact", duration: "8 heures", effect: "CA = 13 + Mod DEX", classes: ["Ensorceleur", "Magicien"] },
-  "Bénédiction": { level: 1, school: "Enchantement", castingTime: "1 action", range: "9m", duration: "Concentration, 1 min", effect: "+1d4 attaques/sauvegardes (3 cibles)", classes: ["Clerc", "Paladin"] },
+  "Bénédiction": { level: 1, school: "Enchantement", castingTime: "1 action", range: "9m", duration: "Concentration, 1 min", attack: "Aucun", effect: "+1d4 attaques/sauvegardes (3 cibles)", classes: ["Clerc", "Paladin"] },
   "Bouclier": { level: 1, school: "Abjuration", castingTime: "1 réaction", range: "Moi", duration: "1 round", effect: "+5 à la CA, annule Projectile Magique", classes: ["Ensorceleur", "Magicien"] },
   "Charme-personne": { level: 1, school: "Enchantement", castingTime: "1 action", range: "9m", duration: "1 heure", save: "SAG", effect: "Charme humanoïde", classes: ["Barde", "Druide", "Ensorceleur", "Magicien", "Occultiste"] },
   "Injonction": { level: 1, school: "Enchantement", castingTime: "1 action", range: "18m", duration: "1 round", save: "SAG", effect: "Cible obéit à un mot", classes: ["Clerc", "Paladin"] },

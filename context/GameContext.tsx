@@ -57,6 +57,11 @@ export function normalizeMultiplayerSessionId(raw: unknown): string {
 const MULTIPLAYER_COMMAND_LEASE_TTL_MS = 180_000;
 /** Au-delà de ce délai, un verrou « intent » auto-joueur abandonné peut être repris par un autre client. */
 const MULTIPLAYER_AUTO_INTENT_STALE_MS = 120_000;
+/**
+ * Les `updatedAtMs` des profils participants proviennent d'horloges locales différentes.
+ * Une dérive inter-machines peut faire paraître "ancien" un update pourtant valide.
+ */
+const MULTIPLAYER_PROFILE_CLOCK_SKEW_TOLERANCE_MS = 10 * 60 * 1000;
 
 /**
  * Messages du chat inclus dans le document `sessions/*` (payload partagé).
@@ -1851,7 +1856,7 @@ function reinjectExplicitLocalMessagesIntoRemote(
   remote: Message[],
   explicitMissing: Message[]
 ): Message[] {
-  const remoteList = Array.isArray(remote) ? [...remote] : [];
+  let remoteList = Array.isArray(remote) ? [...remote] : [];
   const remoteIdSet = new Set(
     remoteList.map((m) => String(m?.id ?? "").trim()).filter(Boolean)
   );
@@ -1869,6 +1874,13 @@ function reinjectExplicitLocalMessagesIntoRemote(
         afterId = pid;
         break;
       }
+    }
+    // Cas rehydrate : si une carte d'initiative n'a plus de prédécesseur distant (cap Firestore),
+    // on utilise le placement dédié dans la timeline de combat au lieu d'un append "au hasard".
+    if (!afterId && id.startsWith("initiative-order-")) {
+      remoteList = insertInitiativeOrderMessageIntoTimeline(remoteList, m);
+      remoteIdSet.add(id);
+      continue;
     }
     insertions.push({ afterId, msg: m });
   }
@@ -2842,6 +2854,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const hasReceivedPlayableSessionPayloadRef = useRef(false);
   /** Dernier `isGameStarted` vu côté payload distant (null = inconnu). Transition false→true : reset PJ depuis le template hors Combat partagé). */
   const remoteIsGameStartedRef = useRef<boolean | null>(null);
+  /** Première application de `messages` depuis le snapshot distant (utile pour la rehydrate F5). */
+  const firstRemoteMessagesAppliedRef = useRef(false);
   /** Snapshot immuable du personnage au moment de la sélection (sert aux resets d'aventure). */
   const playerInitialSnapshotRef = useRef<Player | null>(null);
 
@@ -3117,6 +3131,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       );
     }
     if (Array.isArray(p.messages) && !skipRemotePendingRollApplyRef.current) {
+      const isFirstRemoteMessagesApply = !firstRemoteMessagesAppliedRef.current;
       const cleanedRemote = p.messages.filter((m) => (m as Message).type !== "scene-image-pending");
       const shouldKeepInitiativeCards =
         p.gameMode === "combat" ||
@@ -3163,7 +3178,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
         if (!chatMessagesVisualEqual(prev, merged)) {
           setMessages(merged);
         }
-      } else if (localHasInitiativeDice && shouldKeepInitiativeCards) {
+      } else if (localHasInitiativeDice && shouldKeepInitiativeCards && isFirstRemoteMessagesApply) {
         const remoteIds = new Set(remoteForMerge.map((m) => String(m?.id ?? "").trim()).filter(Boolean));
         const localMissingInitiative = prev.filter(
           (m) =>
@@ -3188,6 +3203,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           setMessages(merged);
         }
       }
+      firstRemoteMessagesAppliedRef.current = true;
     }
     {
       let nextPr = p.pendingRoll ?? null;
@@ -4128,7 +4144,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const profMs =
       typeof prof.updatedAtMs === "number" && Number.isFinite(prof.updatedAtMs) ? prof.updatedAtMs : 0;
     const lastPush = lastLocalParticipantProfilePushAtMsRef.current;
-    if (lastPush >= 0 && profMs < lastPush) return;
+    if (lastPush >= 0 && profMs + MULTIPLAYER_PROFILE_CLOCK_SKEW_TOLERANCE_MS < lastPush) return;
     const prev = playerRef.current;
     if (!prev?.hp) return;
     const nextCur = Math.max(0, Math.trunc(prof.hpCurrent));
@@ -4163,7 +4179,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const profMs =
       typeof prof.updatedAtMs === "number" && Number.isFinite(prof.updatedAtMs) ? prof.updatedAtMs : 0;
     const lastPush = lastLocalParticipantProfilePushAtMsRef.current;
-    if (lastPush >= 0 && profMs < lastPush) return;
+    if (lastPush >= 0 && profMs + MULTIPLAYER_PROFILE_CLOCK_SKEW_TOLERANCE_MS < lastPush) return;
     const prev = playerRef.current;
     if (!prev) return;
     const prevInv = stackInventory(
@@ -5410,6 +5426,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     hasReceivedPlayableSessionPayloadRef.current = false;
     remoteIsGameStartedRef.current = null;
+    firstRemoteMessagesAppliedRef.current = false;
     lastSessionSnapshotHashRef.current = "";
     lastSessionWriteHashRef.current = "";
   }, [multiplayerSessionId]);
@@ -5893,7 +5910,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
               Array.isArray(update.inventory)
                 ? update.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
                 : Array.isArray(update.lootItems)
-                  ? update.lootItems.map((x) => String(x ?? "").trim()).filter(Boolean)
+                  ? [
+                      ...(Array.isArray(currentPlayer.inventory)
+                        ? currentPlayer.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
+                        : []),
+                      ...update.lootItems.map((x) => String(x ?? "").trim()).filter(Boolean),
+                    ]
                   : []
             ),
           }),

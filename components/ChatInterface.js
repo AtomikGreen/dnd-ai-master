@@ -40,6 +40,29 @@ import {
   upsertCombatTimedState,
 } from "@/lib/combatTimedStates";
 import { resourceKindForCastingTime } from "@/lib/spellDisplayMeta";
+import {
+  spellHasDamageOnSave,
+  spellSaveDamageOnSuccessMode,
+  spellIsPersonalRange,
+  isEngineHandledUtilitySpell,
+  mergeConditions,
+  replaceConcentration,
+  stripConcentrationCondition,
+  getActiveConcentrationSpellName,
+  stripGuidanceBuff,
+  hasBlessBuff,
+  hasGuidanceBuff,
+  BUFF_GUIDANCE,
+  BUFF_BLESS,
+  BUFF_LIGHT,
+  BUFF_DETECT_MAGIC,
+  CONDITION_INJONCTION_SKIP,
+  shouldSkipTurnForCommand,
+  stripCommandSkipTurn,
+  pickBlessTargetEntities,
+  inferBlessTargetLimitFromText,
+  stripConcentrationBoundEffectsForSpell,
+} from "@/lib/spellEffectHelpers";
 
 // En React 18 StrictMode (dev), le démontage/remontage réinitialise les useRef du composant
 // alors qu'une résolution async `multiplayerPendingCommand` est encore en cours → deuxième
@@ -1000,6 +1023,11 @@ function normalizeSkillName(skill) {
   return SKILL_ALIASES[base] ?? base;
 }
 
+function textWantsSneakAttack(rawText) {
+  const t = String(rawText ?? "").toLowerCase();
+  return /\bsournoi/.test(t) || /\bsneak\b/.test(t);
+}
+
 /**
  * Test de Médecine sur une autre créature (stabiliser, etc.) : D&D 5e impose le contact
  * (portée contact / même case qu’en mêlée dans ce moteur).
@@ -1039,8 +1067,16 @@ function computeCheckBonus({ player, stat, skill }) {
   const proficient = !!normSkill && Array.isArray(player?.skillProficiencies)
     ? player.skillProficiencies.includes(normSkill)
     : false;
-
-  return base + (proficient ? prof : 0);
+  const expertiseSkills =
+    Array.isArray(player?.rogue?.expertise?.skills)
+      ? player.rogue.expertise.skills
+          .map((s) => normalizeSkillName(s))
+          .filter(Boolean)
+      : [];
+  const hasExpertise = !!normSkill && expertiseSkills.includes(normSkill);
+  // D&D 5e: l'expertise double le bonus de maîtrise.
+  const proficiencyPart = hasExpertise ? prof * 2 : proficient ? prof : 0;
+  return base + proficiencyPart;
 }
 
 /** d20 avec avantage / désavantage (si les deux : annulation → un seul dé). */
@@ -1799,7 +1835,7 @@ function shouldSkipDuplicateClientActionErrorEcho(content) {
 
 /**
  * Moteur d'intentions combat (Command pattern). Ne pas appeler l'IA en cas d'échec.
- * @returns {{ ok: false, userMessage: string } | { ok: true, pendingRoll: object|null, runSpellSave?: { spellName: string, target: object } }}
+ * @returns {{ ok: false, userMessage: string } | { ok: true, pendingRoll: object|null, runSpellSave?: { spellName: string, target: object, saveDealsDamage?: boolean }, runSpellUtility?: { spellName: string, target: object } }}
  */
 function executeCombatActionIntent(intent, ctx) {
   const fail = (userMessage) => ({ ok: false, userMessage });
@@ -1829,9 +1865,11 @@ function executeCombatActionIntent(intent, ctx) {
     setHasDisengagedThisTurn,
     hasDisengagedThisTurn,
     consumeResource: consumeRes,
+    setCombatHiddenIds = null,
     addMessage,
     makeMsgId,
     userContent,
+    sneakAttackUsedThisTurn = false,
     parserMinimalNarration = false,
     localCombatantId = "player",
     dodgeActiveByCombatantIdRef = null,
@@ -1887,7 +1925,17 @@ function executeCombatActionIntent(intent, ctx) {
     return postEntities.find((e) => e.id === id && e.isAlive) ?? null;
   };
 
-  const { type, targetId, itemName } = intent;
+  const { type, itemName } = intent;
+  let targetId = intent.targetId;
+  if (type === "spell" && itemName) {
+    const sr = resolveCombatItemForIntent("spell", itemName, player, userContent);
+    if (sr.kind === "spell") {
+      const sp = SPELLS?.[sr.spellName];
+      if (sp && spellIsPersonalRange(sp)) {
+        targetId = localCombatantId;
+      }
+    }
+  }
   let effectiveMode = gameMode;
   const canOpenCombatFromExploration =
     gameMode !== "combat" && ["attack", "spell", "move_and_attack"].includes(type);
@@ -2256,7 +2304,7 @@ function executeCombatActionIntent(intent, ctx) {
     addMessage(
       "ai",
       "Vous vous désengagez et reculez prudemment (Action).",
-      undefined,
+      "player-utterance",
       disengageMsgId
     );
     return { ok: true, pendingRoll: null };
@@ -2420,9 +2468,25 @@ function executeCombatActionIntent(intent, ctx) {
       return { ok: true };
     }
     consumeMovementResource(setTurnResources);
+    const hiddenBefore = new Set(
+      Array.isArray(combatHiddenIdsArg)
+        ? combatHiddenIdsArg.map((id) => String(id ?? "").trim()).filter(Boolean)
+        : []
+    );
+    const localId = String(localCombatantId ?? "").trim();
+    const mpLocalId = multiplayerSessionId ? `mp-player-${String(clientId ?? "").trim()}` : "";
+    const targetIdNorm = String(targetId ?? "").trim();
+    const preserveIds = [];
+    if (localId && hiddenBefore.has(localId)) preserveIds.push(localId);
+    if (hiddenBefore.has("player")) preserveIds.push("player");
+    if (mpLocalId && hiddenBefore.has(mpLocalId)) preserveIds.push(mpLocalId);
+    if (targetIdNorm && hiddenBefore.has(targetIdNorm)) preserveIds.push(targetIdNorm);
     // Nouveau rapprochement : quitter tout contact précédent (alliés et ennemis), puis lier la nouvelle cible.
     clearMeleeFor(localCombatantId);
     addMeleeMutual(localCombatantId, targetId);
+    if (preserveIds.length > 0 && typeof setCombatHiddenIds === "function") {
+      setCombatHiddenIds((prev) => [...new Set([...(Array.isArray(prev) ? prev : []), ...preserveIds])]);
+    }
     emitMeleeEngagementDebug("rapprochement", localCombatantId, targetId);
     const simRapprochement = cloneMeleeStateShallow(meleeStateSnapshot);
     linkMeleePairInCopy(simRapprochement, localCombatantId, targetId);
@@ -2434,20 +2498,31 @@ function executeCombatActionIntent(intent, ctx) {
     });
     // Bulle combat : confirme la dépense de mouvement (théâtre D&D 5e — un seul « pas » de repositionnement au contact).
     addMessage(
-      "ai",
-      `⚔️ Vous vous rapprochez au corps à corps de **${targetEnt.name}** — mouvement utilisé pour ce tour.`,
-      "dice",
-      makeMsgId()
+      "user",
+      `⚔️ Vous vous rapprochez au corps à corps de ${targetEnt.name} — mouvement utilisé pour ce tour.`,
+      "player-utterance",
+      makeMsgId(),
+      undefined,
+      player?.name ?? "Joueur"
     );
     return { ok: true };
   };
 
   const buildPendingAfterItem = (resolved, opts = {}) => {
     const assumeInMeleeWithTarget = opts.assumeInMeleeWithTarget === true;
+    const explicitSneakAsked = textWantsSneakAttack(userContent);
     if (resolved.kind === "error") return fail(resolved.message);
-    if (!turnResources?.action) {
-      return fail(ACTION_CONSUMED_MESSAGE);
-    }
+    const failMissingResource = (kind) => {
+      const label =
+        kind === "bonus"
+          ? "Action bonus"
+          : kind === "reaction"
+            ? "Réaction"
+            : kind === "movement"
+              ? "Mouvement"
+              : "Action";
+      return fail(`Action impossible : vous n'avez plus de **${label}** disponible ce tour.`);
+    };
 
     if (resolved.kind === "spell") {
       const compErr = spellComponentsBlockReasonForPlayer(player, resolved.spellName);
@@ -2456,21 +2531,31 @@ function executeCombatActionIntent(intent, ctx) {
       const spell = spellMeta.raw;
       const resourceKind = resourceKindForCastingTime(spellMeta.castingTime);
       if (!hasResource(turnResources, effectiveMode, resourceKind)) {
-        return fail(ACTION_CONSUMED_MESSAGE);
+        return failMissingResource(resourceKind);
       }
       if (spellMeta.save) {
-        return { ok: true, pendingRoll: null, runSpellSave: { spellName: resolved.spellName, target: targetEnt } };
+        return {
+          ok: true,
+          pendingRoll: null,
+          runSpellSave: {
+            spellName: resolved.spellName,
+            target: targetEnt,
+            saveDealsDamage: spellHasDamageOnSave(spell),
+          },
+        };
+      }
+      if (isEngineHandledUtilitySpell(resolved.spellName)) {
+        return {
+          ok: true,
+          pendingRoll: null,
+          runSpellUtility: { spellName: resolved.spellName, target: targetEnt },
+        };
       }
       const meleeWith = getMeleeWith(localCombatantId);
       const inMeleeWithTarget = meleeWith.includes(targetId) || assumeInMeleeWithTarget;
       const contactSpell = spell && spellRangeIsContact(spell);
-      const rangedSpellLike =
-        !contactSpell && meleeWith.length > 0 && !inMeleeWithTarget;
-      if (!hasDisengagedThisTurn && rangedSpellLike) {
-        return fail(
-          "Action impossible : attaque à distance en mêlée — désengagez-vous ou rapprochez-vous de la cible visée."
-        );
-      }
+      // D&D 5e: un lancement "à distance" en mêlée reste possible (désavantage éventuel géré au jet),
+      // on ne le bloque donc pas ici.
       const dmgNotation = String(spell?.damage ?? "").trim();
       const healDice = extractDiceAndFlatBonusFromText(String(spell?.effect ?? ""), "1d4");
       const healLike =
@@ -2538,6 +2623,9 @@ function executeCombatActionIntent(intent, ctx) {
     }
 
     const weapon = resolved.weapon;
+    if (!hasResource(turnResources, effectiveMode, "action")) {
+      return failMissingResource("action");
+    }
     const meleeWith = getMeleeWith(localCombatantId);
     const inMeleeWithTarget = meleeWith.includes(targetId) || assumeInMeleeWithTarget;
     const treatAsThrownWeapon =
@@ -2548,20 +2636,72 @@ function executeCombatActionIntent(intent, ctx) {
       treatAsThrown: treatAsThrownWeapon,
     });
 
-    if (
-      attackMode.attackType === "ranged" &&
-      !hasDisengagedThisTurn &&
-      inMeleeWithTarget &&
-      !treatAsThrownWeapon
-    ) {
-      return fail(
-        "Action impossible : attaque à distance au corps à corps — désengagez-vous ou utilisez une arme de mêlée."
-      );
-    }
+    // D&D 5e: une attaque à distance au corps à corps est possible (désavantage géré au jet).
     if (attackMode.attackType === "melee" && !inMeleeWithTarget) {
       return fail(
         "Action impossible : vous devez être au contact pour attaquer à la mêlée (déplacez-vous d'abord)."
       );
+    }
+
+    if (explicitSneakAsked) {
+      const isRogue = String(player?.entityClass ?? "").trim() === "Roublard";
+      if (!isRogue) {
+        return fail("Action refusée : seule la classe **Roublard** peut déclarer une attaque sournoise.");
+      }
+      const alreadyUsed = !!sneakAttackUsedThisTurn;
+      if (alreadyUsed) {
+        return fail("Action refusée : l'attaque sournoise a déjà été utilisée ce tour-ci.");
+      }
+      const preAtkParts = computeWeaponAttackParts(player, weapon?.name ?? "");
+      const wdb = preAtkParts?.weaponDb ?? null;
+      const props = Array.isArray(wdb?.properties) ? wdb.properties : [];
+      const isRangedWeapon = props.some((p) => normalizeFr(p).includes("munitions"));
+      const isFinesse = String(wdb?.stat ?? "") === "FINESSE";
+      if (!isRangedWeapon && !isFinesse) {
+        return fail("Action refusée : l'attaque sournoise exige une arme **finesse** ou **à distance**.");
+      }
+
+      const hiddenSet = new Set(
+        Array.isArray(combatHiddenIdsArg)
+          ? combatHiddenIdsArg.map((id) => String(id ?? "").trim()).filter(Boolean)
+          : []
+      );
+      const targetEntNow = findLivingTarget(targetId);
+      const { isMeleeAttack: wMelee, isRangedAttack: wRanged } = classifyAttackMeleeRanged(weapon, null);
+      const rangedInMeleeHostile = wRanged
+        ? getMeleeWith(localCombatantId).some((mid) => {
+            const e = postEntities.find((x) => String(x?.id ?? "").trim() === String(mid ?? "").trim());
+            return e && e.isAlive !== false && e.type === "hostile";
+          })
+        : false;
+      const advRes = computeAttackRollAdvDis({
+        attackerHidden: hiddenSet.has(String(localCombatantId ?? "").trim()) || hiddenSet.has("player"),
+        targetHidden: !!(targetEntNow?.id && hiddenSet.has(String(targetEntNow.id))),
+        attackerConditions: normalizeCombatantConditions({ conditions: player?.conditions }),
+        targetConditions: normalizeCombatantConditions(targetEntNow),
+        isMeleeAttack: wMelee,
+        isRangedAttack: wRanged,
+        attackerRangedWeaponInMelee: rangedInMeleeHostile,
+        targetHasDodgeActive: !!(targetEntNow?.id && dodgeActiveByCombatantIdRef?.current?.[targetEntNow.id]),
+      });
+      let allyAdjacentForSneak = false;
+      if (targetEntNow?.id) {
+        for (const pid of getMeleeWith(targetEntNow.id) ?? []) {
+          if (String(pid ?? "").trim() === String(localCombatantId ?? "").trim()) continue;
+          const e = postEntities.find((x) => String(x?.id ?? "").trim() === String(pid ?? "").trim());
+          if (e && e.isAlive !== false && e.type !== "hostile") {
+            allyAdjacentForSneak = true;
+            break;
+          }
+        }
+      }
+      const sneakEligibleFromRules =
+        advRes.adv === true || (allyAdjacentForSneak && advRes.dis !== true);
+      if (!sneakEligibleFromRules) {
+        return fail(
+          "Action refusée : l'attaque sournoise exige l'avantage, ou un allié au contact de la cible sans désavantage."
+        );
+      }
     }
 
     const pendingRoll = {
@@ -2572,6 +2712,21 @@ function executeCombatActionIntent(intent, ctx) {
       targetId: targetEnt.id,
       weaponName: weapon.name,
       weaponAttackType: attackMode.attackType,
+      engineContext: {
+        attackerHiddenAtIntent: (() => {
+          const hiddenIds = Array.isArray(combatHiddenIdsArg)
+            ? combatHiddenIdsArg.map((id) => String(id ?? "").trim()).filter(Boolean)
+            : [];
+          const hiddenSet = new Set(hiddenIds);
+          const localId = String(localCombatantId ?? "").trim();
+          const mpLocalId = multiplayerSessionId ? `mp-player-${String(clientId ?? "").trim()}` : "";
+          return (
+            (localId && hiddenSet.has(localId)) ||
+            hiddenSet.has("player") ||
+            (!!mpLocalId && hiddenSet.has(mpLocalId))
+          );
+        })(),
+      },
     };
     return { ok: true, pendingRoll };
   };
@@ -2654,8 +2809,24 @@ function executeCombatActionIntent(intent, ctx) {
       );
       if (!skipEngageMechanicsReplay) {
         consumeMovementResource(setTurnResources);
+        const hiddenBefore = new Set(
+          Array.isArray(combatHiddenIdsArg)
+            ? combatHiddenIdsArg.map((id) => String(id ?? "").trim()).filter(Boolean)
+            : []
+        );
+        const localId = String(localCombatantId ?? "").trim();
+        const mpLocalId = multiplayerSessionId ? `mp-player-${String(clientId ?? "").trim()}` : "";
+        const targetIdNorm = String(targetId ?? "").trim();
+        const preserveIds = [];
+        if (localId && hiddenBefore.has(localId)) preserveIds.push(localId);
+        if (hiddenBefore.has("player")) preserveIds.push("player");
+        if (mpLocalId && hiddenBefore.has(mpLocalId)) preserveIds.push(mpLocalId);
+        if (targetIdNorm && hiddenBefore.has(targetIdNorm)) preserveIds.push(targetIdNorm);
         clearMeleeFor(localCombatantId);
         addMeleeMutual(localCombatantId, targetId);
+        if (preserveIds.length > 0 && typeof setCombatHiddenIds === "function") {
+          setCombatHiddenIds((prev) => [...new Set([...(Array.isArray(prev) ? prev : []), ...preserveIds])]);
+        }
         emitMeleeEngagementDebug("move_and_attack", localCombatantId, targetId);
         const simMa = cloneMeleeStateShallow(meleeStateSnapshot);
         linkMeleePairInCopy(simMa, localCombatantId, targetId);
@@ -2708,29 +2879,15 @@ function executeCombatActionIntent(intent, ctx) {
         inMeleeWithTarget,
         treatAsThrown: treatThrownMa,
       });
-      if (
-        modeAtCurrentPos.attackType === "ranged" &&
-        !hasDisengagedThisTurn &&
-        inMeleeWithTarget &&
-        !treatThrownMa
-      ) {
-        return fail(
-          "Action impossible : attaque à distance au corps à corps — désengagez-vous ou utilisez une arme de mêlée."
-        );
-      }
+      // D&D 5e: une attaque à distance au corps à corps est possible (désavantage géré au jet).
     } else if (resolved.kind === "spell") {
       const spellMeta = getSpellRuntimeMeta(resolved.spellName);
       const sp = spellMeta.raw;
       const contactSpell = sp && spellRangeIsContact(sp);
       const meleeWith = getMeleeWith(localCombatantId);
       const inMeleeWithTarget = meleeWith.includes(targetId) || assumeInMeleeWithTarget;
-      const rangedSpellLike =
-        !contactSpell && !spellMeta.save && meleeWith.length > 0 && !inMeleeWithTarget;
-      if (!hasDisengagedThisTurn && rangedSpellLike) {
-        return fail(
-          "Action impossible : attaque à distance en mêlée — désengagez-vous ou rapprochez-vous de la cible visée."
-        );
-      }
+      // D&D 5e: un sort à distance peut être lancé en mêlée (désavantage éventuel géré au jet),
+      // on ne bloque pas ici.
     }
 
     // Équivalent intent "attack" : pendingRoll / runSpellSave (getMeleeWith peut être stale juste après addMeleeMutual)
@@ -2760,6 +2917,7 @@ function spellRequiresAttackRoll(spell) {
   const atk = String(spell.attack ?? "").trim();
   if (!atk) return true;
   const low = atk.toLowerCase();
+  if (/^aucun|^none|^—|^-$/i.test(atk)) return false;
   if (/touche\s*auto|auto-?hit|touch\s*auto/.test(low)) return false;
   return true;
 }
@@ -2961,12 +3119,18 @@ async function resolveSpellCastNow({
     return true;
   }
 
-  const target = findTargetFromText(text, entities);
-  if (!target) return false;
-
   const spellMeta = getSpellRuntimeMeta(spellName);
   const spell = spellMeta.raw;
   if (!spell) return false;
+
+  let target = findTargetFromText(text, entities);
+  if (spellIsPersonalRange(spell)) {
+    target =
+      entities.find((e) => e && String(e.id) === String(player?.id)) ??
+      entities.find((e) => e && String(e.type).toLowerCase() === "player") ??
+      null;
+  }
+  if (!target) return false;
 
   const compErrEarly = spellComponentsBlockReasonForPlayer(player, spellName);
   if (compErrEarly) {
@@ -3007,10 +3171,114 @@ async function resolveSpellCastNow({
     return true; // handled (blocked)
   }
 
+  const conc = !!spellMeta.concentration;
+  if (conc) {
+    applyPlayerConcentrationSwap(spellName);
+  }
+
+  if (isEngineHandledUtilitySpell(spellName)) {
+    const applyTo = (t, conds, base) => {
+      const tid = String(t?.id ?? "");
+      if (tid && tid === String(player?.id)) {
+        updatePlayer({ conditions: mergeConditions(base ?? player?.conditions, conds) });
+      } else {
+        applyEntityUpdates([
+          { id: tid, action: "update", conditions: mergeConditions(base, conds) },
+        ]);
+      }
+    };
+    let summary = "";
+    if (spellName === "Assistance") {
+      const liveT = entities.find((e) => e && e.id === target.id) ?? target;
+      applyTo(liveT, [BUFF_GUIDANCE], liveT.conditions);
+      guidancePromptBudgetRef.current = 1; // Valable uniquement pour le prochain prompt joueur.
+      summary = `**Assistance** — **${liveT.name}** peut ajouter **+1d4** à son prochain jet de caractéristique${conc ? " (concentration)" : ""}.`;
+    } else if (spellName === "Bénédiction") {
+      const blessLimit = inferBlessTargetLimitFromText(text);
+      const picks = pickBlessTargetEntities(String(player?.id ?? ""), target, entities, blessLimit);
+      for (const p of picks) {
+        const live = entities.find((e) => e && e.id === p.id) ?? p;
+        applyTo(live, [`${BUFF_BLESS} (+1d4 attaques/sauvegardes)`], live.conditions);
+      }
+      summary = `**Bénédiction** — ${picks.map((p) => p.name).join(", ")} reçoivent **+1d4** aux jets d'attaque et de sauvegarde${conc ? " (concentration)" : ""}.`;
+    } else if (spellName === "Lumière") {
+      const liveT = entities.find((e) => e && e.id === target.id) ?? target;
+      applyTo(liveT, [`${BUFF_LIGHT} (lumière vive 6 m, 1 h)`], liveT.conditions);
+      summary = `**Lumière** — **${liveT.name}** émet une lumière vive sur 6 m pendant 1 h.`;
+    } else if (spellName === "Détection de la magie") {
+      applyTo(target, [`${BUFF_DETECT_MAGIC} (auras visibles)`], player?.conditions);
+      summary = `**Détection de la magie** — vous percevez les auras magiques à portée${conc ? " (concentration)" : ""}.`;
+    } else {
+      summary = `**${spellName}** est appliqué.`;
+    }
+    consumeResource(setTurnResources, gameMode, resourceKind);
+    const nextEntities = entities;
+    ensureCombatState(nextEntities);
+    await callApi(`🎲 ${summary}`, "dice", false, {
+      entities: nextEntities,
+      engineEvent: {
+        kind: "spell_utility_resolution",
+        spellName,
+        targetId: target?.id ?? null,
+        slotLevelUsed: slotResult.usedLevel,
+      },
+    });
+    return true;
+  }
+
   const dc = computeSpellSaveDC(player);
 
   // Sort Ã  sauvegarde (ex: Fracasse) : le joueur ne lance RIEN, le moteur résout tout.
   if (spellMeta.save) {
+    if (!spellHasDamageOnSave(spell)) {
+      const saveKey = spellMeta.save;
+      const nat = debugNextRoll ?? (Math.floor(Math.random() * 20) + 1);
+      if (debugNextRoll !== null) setDebugNextRoll(null);
+      const saveBonus = computeEntitySaveBonus(target, saveKey);
+      const total = nat + saveBonus;
+      const succeeded = total >= dc;
+      let myUpdates = [];
+      if (!succeeded && spellName === "Injonction") {
+        myUpdates.push({
+          id: target.id,
+          action: "update",
+          conditions: mergeConditions(target.conditions, CONDITION_INJONCTION_SKIP),
+        });
+      }
+      const nextEntities = myUpdates.length ? applyUpdatesLocally(entities, myUpdates) : entities;
+      if (myUpdates.length) applyEntityUpdates(myUpdates);
+      ensureCombatState(nextEntities);
+      consumeResource(setTurnResources, gameMode, resourceKind);
+      const bonusStr = fmtMod(saveBonus);
+      const saveLine =
+        nat === 20
+          ? `Nat **20** (réussite automatique)`
+          : nat === 1
+            ? `Nat **1** (échec automatique)`
+            : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
+      const effectLine = succeeded
+        ? `✔ **Réussite** — la cible résiste à l'effet.`
+        : `✖ **Échec** — la cible subit l'effet du sort.${
+            spellName === "Injonction" ? " Elle **perd son prochain tour** (obéissance)." : ""
+          }`;
+      const diceContent = `🎲 Jet de sauvegarde (${saveKey} pour ${spellName} → ${target.name}) — ${saveLine}\n${effectLine}`;
+      await callApi(diceContent, "dice", false, {
+        entities: nextEntities,
+        engineEvent: {
+          kind: "spell_save_resolution",
+          spellName,
+          targetId: target.id,
+          saveType: saveKey,
+          nat,
+          total,
+          dc,
+          succeeded,
+          damage: 0,
+          noDamageSave: true,
+        },
+      });
+      return true;
+    }
     const saveKey = spellMeta.save;
     const nat = debugNextRoll ?? (Math.floor(Math.random() * 20) + 1);
     if (debugNextRoll !== null) setDebugNextRoll(null);
@@ -3021,7 +3289,9 @@ async function resolveSpellCastNow({
     const dmgNotation = String(spell.damage ?? "1d6");
     const r = rollDiceDetailed(dmgNotation);
     const baseDmg = Math.max(0, r.total);
-    const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
+    const saveDamageOnSuccessMode = spellSaveDamageOnSuccessMode(spell);
+    const finalDmg =
+      succeeded && saveDamageOnSuccessMode === "none" ? 0 : succeeded ? Math.floor(baseDmg / 2) : baseDmg;
 
     let myUpdates = [];
     if (target.type !== "hostile") myUpdates.push({ id: target.id, action: "update", type: "hostile" });
@@ -3044,7 +3314,7 @@ async function resolveSpellCastNow({
     ensureCombatState(nextEntities);
 
     // Consommer la ressource (Action/Bonus/Réaction) comme en combat
-    consumeResource(setTurnResourcesSynced, "combat", resourceKind);
+    consumeResource(setTurnResources, "combat", resourceKind);
 
     // Message moteur (ðŸŽ² réservé au moteur)
     const bonusStr = fmtMod(saveBonus);
@@ -3054,8 +3324,14 @@ async function resolveSpellCastNow({
         : nat === 1
         ? `Nat **1** ðŸ’€ (échec automatique)`
         : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
-    const outcome = succeeded ? "âœ” Réussite â€” dégâts réduits." : "âœ– Ã‰chec â€” dégâts complets.";
-    const dmgDetail = `${formatDiceNotationDetail(r, dmgNotation)}${succeeded ? " â†’ moitié dégâts" : ""}`;
+    const outcome = succeeded
+      ? saveDamageOnSuccessMode === "none"
+        ? "âœ” Réussite â€” aucun dégât."
+        : "âœ” Réussite â€” dégâts réduits."
+      : "âœ– Ã‰chec â€” dégâts complets.";
+    const dmgDetail = `${formatDiceNotationDetail(r, dmgNotation)}${
+      succeeded && saveDamageOnSuccessMode !== "none" ? " â†’ moitié dégâts" : ""
+    }`;
     const dmgLine = finalDmg > 0 ? `${dmgDetail} = **${finalDmg} dégâts ${spell.damageType ?? ""}**` : "Aucun dégât.";
     const hpDebug = debugMode && target.hp ? ` (PV: ${hpBefore} â†’ ${hpAfter}/${target.hp.max})` : "";
 
@@ -3550,7 +3826,10 @@ export default function ChatInterface() {
   const [latencyAvgMs, setLatencyAvgMs] = useState(null);
   const [latencyLastMs, setLatencyLastMs] = useState(null);
   const [sneakAttackArmed, setSneakAttackArmed] = useState(false);
+  const [sneakAttackExplicitArmed, setSneakAttackExplicitArmed] = useState(false);
   const [sneakAttackUsedThisTurn, setSneakAttackUsedThisTurn] = useState(false);
+  const guidancePromptBudgetRef = useRef(0);
+  const previousGameModeRef = useRef(gameMode);
   const [failedRequestPayload, setFailedRequestPayload] = useState(null);
   const [flowBlocked, setFlowBlocked] = useState(false);
   const [isRetryingFailedRequest, setIsRetryingFailedRequest] = useState(false);
@@ -3883,6 +4162,8 @@ export default function ChatInterface() {
   const localParseIntentInFlightRef = useRef(new Map());
   /** Déduplication large des requêtes naturelles (visible + replay caché) par fenêtre TTL. */
   const recentNaturalParserCallsRef = useRef(new Map());
+  /** Déduplication par texte (cross-room) pour replays cachés déclenchés pendant une transition. */
+  const recentNaturalParserTextCallsRef = useRef(new Map());
   const multiplayerThinkingActiveRef = useRef(multiplayerThinkingState?.active === true);
   useEffect(() => {
     multiplayerThinkingActiveRef.current = multiplayerThinkingState?.active === true;
@@ -4754,6 +5035,7 @@ export default function ChatInterface() {
   }
 
   function markPlayerDead(reason = "") {
+    breakPlayerConcentrationFromIncapacitation("Vous mourez : la concentration prend fin.");
     setPlayer((prev) => {
       if (!prev) return prev;
       playerHpRef.current = 0;
@@ -4780,6 +5062,9 @@ export default function ChatInterface() {
   }
 
   function bringPlayerToZeroHp() {
+    breakPlayerConcentrationFromIncapacitation(
+      "Vous tombez à 0 PV (inconscient) : la concentration prend fin."
+    );
     setPlayer((prev) => {
       if (!prev?.hp) return prev;
       playerHpRef.current = 0;
@@ -4812,6 +5097,8 @@ export default function ChatInterface() {
         dead: deathStateBefore.dead === true,
       };
     }
+
+    maybeBreakPlayerConcentrationFromDamage(numericDamage);
 
     if (hpBefore > 0) {
       const hpAfter = Math.max(0, hpBefore - numericDamage);
@@ -4912,6 +5199,109 @@ export default function ChatInterface() {
       dead: hpAfter <= 0,
       instantDeath: false,
     };
+  }
+
+  function clearConcentrationEffectsForSpell(spellName) {
+    const name = String(spellName ?? "").trim();
+    if (!name) return;
+    if (/^assistance$/i.test(name)) {
+      guidancePromptBudgetRef.current = 0;
+    }
+    setPlayer((prev) => {
+      if (!prev) return prev;
+      const withoutConcentration = stripConcentrationCondition(prev.conditions);
+      const nextConditions = stripConcentrationBoundEffectsForSpell(withoutConcentration, name);
+      return { ...prev, conditions: nextConditions };
+    });
+    if (!Array.isArray(entities) || entities.length === 0) return;
+    const updates = [];
+    for (const ent of entities) {
+      if (!ent?.id) continue;
+      const before = Array.isArray(ent.conditions) ? ent.conditions : [];
+      const after = stripConcentrationBoundEffectsForSpell(before, name);
+      if (after.length !== before.length) {
+        updates.push({ id: ent.id, action: "update", conditions: after });
+      }
+    }
+    if (updates.length > 0) {
+      applyEntityUpdates(updates);
+    }
+  }
+
+  function stripConcentrationBuffForSpellName(spellName, conditions) {
+    return stripConcentrationBoundEffectsForSpell(conditions, spellName);
+  }
+
+  function applyPlayerConcentrationSwap(nextSpellName) {
+    const previousConcentration = getActiveConcentrationSpellName(player?.conditions);
+    const base = stripConcentrationCondition(player?.conditions);
+    const withoutPrevious =
+      previousConcentration != null
+        ? stripConcentrationBuffForSpellName(previousConcentration, base)
+        : base;
+    updatePlayer({ conditions: replaceConcentration(withoutPrevious, nextSpellName) });
+    if (/^assistance$/i.test(String(previousConcentration ?? "").trim())) {
+      guidancePromptBudgetRef.current = 0;
+    }
+    if (!previousConcentration || !Array.isArray(entities) || entities.length === 0) return;
+    const updates = [];
+    for (const ent of entities) {
+      if (!ent?.id) continue;
+      const before = Array.isArray(ent.conditions) ? ent.conditions : [];
+      const after = stripConcentrationBuffForSpellName(previousConcentration, before);
+      if (after.length !== before.length) {
+        updates.push({ id: ent.id, action: "update", conditions: after });
+      }
+    }
+    if (updates.length > 0) {
+      applyEntityUpdates(updates);
+    }
+  }
+
+  function clearGuidanceBuffEverywhere() {
+    setPlayer((prev) => {
+      if (!prev) return prev;
+      return { ...prev, conditions: stripGuidanceBuff(prev.conditions) };
+    });
+    if (!Array.isArray(entities) || entities.length === 0) return;
+    const updates = [];
+    for (const ent of entities) {
+      if (!ent?.id) continue;
+      const before = Array.isArray(ent.conditions) ? ent.conditions : [];
+      const after = stripGuidanceBuff(before);
+      if (after.length !== before.length) {
+        updates.push({ id: ent.id, action: "update", conditions: after });
+      }
+    }
+    if (updates.length > 0) applyEntityUpdates(updates);
+  }
+
+  function maybeBreakPlayerConcentrationFromDamage(numericDamage) {
+    if (!player || numericDamage <= 0) return;
+    const activeSpell = getActiveConcentrationSpellName(player.conditions);
+    if (!activeSpell) return;
+    const dc = Math.max(10, Math.floor(numericDamage / 2));
+    const conMod = abilityMod(player?.stats?.CON ?? 10);
+    const nat = Math.floor(Math.random() * 20) + 1;
+    const total = nat + conMod;
+    const success = total >= dc;
+    const rollLine = `Concentration (${activeSpell}) : d20 ${nat} ${fmtMod(conMod)} = ${total} vs DD ${dc}.`;
+    if (success) {
+      addMessage("ai", `${rollLine} ✅ Concentration maintenue.`, "meta", makeMsgId());
+      return;
+    }
+    clearConcentrationEffectsForSpell(activeSpell);
+    addMessage("ai", `${rollLine} ❌ Concentration rompue.`, "meta", makeMsgId());
+  }
+
+  function breakPlayerConcentrationFromIncapacitation(reasonText = "") {
+    const activeSpell = getActiveConcentrationSpellName(player?.conditions);
+    if (!activeSpell) return false;
+    clearConcentrationEffectsForSpell(activeSpell);
+    if (reasonText) {
+      addMessage("ai", reasonText, "meta", makeMsgId());
+    }
+    return true;
   }
 
   function advanceWorldClock(minutes) {
@@ -5617,6 +6007,7 @@ export default function ChatInterface() {
     if (isLocalPc) {
       setHasDisengagedThisTurn(false);
       setSneakAttackArmed(false);
+      setSneakAttackExplicitArmed(false);
       setSneakAttackUsedThisTurn(false);
       if (surprised) {
         lockPlayerTurnResourcesForSurprise();
@@ -6150,6 +6541,18 @@ export default function ChatInterface() {
     setPendingRoll(null);
     deathSavePromptKeyRef.current = null;
   }, [gameMode, combatTurnIndex, combatTurnWriteSeq, combatOrder, pendingRoll, player?.hp?.current, player?.deathState]);
+
+  /** Nat 20 / soin / réveil : si le PJ a de nouveau des PV, aucun death_save ne doit bloquer la saisie. */
+  useEffect(() => {
+    const liveHp = playerHpRef.current ?? player?.hp?.current ?? 0;
+    if (liveHp <= 0) return;
+    const pr = pendingRollRef.current;
+    if (!pr || pr.kind !== "death_save") return;
+    pendingRollRef.current = null;
+    setPendingRoll(null);
+    deathSavePromptKeyRef.current = null;
+    emittedDeathSavePromptKeys.clear();
+  }, [player?.hp?.current, player?.deathState, pendingRoll]);
 
   /** PJ stabilisé à 0 PV : même logique que la boucle ennemis si le tour arrive par sync (ex. multijoueur). */
   // eslint-disable-next-line react-hooks/exhaustive-deps -- garde-fou tour stabilisé
@@ -7097,9 +7500,7 @@ export default function ChatInterface() {
           if (!spell) return null;
           const castingTime = normalizeFr(spell.castingTime ?? "");
           const isActionSpell = castingTime.includes("action") && !castingTime.includes("reaction");
-          const isOffensiveSpell =
-            !!spell.save || !!spell.damage || /attaque|attack/i.test(String(spell.attack ?? ""));
-          if (!isActionSpell || !isOffensiveSpell) return null;
+          if (!isActionSpell) return null;
           return {
             key: `spell_${normalizeFr(canonicalSpellName).replace(/[^a-z0-9]+/g, "_")}`,
             label: canonicalSpellName,
@@ -7439,6 +7840,16 @@ export default function ChatInterface() {
   }
 
   function promptPlayerOpportunityAttack(reactor, target) {
+    const hpNow =
+      typeof playerHpRef.current === "number"
+        ? playerHpRef.current
+        : typeof player?.hp?.current === "number"
+          ? player.hp.current
+          : 0;
+    const dsNow = getPlayerDeathStateSnapshot();
+    if (hpNow <= 0 || dsNow.dead === true || dsNow.unconscious === true) {
+      return Promise.resolve({ performed: false, targetAlive: target?.isAlive !== false });
+    }
     return new Promise((resolve) => {
       opportunityAttackPromptResolverRef.current = resolve;
       setOpportunityAttackPrompt({
@@ -7597,6 +8008,19 @@ export default function ChatInterface() {
       let result = { performed: false, targetAlive: mover.isAlive !== false };
       if (reactor.id === "player" || controllerForCombatantId(reactor.id) === "player") {
         const rid = String(reactor.id ?? "").trim();
+        if (isLocalPlayerCombatantId(rid)) {
+          const hpNow =
+            typeof playerHpRef.current === "number"
+              ? playerHpRef.current
+              : typeof player?.hp?.current === "number"
+                ? player.hp.current
+                : 0;
+          const dsNow = getPlayerDeathStateSnapshot();
+          if (hpNow <= 0 || dsNow.dead === true || dsNow.unconscious === true) {
+            await yieldCombatUiSync();
+            continue;
+          }
+        }
         const trMap = gameStateRef.current?.turnResourcesByCombatantId ?? turnResourcesByCombatantId ?? {};
         const tr = normalizeTurnResourcesInput(trMap[rid]);
         if (!tr.reaction || !hasReaction(rid)) {
@@ -7755,6 +8179,14 @@ export default function ChatInterface() {
     let currentHp = getCombatantCurrentHp(target);
     const entPool = gameStateRef.current?.entities ?? entities ?? [];
     const { isMeleeAttack, isRangedAttack } = classifyAttackMeleeRanged(chosenWeapon, tacticalAction);
+    // Garde-fou: une attaque de mêlée valide implique un lien de contact bidirectionnel.
+    // Évite les désyncs où l'ennemi frappe au corps à corps sans être marqué en mêlée.
+    if (isMeleeAttack && attacker?.id && target?.id) {
+      const alreadyLinked = getMeleeWith(attacker.id).includes(String(target.id));
+      if (!alreadyLinked) {
+        addMeleeMutual(attacker.id, target.id);
+      }
+    }
     const meleeIds = attacker?.id ? getMeleeWith(attacker.id) : [];
     let attackerRangedWeaponInMelee = false;
     if (isRangedAttack && attacker?.id) {
@@ -7934,6 +8366,11 @@ export default function ChatInterface() {
               enemyName: attacker.name,
               weaponName: chosenWeapon.name,
               outcome: narrativeOutcome,
+              targetHpBefore: hpPreAttack,
+              targetHpAfter: currentHp,
+              damageApplied: lastDmgTotal,
+              targetDowned: typeof currentHp === "number" ? currentHp <= 0 : false,
+              targetDead: targetDamageResult?.dead === true,
             },
           }),
         });
@@ -7948,7 +8385,7 @@ export default function ChatInterface() {
       }
     }
 
-    if (targetIsPlayerControlled && attackKilledTarget) {
+    if (targetIsPlayerControlled) {
       try {
         const res = await fetch("/api/chat-combat", {
           method: "POST",
@@ -7962,6 +8399,11 @@ export default function ChatInterface() {
               enemyName: attacker.name,
               weaponName: chosenWeapon.name,
               outcome: narrativeOutcome,
+              targetHpBefore: hpPreAttack,
+              targetHpAfter: currentHp,
+              damageApplied: lastDmgTotal,
+              targetDowned: typeof currentHp === "number" ? currentHp <= 0 : false,
+              targetDead: targetDamageResult?.dead === true,
             },
           }),
         });
@@ -7972,14 +8414,28 @@ export default function ChatInterface() {
         if (res.ok && typeof data?.narrative === "string" && data.narrative.trim()) {
           narrativeText = data.narrative.trim();
         }
+        // Sur coup potentiellement létal du PJ, on garde un mode strict: il faut une narration.
+        if (attackKilledTarget && !narrativeText) {
+          throw new Error("Narration combat vide");
+        }
       } catch (err) {
-        markFlowFailure(
-          `Narration combat indisponible: ${String(err?.message ?? err)}`,
-          { kind: "nextTurn" }
+        // En coup létal contre le joueur, on force l'arrêt pour éviter un état ambigu.
+        if (attackKilledTarget) {
+          markFlowFailure(
+            `Narration combat indisponible: ${String(err?.message ?? err)}`,
+            { kind: "nextTurn" }
+          );
+          throw err;
+        }
+        // En attaque normale, on garde le fallback moteur (shortOutcome + détail combat).
+        addMessage(
+          "ai",
+          `[DEBUG] Narration combat non létale indisponible (fallback moteur conservé): ${String(err?.message ?? err)}`,
+          "debug",
+          makeMsgId()
         );
-        throw err;
       }
-      if (!narrativeText) {
+      if (attackKilledTarget && !narrativeText) {
         markFlowFailure(
           "Narration combat vide: impossible de poursuivre proprement.",
           { kind: "nextTurn" }
@@ -7989,17 +8445,21 @@ export default function ChatInterface() {
     }
 
     if (narrativeText) {
-      addMessage("ai", narrativeText, "enemy-turn", makeMsgId());
+      // Narration de combat "MJ": même rendu que la narration classique (gauche, non rouge).
+      addMessage("ai", narrativeText, undefined, makeMsgId());
     } else {
-      const shortOutcome =
+      // Fallback narratif local: conserve une prose minimale même si /api/chat-combat
+      // est indisponible ponctuellement, pour éviter un "trou" de narration entre deux attaques.
+      const localFallbackNarrative =
         narrativeOutcome === "critical_hit"
-          ? `critique sur ${target.name}`
+          ? `${attacker.name} exploite une ouverture et frappe avec une brutalité soudaine; le coup de ${chosenWeapon.name} arrache un cri à ${target.name}.`
           : narrativeOutcome === "hit"
-            ? `touche ${target.name}`
+            ? `${attacker.name} trouve l'angle juste et touche ${target.name} avec ${chosenWeapon.name}, forçant ${target.name} à encaisser le choc.`
             : narrativeOutcome === "fumble"
-              ? "commet un fumble"
-              : `manque ${target.name}`;
-      addMessage("ai", `⚔️ ${attacker.name} ${shortOutcome} avec ${chosenWeapon.name}.`, "enemy-turn", makeMsgId());
+              ? `${attacker.name} s'élance avec ${chosenWeapon.name}, mais son geste se dérègle au dernier instant et l'attaque se perd dans le vide.`
+              : `${attacker.name} attaque avec ${chosenWeapon.name}, mais ${target.name} parvient à éviter l'impact.`;
+      // Fallback narratif local: même rendu narrateur classique.
+      addMessage("ai", localFallbackNarrative, undefined, makeMsgId());
     }
     addMessage("ai", combatDetailBlock, "combat-detail", makeMsgId());
     addMessage(
@@ -8058,7 +8518,19 @@ export default function ChatInterface() {
   ) {
     const canonicalSpellName = canonicalizeSpellNameAgainstCombatant(attacker, spellName) ?? spellName;
     const spell = SPELLS?.[canonicalSpellName];
-    if (!attacker || !target || !spell) return false;
+    if (!attacker || !spell) return false;
+    const effectText = String(spell?.effect ?? "");
+    const healDice = extractDiceAndFlatBonusFromText(effectText, "1d4");
+    const healLike =
+      !spell.save &&
+      !spellRequiresAttackRoll(spell) &&
+      !spellHasDamageOnSave(spell) &&
+      (/pv|points?\s*de\s*vie|hit\s*points?/i.test(effectText) ||
+        /soins?|healing|heal/i.test(canonicalSpellName));
+    const utilityLike = isEngineHandledUtilitySpell(canonicalSpellName);
+    const effectiveTarget =
+      target ?? (spellIsPersonalRange(spell) || healLike || utilityLike ? attacker : null);
+    if (!effectiveTarget) return false;
 
     const compV = validateSpellCastingComponents(attacker, canonicalSpellName);
     if (!compV.ok) {
@@ -8074,9 +8546,103 @@ export default function ChatInterface() {
     const slotResult = spendSpellSlotForCombatant(attacker.id, spell.level ?? 0);
     if (!slotResult.ok) return false;
 
+    if (utilityLike) {
+      const liveTarget = getRuntimeCombatant(effectiveTarget.id) ?? effectiveTarget;
+      const applyTo = (combatant, conds) => {
+        if (!combatant?.id) return;
+        if (combatant.id === "player") {
+          updatePlayer({ conditions: mergeConditions(player?.conditions, conds) });
+          return;
+        }
+        applyEntityUpdates([
+          {
+            id: combatant.id,
+            action: "update",
+            conditions: mergeConditions(combatant.conditions, conds),
+          },
+        ]);
+      };
+      if (spell?.duration && /concentration/i.test(String(spell.duration))) {
+        const nextConc = replaceConcentration(attacker?.conditions, canonicalSpellName);
+        if (attacker?.id === "player") {
+          updatePlayer({ conditions: nextConc });
+        } else if (attacker?.id) {
+          applyEntityUpdates([{ id: attacker.id, action: "update", conditions: nextConc }]);
+        }
+      }
+      if (canonicalSpellName === "Assistance") {
+        applyTo(liveTarget, [BUFF_GUIDANCE]);
+      } else if (canonicalSpellName === "Bénédiction") {
+        applyTo(liveTarget, [`${BUFF_BLESS} (+1d4 attaques/sauvegardes)`]);
+      } else if (canonicalSpellName === "Lumière") {
+        applyTo(liveTarget, [`${BUFF_LIGHT} (lumière vive 6 m, 1 h)`]);
+      } else if (canonicalSpellName === "Détection de la magie") {
+        applyTo(attacker, [`${BUFF_DETECT_MAGIC} (auras visibles)`]);
+      }
+      addMessage(
+        "ai",
+        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""}${liveTarget?.name ? ` sur ${liveTarget.name}` : ""}.`,
+        "enemy-turn",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `${canonicalSpellName} est appliqué.`,
+        "combat-detail",
+        makeMsgId()
+      );
+      return true;
+    }
+
+    if (healLike) {
+      const liveTarget = getRuntimeCombatant(effectiveTarget.id) ?? effectiveTarget;
+      if (!liveTarget?.hp) return false;
+      const hpBefore = getCombatantCurrentHp(liveTarget) ?? liveTarget.hp.current ?? 0;
+      const rHeal = rollDiceDetailed(healDice.diceNotation);
+      const healAmount = Math.max(1, (rHeal.total ?? 0) + (healDice.flatBonus ?? 0));
+      const hpAfterTarget = Math.min(liveTarget.hp.max ?? hpBefore + healAmount, hpBefore + healAmount);
+      applyHpToCombatant(liveTarget, hpAfterTarget);
+      addMessage(
+        "ai",
+        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${liveTarget.name}.`,
+        "enemy-turn",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `${canonicalSpellName} : ${formatDiceNotationDetail(rHeal, healDice.diceNotation)}${
+          healDice.flatBonus ? ` ${healDice.flatBonus >= 0 ? "+" : ""}${healDice.flatBonus}` : ""
+        } = **${healAmount} PV**. ${liveTarget.name} : **${hpAfterTarget}/${liveTarget.hp.max} HP**.`,
+        "combat-detail",
+        makeMsgId()
+      );
+      addMessage(
+        "ai",
+        `[DEBUG] Résolution sort auto (soin)\n` +
+          safeJson({
+            attackerId: attacker.id,
+            attackerName: attacker.name,
+            targetId: liveTarget.id,
+            targetName: liveTarget.name,
+            spellName: canonicalSpellName,
+            healDice: healDice.diceNotation,
+            healFlatBonus: healDice.flatBonus,
+            healAmount,
+            hpBefore,
+            hpAfter: hpAfterTarget,
+            slotLevelUsed: slotResult.usedLevel,
+            tacticalThought: tactical?.thought_process ?? "",
+            tacticalAction,
+          }),
+        "debug",
+        makeMsgId()
+      );
+      return true;
+    }
+
     if (spell.save) {
       const dc = computeSpellSaveDC(attacker);
-      if (target.id === "player") {
+      if (effectiveTarget.id === "player") {
         const incomingPlayerSaveRoll = stampPendingRollForActor(
           {
             kind: "save",
@@ -8093,6 +8659,7 @@ export default function ChatInterface() {
               spellName: canonicalSpellName,
               damageNotation: String(spell.damage ?? "1d6"),
               damageType: spell.damageType ?? null,
+              saveDamageOnSuccessMode: spellSaveDamageOnSuccessMode(spell),
               slotLevelUsed: slotResult.usedLevel,
               tacticalThought: tactical?.thought_process ?? "",
               tacticalAction,
@@ -8103,7 +8670,7 @@ export default function ChatInterface() {
         );
         addMessage(
           "ai",
-          `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${target.name}.`,
+        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${effectiveTarget.name}.`,
           "enemy-turn",
           makeMsgId()
         );
@@ -8112,20 +8679,22 @@ export default function ChatInterface() {
         return true;
       }
       const nat = Math.floor(Math.random() * 20) + 1;
-      const saveBonus = computeEntitySaveBonus(target, spell.save);
+      const saveBonus = computeEntitySaveBonus(effectiveTarget, spell.save);
       const total = nat + saveBonus;
       const succeeded = nat === 20 ? true : nat === 1 ? false : total >= dc;
       const r = rollDiceDetailed(String(spell.damage ?? "1d6"));
       const baseDmg = Math.max(0, r.total);
-      const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
-      const hpBefore = getCombatantCurrentHp(target);
+      const saveDamageOnSuccessMode = spellSaveDamageOnSuccessMode(spell);
+      const finalDmg =
+        succeeded && saveDamageOnSuccessMode === "none" ? 0 : succeeded ? Math.floor(baseDmg / 2) : baseDmg;
+      const hpBefore = getCombatantCurrentHp(effectiveTarget);
       const damageResult =
-        hpBefore == null || finalDmg <= 0 ? null : applyDamageToCombatant(target, finalDmg, { critical: false });
+        hpBefore == null || finalDmg <= 0 ? null : applyDamageToCombatant(effectiveTarget, finalDmg, { critical: false });
       const hpAfter = damageResult ? damageResult.hpAfter : hpBefore;
 
       addMessage(
         "ai",
-        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${target.name}.`,
+        `⚔️ ${attacker.name} lance ${canonicalSpellName}${labelSuffix || ""} sur ${effectiveTarget.name}.`,
         "enemy-turn",
         makeMsgId()
       );
@@ -8133,7 +8702,13 @@ export default function ChatInterface() {
         "ai",
         `Sauvegarde ${spell.save} : nat ${nat} ${fmtMod(saveBonus)} = **${total}** vs DD **${dc}** — ${
           succeeded ? "réussite" : "échec"
-        }. ${finalDmg > 0 ? `${finalDmg} dégâts ${spell.damageType ?? ""}.` : "Aucun dégât."}`,
+        }. ${
+          succeeded && saveDamageOnSuccessMode === "none"
+            ? "Aucun dégât (sort évité sur sauvegarde réussie)."
+            : finalDmg > 0
+              ? `${finalDmg} dégâts ${spell.damageType ?? ""}.`
+              : "Aucun dégât."
+        }`,
         "combat-detail",
         makeMsgId()
       );
@@ -8143,8 +8718,8 @@ export default function ChatInterface() {
           safeJson({
             attackerId: attacker.id,
             attackerName: attacker.name,
-            targetId: target.id,
-            targetName: target.name,
+            targetId: effectiveTarget.id,
+            targetName: effectiveTarget.name,
             spellName: canonicalSpellName,
             tacticalThought: tactical?.thought_process ?? "",
             tacticalAction,
@@ -8161,7 +8736,7 @@ export default function ChatInterface() {
         "debug",
         makeMsgId()
       );
-      if (target.id === "player" && damageResult?.dead === true) {
+      if (effectiveTarget.id === "player" && damageResult?.dead === true) {
         return "player_dead";
       }
       return true;
@@ -8174,7 +8749,7 @@ export default function ChatInterface() {
       damageBonus: 0,
       kind: /corps a corps|corps à corps/i.test(String(spell.attack ?? "")) ? "melee" : "ranged",
     };
-    return resolveCombatantWeaponAttack(attacker, target, spellWeapon, labelSuffix, tactical, {
+    return resolveCombatantWeaponAttack(attacker, effectiveTarget, spellWeapon, labelSuffix, tactical, {
       ...(tacticalAction ?? {}),
       kind: "spell",
       name: canonicalSpellName,
@@ -8296,10 +8871,10 @@ export default function ChatInterface() {
     /** Miroir synchrone des ids au contact de cet ennemi (getMeleeWith peut être périmé dans la boucle). */
     let localMeleeNeighbors = new Set(getMeleeWith(enemy.id));
 
-    const pickOffensiveOptionForAction = (act, targetCombatant) => {
+    const pickOffensiveOptionForAction = (act) => {
       const spellName = canonicalizeSpellNameAgainstCombatant(enemy, act?.name ?? "");
       if (spellName && SPELLS?.[spellName]) {
-        return { kind: "spell", spellName, canAttack: !!targetCombatant };
+        return { kind: "spell", spellName, canAttack: true };
       }
       let chosenWeapon = null;
       if (act?.name) {
@@ -8310,16 +8885,10 @@ export default function ChatInterface() {
       if (!chosenWeapon && enemyWeapons.length > 0) {
         chosenWeapon = enemyWeapons[0];
       }
-      const targetIdStr = targetCombatant?.id != null ? String(targetCombatant.id).trim() : "";
-      const inMeleeWithTarget = targetIdStr && localMeleeNeighbors.has(targetIdStr);
       if (chosenWeapon && effectiveInMeleeWithPlayer && isRangedWeapon(chosenWeapon)) {
         chosenWeapon = enemyWeapons.find((w) => !isRangedWeapon(w)) ?? chosenWeapon;
       }
-      let canAttack = !!chosenWeapon && !!targetCombatant;
-      if (chosenWeapon && !inMeleeWithTarget && !isRangedWeapon(chosenWeapon)) {
-        canAttack = false;
-      }
-      return { kind: "weapon", chosenWeapon, canAttack };
+      return { kind: "weapon", chosenWeapon, canAttack: !!chosenWeapon };
     };
 
     const enemyStillAlive = () => {
@@ -8529,10 +9098,33 @@ export default function ChatInterface() {
           continue;
         }
         const actTargetId = typeof act?.targetId === "string" ? act.targetId : null;
-        const targetCombatant = actTargetId ? getRuntimeCombatant(actTargetId) : fallbackPlayerTarget;
+        const picked = pickOffensiveOptionForAction(act);
+        const spellForPick =
+          picked?.kind === "spell" && picked?.spellName ? SPELLS?.[picked.spellName] : null;
+        const spellLooksUtility =
+          picked?.kind === "spell" && picked?.spellName
+            ? isEngineHandledUtilitySpell(picked.spellName)
+            : false;
+        const effectText = String(spellForPick?.effect ?? "");
+        const spellLooksLikeHeal =
+          !!spellForPick &&
+          !spellForPick.save &&
+          !spellRequiresAttackRoll(spellForPick) &&
+          !spellHasDamageOnSave(spellForPick) &&
+          (/pv|points?\s*de\s*vie|hit\s*points?/i.test(effectText) ||
+            /soins?|healing|heal/i.test(String(picked?.spellName ?? "")));
+        let targetCombatant = actTargetId ? getRuntimeCombatant(actTargetId) : null;
+        if (
+          !targetCombatant &&
+          spellForPick &&
+          (spellIsPersonalRange(spellForPick) || spellLooksLikeHeal || spellLooksUtility)
+        ) {
+          targetCombatant = enemy;
+        }
+        if (!targetCombatant) {
+          targetCombatant = fallbackPlayerTarget;
+        }
         if (!targetCombatant || targetCombatant.isAlive === false) continue;
-
-        const picked = pickOffensiveOptionForAction(act, targetCombatant);
         let ok = false;
         if (picked?.kind === "spell" && picked.spellName && targetCombatant) {
           ok = await resolveCombatantSpellAgainstTarget(
@@ -8772,10 +9364,26 @@ export default function ChatInterface() {
     const liveMode = gameStateRef.current?.gameMode ?? gameMode;
     const anyCombatReadyHostile = hasAnyCombatReadyHostile(currentEntities);
     if (!anyCombatReadyHostile) {
+      const anyHostileAlive = hasAnyHostileAlive(currentEntities);
       const entLen = Array.isArray(currentEntities) ? currentEntities.length : 0;
       const orderLen =
         (Array.isArray(gameStateRef.current?.combatOrder) ? gameStateRef.current.combatOrder.length : 0) ||
         (combatOrder?.length ?? 0);
+      const liveOrder = Array.isArray(maybeOrder)
+        ? maybeOrder
+        : Array.isArray(gameStateRef.current?.combatOrder)
+          ? gameStateRef.current.combatOrder
+          : combatOrder;
+      const hostileInOrderStillAlive = (Array.isArray(liveOrder) ? liveOrder : []).some((entry) => {
+        const id = String(entry?.id ?? "").trim();
+        if (!id) return false;
+        const ent = (Array.isArray(currentEntities) ? currentEntities : []).find(
+          (e) => String(e?.id ?? "").trim() === id
+        );
+        return !!ent && ent.type === "hostile" && ent.isAlive === true;
+      });
+      const preserveCombatWithLivingHostiles =
+        liveMode === "combat" && anyHostileAlive && hostileInOrderStillAlive;
       // Après un jet joueur → arbitre (porte, obstacle…), la salle peut avoir entities=[] sans que le
       // combat soit terminé : ne pas traiter "aucune entité" comme "plus aucun hostile" et effacer l'initiative.
       const skipEmptyRoomCleanup =
@@ -8783,7 +9391,7 @@ export default function ChatInterface() {
         entLen === 0 &&
         orderLen > 0 &&
         liveMode === "combat";
-      if (skipEmptyRoomCleanup) {
+      if (skipEmptyRoomCleanup || preserveCombatWithLivingHostiles) {
         return;
       }
       if (liveMode === "combat") {
@@ -9075,6 +9683,7 @@ export default function ChatInterface() {
         }
         setHasDisengagedThisTurn(false);
         setSneakAttackArmed(false);
+        setSneakAttackExplicitArmed(false);
         setSneakAttackUsedThisTurn(false);
         const arbiterAtPlayerTurnStart = await runCombatTurnStartArbiter({
           actorId: "player",
@@ -9142,6 +9751,40 @@ export default function ChatInterface() {
             ? Math.trunc(gameStateRef.current.combatTurnWriteSeq)
             : Math.trunc(combatTurnWriteSeq ?? 0);
         const turnKey = `${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${liveEnemy.id}`;
+        if (shouldSkipTurnForCommand(liveEnemy.conditions)) {
+          commitCombatTurnIndex(idx);
+          const cmdSkipMsgId = `npc-command-skip:${turnKey.replace(/:/g, "-")}`;
+          const cmdSkipTurnEndMsgId = `npc-command-turn-end:${turnKey.replace(/:/g, "-")}`;
+          const cmdSkipTurnEndDivId = `npc-command-turn-end-div:${turnKey.replace(/:/g, "-")}`;
+          if (!messagesRef.current.some((m) => m && m.id === cmdSkipMsgId)) {
+            addMessage(
+              "ai",
+              `**${liveEnemy.name}** est sous **Injonction** et ne peut pas agir ce tour.`,
+              "enemy-turn",
+              cmdSkipMsgId
+            );
+          }
+          if (!messagesRef.current.some((m) => m && m.id === cmdSkipTurnEndMsgId)) {
+            addMessage("ai", `**${liveEnemy.name}** met fin à son tour.`, "turn-end", cmdSkipTurnEndMsgId);
+          }
+          if (!messagesRef.current.some((m) => m && m.id === cmdSkipTurnEndDivId)) {
+            addMessage("ai", "", "turn-divider", cmdSkipTurnEndDivId);
+          }
+          applyEntityUpdates([
+            {
+              id: liveEnemy.id,
+              action: "update",
+              conditions: stripCommandSkipTurn(liveEnemy.conditions),
+            },
+          ]);
+          await yieldCombatUiSync();
+          currentEntities = gameStateRef.current?.entities ?? entities;
+          order = gameStateRef.current?.combatOrder ?? order;
+          idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
+          commitCombatTurnIndex(idx);
+          processedEnemyTurnKeysRef.current.add(turnKey);
+          continue;
+        }
         if (processedEnemyTurnKeysRef.current.has(turnKey)) {
           // Snapshot stale / redéclenchement : ce tour a déjà été résolu, ne pas rejouer.
           if (debugMode) {
@@ -9180,15 +9823,8 @@ export default function ChatInterface() {
         if (!hasLivingPlayerCombatant(currentEntities)) {
           return;
         }
-        const arbiterAtEnemyTurnEnd = await runCombatTurnEndArbiter({
-          actorId: liveEnemy.id,
-          actorName: liveEnemy.name,
-          actorType: liveEnemy.type ?? null,
-        });
-        if (arbiterAtEnemyTurnEnd?.awaitingPlayerRoll === true) {
-          // Rare : fin de tour PNJ bloquée sur un jet — pas de clé « traité » pour permettre une reprise propre.
-          return;
-        }
+        // Désactivé volontairement : l'arbitre n'est appelé qu'au début de tour.
+        // Évite un 2e appel GM_ARBITER juste après le GM_TACTICIAN.
         processedEnemyTurnKeysRef.current.add(turnKey);
         // Surprise consommée dans `simulateSingleEnemyTurn` (branche surpris) — ne pas dupliquer ici.
       }
@@ -9529,6 +10165,7 @@ export default function ChatInterface() {
       }
       setHasDisengagedThisTurn(false);
       setSneakAttackArmed(false);
+      setSneakAttackExplicitArmed(false);
       setSneakAttackUsedThisTurn(false);
       // Ne pas utiliser setIsTyping ici : runCombatTurnStartArbiter est un hook mécanique
       // (surprise, CA, etc.) sans narration MJ — l’API peut être longue (ex. Gemini) et
@@ -9900,6 +10537,127 @@ export default function ChatInterface() {
   }, [registerCombatNextTurn]);
 
   /**
+   * Sorts utilitaires (Assistance, Bénédiction, Lumière, Détection de la magie).
+   * @returns {{ exitCallApi: boolean, suppressReply: boolean }}
+   */
+  async function handleCombatIntentSpellUtilityBranch(
+    intentResult,
+    postEntities,
+    effGameModeForIntent,
+    baseRoomId,
+    baseScene,
+    meleeCombatantIdForUtility
+  ) {
+    if (!intentResult?.runSpellUtility) {
+      return { exitCallApi: false, suppressReply: false };
+    }
+    const spellName = intentResult.runSpellUtility.spellName;
+    const target = intentResult.runSpellUtility.target;
+    const compErr = spellComponentsBlockReasonForPlayer(player, spellName);
+    if (compErr) {
+      addMessage("ai", `⚠️ ${compErr}`, undefined, makeMsgId());
+      return { exitCallApi: false, suppressReply: true };
+    }
+    const spell = SPELLS?.[spellName];
+    if (!spell || !target) {
+      addMessage("ai", `[DEBUG] runSpellUtility incohérent`, "debug", makeMsgId());
+      return { exitCallApi: false, suppressReply: true };
+    }
+    const resourceKind = resourceKindForCastingTime(spell.castingTime);
+    if (!hasResource(turnResourcesRef.current, effGameModeForIntent, resourceKind)) {
+      const label =
+        resourceKind === "bonus"
+          ? "Action bonus"
+          : resourceKind === "reaction"
+            ? "Réaction"
+            : "Action";
+      addMessage(
+        "ai",
+        `⚠ Vous avez déjà utilisé votre **${label}** ce tour-ci — impossible de lancer ${spellName} maintenant.`,
+        undefined,
+        makeMsgId()
+      );
+      return { exitCallApi: false, suppressReply: true };
+    }
+    const slotResult = spendSpellSlot(player, updatePlayer, spell.level ?? 0);
+    if (!slotResult.ok) {
+      addMessage(
+        "ai",
+        `⚠ Vous n'avez plus d'emplacements de sort disponibles pour lancer ${spellName}.`,
+        undefined,
+        makeMsgId()
+      );
+      return { exitCallApi: false, suppressReply: true };
+    }
+    const sm = getSpellRuntimeMeta(spellName);
+    const conc = !!sm.concentration;
+    const casterId = String(meleeCombatantIdForUtility ?? localCombatantId ?? "").trim();
+
+    const applyCondsToId = (entityId, condLine, baseConds) => {
+      const eid = String(entityId ?? "").trim();
+      if (eid && (eid === String(player?.id ?? "") || eid === String(localCombatantId ?? ""))) {
+        updatePlayer({ conditions: mergeConditions(baseConds ?? player?.conditions, condLine) });
+      } else {
+        applyEntityUpdates([
+          {
+            id: eid,
+            action: "update",
+            conditions: mergeConditions(baseConds, condLine),
+          },
+        ]);
+      }
+    };
+
+    if (conc) {
+      applyPlayerConcentrationSwap(spellName);
+    }
+
+    let summary = "";
+    if (spellName === "Assistance") {
+      const liveT = postEntities.find((e) => e && e.id === target.id) ?? target;
+      applyCondsToId(liveT.id, [BUFF_GUIDANCE], liveT.conditions);
+      guidancePromptBudgetRef.current = 1; // Valable uniquement pour le prochain prompt joueur.
+      summary = `**Assistance** — **${liveT.name}** peut ajouter **+1d4** à son prochain jet de caractéristique${conc ? " (concentration)" : ""}.`;
+    } else if (spellName === "Bénédiction") {
+      const picks = pickBlessTargetEntities(casterId, target, postEntities);
+      for (const p of picks) {
+        const live = postEntities.find((e) => e && e.id === p.id) ?? p;
+        applyCondsToId(live.id, [`${BUFF_BLESS} (+1d4 attaques/sauvegardes)`], live.conditions);
+      }
+      summary = `**Bénédiction** — ${picks.map((p) => p.name).join(", ")} reçoivent **+1d4** aux jets d'attaque et de sauvegarde${conc ? " (concentration)" : ""}.`;
+    } else if (spellName === "Lumière") {
+      const liveT = postEntities.find((e) => e && e.id === target.id) ?? target;
+      applyCondsToId(liveT.id, [`${BUFF_LIGHT} (lumière vive 6 m, 1 h)`], liveT.conditions);
+      summary = `**Lumière** — **${liveT.name}** émet une lumière vive sur 6 m pendant 1 h.`;
+    } else if (spellName === "Détection de la magie") {
+      const selfT = postEntities.find((e) => e && e.id === casterId) ?? target;
+      applyCondsToId(selfT.id, [`${BUFF_DETECT_MAGIC} (auras visibles)`], selfT.conditions ?? player?.conditions);
+      summary = `**Détection de la magie** — vous percevez les auras magiques à portée${conc ? " (concentration)" : ""}.`;
+    } else {
+      summary = `**${spellName}** est appliqué.`;
+    }
+
+    consumeResource(setTurnResourcesSynced, effGameModeForIntent, resourceKind);
+    const nextEntities = gameStateRef.current?.entities ?? postEntities;
+    ensureCombatState(nextEntities);
+
+    await callApi(`🎲 ${summary}`, "dice", false, {
+      entities: nextEntities,
+      currentRoomId: baseRoomId,
+      currentScene: baseScene,
+      currentSceneName,
+      gameMode: effGameModeForIntent,
+      engineEvent: {
+        kind: "spell_utility_resolution",
+        spellName,
+        targetId: target?.id ?? null,
+        slotLevelUsed: slotResult.usedLevel,
+      },
+    });
+    return { exitCallApi: true, suppressReply: true };
+  }
+
+  /**
    * Résolution d'un sort avec jet de sauvegarde après executeCombatActionIntent (GM ou parseur).
    * @returns {{ exitCallApi: boolean, suppressReply: boolean }}
    */
@@ -9930,6 +10688,22 @@ export default function ChatInterface() {
       );
       return { exitCallApi: false, suppressReply: true };
     }
+    const targetIdNorm = String(target?.id ?? "").trim();
+    const localMpIdNorm = clientId ? `mp-player-${String(clientId).trim()}` : "";
+    const targetResolvable =
+      postEntities.some((e) => String(e?.id ?? "").trim() === targetIdNorm) ||
+      targetIdNorm === String(player?.id ?? "").trim() ||
+      targetIdNorm === "player" ||
+      (localMpIdNorm && targetIdNorm === localMpIdNorm);
+    if (!targetResolvable) {
+      addMessage(
+        "ai",
+        `⚠ Cible introuvable (${target?.name ?? (targetIdNorm || "inconnue")}) : sort annulé, aucune ressource consommée.`,
+        "intent-error",
+        makeMsgId()
+      );
+      return { exitCallApi: true, suppressReply: true };
+    }
     const resourceKind = resourceKindForCastingTime(spell.castingTime);
     if (!hasResource(turnResourcesRef.current, effGameModeForIntent, resourceKind)) {
       const label =
@@ -9956,6 +10730,10 @@ export default function ChatInterface() {
       );
       return { exitCallApi: false, suppressReply: true };
     }
+    const sm = getSpellRuntimeMeta(canonicalSpellName);
+    if (sm.concentration) {
+      applyPlayerConcentrationSwap(canonicalSpellName);
+    }
     const dc = computeSpellSaveDC(player);
     const nat = debugNextRoll ?? (Math.floor(Math.random() * 20) + 1);
     if (debugNextRoll !== null) setDebugNextRoll(null);
@@ -9963,50 +10741,129 @@ export default function ChatInterface() {
     const total = nat + saveBonus;
     const succeeded = total >= dc;
 
-    const dmgNotation = String(spell.damage ?? "1d6");
-    const r = rollDiceDetailed(dmgNotation);
-    const fullDmg = r.total;
-    const baseDmg = Math.max(0, fullDmg);
-    const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
+    const saveDealsDamage =
+      intentResult.runSpellSave.saveDealsDamage !== undefined
+        ? !!intentResult.runSpellSave.saveDealsDamage
+        : spellHasDamageOnSave(spell);
 
-    let myUpdates = [];
-    if (target.type !== "hostile") {
-      myUpdates.push({ id: target.id, action: "update", type: "hostile" });
-    }
-
-    let hpBefore = target.hp?.current ?? null;
-    let hpAfter = hpBefore;
-    if (target.hp && finalDmg > 0) {
-      const newHp = Math.max(0, target.hp.current - finalDmg);
-      hpAfter = newHp;
-      if (newHp <= 0) {
-        myUpdates.push({ id: target.id, action: "kill" });
-      } else {
-        const idx = myUpdates.findIndex((u) => u.action === "update" && u.id === target.id);
-        if (idx >= 0) {
-          myUpdates[idx] = { ...myUpdates[idx], hp: { current: newHp, max: target.hp.max } };
-        } else {
-          myUpdates.push({
-            id: target.id,
-            action: "update",
-            hp: { current: newHp, max: target.hp.max },
-          });
-        }
+    if (!saveDealsDamage) {
+      let myUpdates = [];
+      if (!succeeded && canonicalSpellName === "Injonction") {
+        myUpdates.push({
+          id: target.id,
+          action: "update",
+          conditions: mergeConditions(target.conditions, CONDITION_INJONCTION_SKIP),
+        });
       }
-    }
+      myUpdates = markSceneHostilesAware(postEntities, myUpdates);
+      const nextEntities = myUpdates.length ? applyUpdatesLocally(postEntities, myUpdates) : postEntities;
+      if (myUpdates.length) applyEntityUpdates(myUpdates);
+      ensureCombatState(nextEntities);
+      consumeResource(setTurnResourcesSynced, effGameModeForIntent, resourceKind);
 
-    myUpdates = markSceneHostilesAware(postEntities, myUpdates);
-    const nextEntities = myUpdates.length
-      ? applyUpdatesLocally(postEntities, myUpdates)
-      : postEntities;
-    if (myUpdates.length) applyEntityUpdates(myUpdates);
-    ensureCombatState(nextEntities);
+      const saveLabel = `${spell.save}`;
+      const bonusStr = fmtMod(saveBonus);
+      const saveLine =
+        nat === 20
+          ? `Nat **20** (réussite automatique)`
+          : nat === 1
+            ? `Nat **1** (échec automatique)`
+            : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
+      const effectLine = succeeded
+        ? `✔ **Réussite** — la cible résiste à l'effet.`
+        : `✖ **Échec** — la cible subit l'effet du sort.${
+            canonicalSpellName === "Injonction" ? " Elle **perd son prochain tour** (obéissance)." : ""
+          }`;
+      const content = `🎲 Jet de sauvegarde (${saveLabel} pour ${canonicalSpellName} → ${target.name}) — ${saveLine}\n${effectLine}`;
+
+      addMessage(
+        "ai",
+        `[DEBUG] Résolution sort (save, sans dégâts) ${canonicalSpellName}\n` +
+          safeJson({
+            targetId: target.id,
+            saveType: spell.save,
+            nat,
+            total,
+            dc,
+            succeeded,
+            slotLevelUsed: slotResult.usedLevel,
+          }),
+        "debug",
+        makeMsgId()
+      );
+
+      await callApi(content, "dice", false, {
+        entities: nextEntities,
+        currentRoomId: baseRoomId,
+        currentScene: baseScene,
+        currentSceneName,
+        gameMode: effGameModeForIntent,
+        engineEvent: {
+          kind: "spell_save_resolution",
+          spellName: canonicalSpellName,
+          targetId: target.id,
+          saveType: spell.save,
+          nat,
+          total,
+          dc,
+          succeeded,
+          damage: 0,
+          targetHpBefore: target.hp?.current ?? null,
+          targetHpAfter: target.hp?.current ?? null,
+          targetHpMax: target.hp?.max ?? null,
+          targetIsAlive: target.isAlive !== false,
+          slotLevelUsed: slotResult.usedLevel,
+          noDamageSave: true,
+        },
+      });
+      return { exitCallApi: true, suppressReply: true };
+    }
 
     consumeResource(setTurnResourcesSynced, effGameModeForIntent, resourceKind);
+    const saveLabel = `${spell.save}`;
+    const bonusStr = fmtMod(saveBonus);
+    const saveLine =
+      nat === 20
+        ? `Nat **20** ðŸ’¥ (réussite automatique)`
+        : nat === 1
+          ? `Nat **1** ðŸ’€ (échec automatique)`
+          : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
+    const fullSaveLine =
+      `ðŸŽ² Jet de sauvegarde (${saveLabel} pour ${canonicalSpellName} â†’ ${target.name}) â€” ${saveLine}`;
+    const dmgNotation = String(spell.damage ?? "1d6");
+    const splitDmg = splitDiceNotationAndFlatBonus(dmgNotation);
+    const pendingDmg = stampPendingRollForActor(
+      buildPendingDiceRoll({
+        roll: splitDmg.diceNotation,
+        totalBonus: splitDmg.flatBonus,
+        stat: "Dégâts",
+        skill: canonicalSpellName,
+        raison: `Dégâts (${canonicalSpellName} → ${target.name}) — après sauvegarde`,
+        weaponName: canonicalSpellName,
+        targetId: target.id,
+        engineContext: {
+          stage: "spell_save_followup",
+          spellName: canonicalSpellName,
+          targetId: target.id,
+          saveSucceeded: succeeded,
+          saveLine: fullSaveLine,
+          saveType: spell.save,
+          saveNat: nat,
+          saveTotal: total,
+          saveDc: dc,
+          saveDamageOnSuccessMode: spellSaveDamageOnSuccessMode(spell),
+          spellDamageType: spell.damageType ?? "",
+          dmgNotation,
+          slotResult,
+        },
+      }),
+      player,
+      clientId
+    );
 
     addMessage(
       "ai",
-      `[DEBUG] Résolution sort (save) ${canonicalSpellName} [actionIntent]\n` +
+      `[DEBUG] Résolution sort (save) ${canonicalSpellName} [actionIntent] — dégâts en attente\n` +
         safeJson({
           targetId: target.id,
           targetName: target.name,
@@ -10016,63 +10873,14 @@ export default function ChatInterface() {
           total,
           dc,
           succeeded,
-          damage: finalDmg,
-          hpBefore,
-          hpAfter,
           slotLevelUsed: slotResult.usedLevel,
           resourceKind,
         }),
       "debug",
       makeMsgId()
     );
-
-    const saveLabel = `${spell.save}`;
-    const bonusStr = fmtMod(saveBonus);
-    const saveLine =
-      nat === 20
-        ? `Nat **20** ðŸ’¥ (réussite automatique)`
-        : nat === 1
-          ? `Nat **1** ðŸ’€ (échec automatique)`
-          : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
-    const outcome = succeeded
-      ? "âœ” Réussite â€” dégâts réduits."
-      : "âœ– Ã‰chec â€” dégâts complets.";
-    let dmgDetail = formatDiceNotationDetail(r, dmgNotation);
-    if (succeeded) {
-      dmgDetail += " â†’ moitié dégâts";
-    }
-    const dmgLine =
-      finalDmg > 0
-        ? `${dmgDetail} = **${finalDmg} dégâts ${spell.damageType ?? ""}**`
-        : "Aucun dégât.";
-
-    const content =
-      `ðŸŽ² Jet de sauvegarde (${saveLabel} pour ${canonicalSpellName} â†’ ${target.name}) â€” ${saveLine}\n` +
-      `${outcome} ${dmgLine}.`;
-
-    await callApi(content, "dice", false, {
-      entities: nextEntities,
-      currentRoomId: baseRoomId,
-      currentScene: baseScene,
-      currentSceneName,
-      gameMode: effGameModeForIntent,
-      engineEvent: {
-        kind: "spell_save_resolution",
-        spellName: canonicalSpellName,
-        targetId: target.id,
-        saveType: spell.save,
-        nat,
-        total,
-        dc,
-        succeeded,
-        damage: finalDmg,
-        targetHpBefore: hpBefore,
-        targetHpAfter: hpAfter,
-        targetHpMax: target.hp?.max ?? null,
-        targetIsAlive: hpAfter === null ? true : hpAfter > 0,
-        slotLevelUsed: slotResult.usedLevel,
-      },
-    });
+    pendingRollRef.current = pendingDmg;
+    setPendingRoll(pendingDmg);
     return { exitCallApi: true, suppressReply: true };
   }
 
@@ -10119,6 +10927,20 @@ export default function ChatInterface() {
       typeof meleeCombatantIdForResolve === "string" && meleeCombatantIdForResolve.trim()
         ? meleeCombatantIdForResolve.trim()
         : localCombatantId;
+    const intentTypeNorm = String(actionIntentNorm?.type ?? "").trim();
+    const isWeaponAttackIntent =
+      intentTypeNorm === "attack" || intentTypeNorm === "move_and_attack";
+    const rogueAutoSneakInCombat =
+      String(combatPlayer?.entityClass ?? "").trim() === "Roublard" &&
+      (gameStateRef.current?.gameMode ?? gameMode) === "combat" &&
+      isWeaponAttackIntent;
+    if (rogueAutoSneakInCombat && !sneakAttackUsedThisTurn) {
+      setSneakAttackArmed(true);
+      setSneakAttackExplicitArmed(textWantsSneakAttack(userTextForResolve));
+    } else if (!isWeaponAttackIntent) {
+      setSneakAttackArmed(false);
+      setSneakAttackExplicitArmed(false);
+    }
     // Après await parse-intent, le closure React peut être périmé ; l’index « live » est tenu
     // à jour par commitCombatTurnIndex (sync) + chaque rendu.
     const live = gameStateRef.current;
@@ -10322,9 +11144,11 @@ export default function ChatInterface() {
       setHasDisengagedThisTurn,
       hasDisengagedThisTurn,
       consumeResource,
+      setCombatHiddenIds,
       addMessage,
       makeMsgId,
       userContent: userTextForResolve,
+      sneakAttackUsedThisTurn,
       parserMinimalNarration: true,
       localCombatantId: meleeIdForCombat,
       dodgeActiveByCombatantIdRef,
@@ -10394,6 +11218,18 @@ export default function ChatInterface() {
       return;
     }
 
+    if (intentResult.runSpellUtility) {
+      await handleCombatIntentSpellUtilityBranch(
+        intentResult,
+        postEntities,
+        effGameModeForIntent,
+        baseRoomId,
+        baseScene,
+        meleeCombatantIdForResolve
+      );
+      return;
+    }
+
     if (intentResult.pendingRoll) {
       const stamped = stampPendingRollForActor(
         intentResult.pendingRoll,
@@ -10425,6 +11261,10 @@ export default function ChatInterface() {
 
     const resolution = String(apiDecision.resolution ?? "").trim();
     const effectiveActingPlayer = actingPlayerOverride ?? player ?? null;
+    const rollSubmitterClientId =
+      rollAttribution?.submitterClientId != null && String(rollAttribution.submitterClientId).trim()
+        ? String(rollAttribution.submitterClientId).trim()
+        : String(clientId ?? "").trim() || null;
     if (resolution === "unclear_input") {
       const reason =
         typeof apiDecision.reason === "string" && apiDecision.reason.trim()
@@ -10820,6 +11660,7 @@ export default function ChatInterface() {
               rollRequestSummary: { kind: "gm_secret", roll: rollNotation },
             },
             actingPlayerOverride: effectiveActingPlayer,
+            commandSubmitterClientId: rollSubmitterClientId,
           });
           if (resolved?.awaitingPlayerRoll === true) return;
           await callApi(
@@ -11071,8 +11912,13 @@ export default function ChatInterface() {
       }
     }
 
+    const parseIntentMode = String(baseGameModeForResolve ?? "").trim();
+    const liveModeAfterIntent = String(gameStateRef.current?.gameMode ?? "").trim();
+    // L'arbitre de scène doit suivre le mode vu par parse-intent pour CE message.
+    // Sinon un basculement asynchrone de `gameStateRef.current.gameMode` peut court-circuiter
+    // l'appel /api/gm-arbiter, puis on part directement au narrateur (symptôme observé).
     const explorationAfterIntent =
-      (gameStateRef.current?.gameMode ?? baseGameModeForResolve) === "exploration";
+      parseIntentMode === "exploration" || liveModeAfterIntent === "exploration";
 
     const engineEventBeforeArbiter = engineEvent;
     const hadIntentSceneTransition =
@@ -11107,7 +11953,8 @@ export default function ChatInterface() {
             sceneUpdate: hadIntentSceneTransition ? null : sceneUpdate ?? null,
             parseIntentNavigationApplied: hadIntentSceneTransition ? true : undefined,
           },
-            actingPlayerOverride: effectiveActingPlayer,
+          actingPlayerOverride: effectiveActingPlayer,
+          commandSubmitterClientId: rollSubmitterClientId,
         });
         nextEntities = resolved?.nextEntities ?? nextEntities;
         nextRoomId = resolved?.nextRoomId ?? nextRoomId;
@@ -11129,17 +11976,16 @@ export default function ChatInterface() {
         skipSceneRulesResolvedPipeline = true;
       } catch (e) {
         const errMsg = String(e?.message ?? e) || "GM Arbitre (scène) indisponible.";
-        if (debugMode) {
-          addMessage(
-            "ai",
-            `[DEBUG] Erreur GM Arbitre de scène (après parse-intent): ${errMsg}`,
-            "debug",
-            makeMsgId()
-          );
-        }
+        console.error("[scene-arbiter] échec après parse-intent", e);
         addMessage(
           "ai",
-          "L'arbitrage des règles du lieu (étape IA avant la narration) a échoué. Le MJ raconte quand même la suite — pièges / effets secrets du lieu n'ont peut-être pas été appliqués.",
+          `[DEBUG] Erreur GM Arbitre de scène (après parse-intent): ${errMsg}`,
+          "debug",
+          makeMsgId()
+        );
+        addMessage(
+          "ai",
+          `L'arbitrage des règles du lieu (étape IA avant la narration) a échoué [ARB_ERR:${errMsg}]. Le MJ raconte quand même la suite — pièges / effets secrets du lieu n'ont peut-être pas été appliqués.`,
           "meta-reply",
           makeMsgId()
         );
@@ -11437,6 +12283,7 @@ export default function ChatInterface() {
     intentDecision = null,
     arbiterTrigger = null,
     actingPlayerOverride = null,
+    commandSubmitterClientId = null,
     reentryDepth = 0,
     transitionResolutionNote = null,
   }) {
@@ -11453,6 +12300,10 @@ export default function ChatInterface() {
       scope: campaignContextScope,
     });
     const effectiveActingPlayer = actingPlayerOverride ?? player ?? null;
+    const effectiveCommandSubmitterClientId =
+      typeof commandSubmitterClientId === "string" && commandSubmitterClientId.trim()
+        ? commandSubmitterClientId.trim()
+        : String(clientId ?? "").trim() || null;
     const postArbiter = async (rollResult = null, worldContextOverride = null) => {
       const visibleExitsForRoom = getVisibleExitsForRoom(roomId, getRoomMemory(roomId));
       const trig = arbiterTrigger ?? null;
@@ -11724,6 +12575,47 @@ export default function ChatInterface() {
           audience === "global" || audience === "selected"
             ? pendingCore
             : stampPendingRollForActor(pendingCore, effectiveActingPlayer, clientId);
+        if (
+          audience === "single" &&
+          stealthLike &&
+          baseGameMode === "combat"
+        ) {
+          const hiderId =
+            String(arbiterTrigger?.actorId ?? "").trim() ||
+            String(localCombatantId ?? "").trim() ||
+            (effectiveActingPlayer?.id != null ? String(effectiveActingPlayer.id).trim() : "");
+          if (hiderId && (getMeleeWith(hiderId) ?? []).length > 0) {
+            addMessage(
+              "ai",
+              "🚫 **Se cacher** — action refusée : impossible d'être caché au corps à corps d'une autre créature.",
+              "intent-error",
+              makeMsgId()
+            );
+            return finalDecision;
+          }
+        }
+        if (audience === "single" && baseGameMode === "combat") {
+          const rrActorId =
+            String(arbiterTrigger?.actorId ?? "").trim() ||
+            String(localCombatantId ?? "").trim() ||
+            (effectiveActingPlayer?.id != null ? String(effectiveActingPlayer.id).trim() : "");
+          const trForCheckGate =
+            rrActorId &&
+            turnResourcesByCombatantId &&
+            typeof turnResourcesByCombatantId === "object" &&
+            turnResourcesByCombatantId[rrActorId]
+              ? normalizeTurnResourcesInput(turnResourcesByCombatantId[rrActorId])
+              : normalizeTurnResourcesInput(turnResourcesRef.current);
+          if (!trForCheckGate?.action) {
+            addMessage(
+              "ai",
+              "⚠ Action impossible : l'action de ce tour a déjà été consommée.",
+              "intent-error",
+              makeMsgId()
+            );
+            return finalDecision;
+          }
+        }
         pendingRollRef.current = pendingFromSceneArbiter;
         setPendingRoll(pendingFromSceneArbiter);
         addMessage(
@@ -11791,34 +12683,152 @@ export default function ChatInterface() {
 
     const plannedUpdatesRaw = Array.isArray(finalDecision?.entityUpdates) ? finalDecision.entityUpdates : [];
     const hookPhase = String(arbiterTrigger?.phase ?? "").trim();
-    const plannedUpdates =
+    // Garde-fou: en hook de tour combat, l'arbitre ne doit pas "re-résoudre" un jet de sauvegarde
+    // déjà traité par le moteur (ex. Injonction) via un engineEvent narratif seul.
+    if (hookPhase === "combat_turn_start" || hookPhase === "combat_turn_end") {
+      const actorIdNow = String(arbiterTrigger?.actorId ?? "").trim();
+      const actorNow = actorIdNow
+        ? (Array.isArray(entitiesBaseForPlannedUpdates) ? entitiesBaseForPlannedUpdates : []).find(
+            (e) => String(e?.id ?? "").trim() === actorIdNow
+          )
+        : null;
+      const actorHasCommandSkip = Array.isArray(actorNow?.conditions)
+        ? actorNow.conditions.some((c) => String(c ?? "").trim() === CONDITION_INJONCTION_SKIP)
+        : false;
+      const eventDetails = String(finalDecision?.engineEvent?.details ?? "").toLowerCase();
+      const reasonLow = String(finalDecision?.reason ?? "").toLowerCase();
+      const mentionsSpellSaveOrCommand =
+        /injonction|sauvegarde|perd son tour|obéissance|obeissance/.test(`${eventDetails} ${reasonLow}`);
+      const hasMechanicalDelta =
+        plannedUpdatesRaw.length > 0 ||
+        (finalDecision?.sceneUpdate?.hasChanged === true &&
+          typeof finalDecision?.sceneUpdate?.targetRoomId === "string" &&
+          finalDecision.sceneUpdate.targetRoomId.trim().length > 0) ||
+        !!finalDecision?.rollRequest ||
+        (typeof finalDecision?.timeAdvanceMinutes === "number" &&
+          Number.isFinite(finalDecision.timeAdvanceMinutes) &&
+          finalDecision.timeAdvanceMinutes > 0) ||
+        (Array.isArray(finalDecision?.crossRoomEntityUpdates) &&
+          finalDecision.crossRoomEntityUpdates.length > 0) ||
+        (Array.isArray(finalDecision?.crossRoomMoves) && finalDecision.crossRoomMoves.length > 0) ||
+        (Array.isArray(finalDecision?.crossRoomMemoryAppend) &&
+          finalDecision.crossRoomMemoryAppend.length > 0);
+      if (mentionsSpellSaveOrCommand && !actorHasCommandSkip && !hasMechanicalDelta) {
+        if (debugMode) {
+          addMessage(
+            "ai",
+            `[DEBUG] GM Arbitre neutralisé (hook combat) : tentative de re-résolution Injonction/sauvegarde sans état mécanique actif.`,
+            "debug",
+            makeMsgId()
+          );
+        }
+        finalDecision = {
+          ...(finalDecision && typeof finalDecision === "object" ? finalDecision : {}),
+          resolution: "no_roll_needed",
+          reason: "Aucune mécanique de salle à appliquer (résolution de sort déjà gérée par le moteur).",
+          engineEvent: null,
+          entityUpdates: null,
+          sceneUpdate: null,
+          rollRequest: null,
+          timeAdvanceMinutes: null,
+          roomMemoryAppend: null,
+          crossRoomEntityUpdates: null,
+          crossRoomMoves: null,
+          crossRoomMemoryAppend: null,
+        };
+      }
+    }
+    const plannedUpdatesBase =
       hookPhase === "combat_turn_start" || hookPhase === "combat_turn_end"
         ? plannedUpdatesRaw.filter((u) => {
             if (!u || typeof u !== "object") return false;
             if (String(u.action ?? "update").trim() !== "update") return true;
-            if (!Object.prototype.hasOwnProperty.call(u, "surprised")) return true;
-            if (u.surprised !== true) return true;
             const uid = String(u.id ?? "").trim();
-            if (!uid) return true;
-            const cur = (Array.isArray(entitiesBaseForPlannedUpdates) ? entitiesBaseForPlannedUpdates : []).find(
-              (e) => String(e?.id ?? "").trim() === uid
-            );
+            const cur = uid
+              ? (Array.isArray(entitiesBaseForPlannedUpdates) ? entitiesBaseForPlannedUpdates : []).find(
+                  (e) => String(e?.id ?? "").trim() === uid
+                )
+              : null;
+
             // Hooks de tour combat : ne jamais réarmer `surprised:true` une fois consommé.
             // Sinon un PNJ peut être re-surpris en boucle à chaque sync/tour joueur.
-            if (cur && cur.isAlive === true && cur.surprised === false) {
+            if (Object.prototype.hasOwnProperty.call(u, "surprised") && u.surprised === true) {
+              if (cur && cur.isAlive === true && cur.surprised === false) {
+                if (debugMode) {
+                  addMessage(
+                    "ai",
+                    `[DEBUG] GM Arbitre ignoré (hook combat) : réapplication interdite de surprised=true sur ${cur.name ?? uid}.`,
+                    "debug",
+                    makeMsgId()
+                  );
+                }
+                return false;
+              }
+            }
+
+            // Garde-fou Injonction : au début du tour ennemi, ignorer un "conditions: []" arbitre
+            // qui effacerait le marqueur avant la logique de skip de tour.
+            if (
+              hookPhase === "combat_turn_start" &&
+              Object.prototype.hasOwnProperty.call(u, "conditions") &&
+              Array.isArray(u.conditions) &&
+              u.conditions.length === 0 &&
+              Array.isArray(cur?.conditions) &&
+              cur.conditions.some((c) => String(c ?? "").trim() === CONDITION_INJONCTION_SKIP)
+            ) {
               if (debugMode) {
                 addMessage(
                   "ai",
-                  `[DEBUG] GM Arbitre ignoré (hook combat) : réapplication interdite de surprised=true sur ${cur.name ?? uid}.`,
+                  `[DEBUG] GM Arbitre ignoré (hook combat) : conservation de l'effet Injonction sur ${cur?.name ?? uid} jusqu'au skip de tour.`,
                   "debug",
                   makeMsgId()
                 );
               }
               return false;
             }
+
             return true;
           })
         : plannedUpdatesRaw;
+
+    // Multijoueur: les updates arbitre `id:"player"` doivent cibler le soumetteur
+    // (`mp-player-<cid>`), sinon `applyEntityUpdates` les ignore côté contexte MP.
+    const plannedUpdates =
+      multiplayerSessionId && effectiveCommandSubmitterClientId
+        ? plannedUpdatesBase.map((u) => {
+            if (!u || typeof u !== "object") return u;
+            if (String(u.id ?? "").trim() !== "player") return u;
+            const sub = String(effectiveCommandSubmitterClientId).trim();
+            const localCid = String(clientId ?? "").trim();
+            const mpTargetId = `mp-player-${sub}`;
+            let next = { ...u, id: mpTargetId };
+            const hasInv = next.inventory !== undefined || next.lootItems !== undefined;
+            if (hasInv) {
+              const baseInv = Array.isArray(effectiveActingPlayer?.inventory)
+                ? effectiveActingPlayer.inventory
+                : Array.isArray(player?.inventory)
+                  ? player.inventory
+                  : [];
+              const nextInv = stackInventory(
+                Array.isArray(next.inventory)
+                  ? next.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
+                  : Array.isArray(next.lootItems)
+                    ? [...baseInv, ...next.lootItems.map((x) => String(x ?? "").trim()).filter(Boolean)]
+                    : [...baseInv]
+              );
+              if (typeof patchParticipantProfileInventory === "function") {
+                void patchParticipantProfileInventory(sub, nextInv);
+              }
+              if (sub === localCid) {
+                updatePlayer({ inventory: nextInv });
+              }
+              const { inventory: _inv, lootItems: _loot, ...rest } = next;
+              next = { ...rest, id: mpTargetId };
+            }
+            return next;
+          })
+        : plannedUpdatesBase;
+
     const plannedEntitiesAfterLocalUpdates = plannedUpdates.length
       ? applyUpdatesLocally(entitiesBaseForPlannedUpdates, plannedUpdates)
       : entitiesBaseForPlannedUpdates;
@@ -11903,7 +12913,24 @@ export default function ChatInterface() {
         if (!isSameRoomTransition) {
           // Un sceneUpdate change de salle: les entités actives deviennent celles de la salle cible.
           // Garder `nextEntities` (salle source) ici provoque un "TP" visuel/métier des créatures.
-          nextEntities = takeEntitiesForRoom(tid);
+          const sourceIds = new Set(
+            (Array.isArray(nextEntities) ? nextEntities : [])
+              .map((e) => String(e?.id ?? "").trim())
+              .filter(Boolean)
+          );
+          nextEntities = (takeEntitiesForRoom(tid) ?? []).filter((e) => {
+            const id = String(e?.id ?? "").trim();
+            if (!id || !sourceIds.has(id)) return true;
+            const isHostile = String(e?.type ?? "").toLowerCase() === "hostile";
+            const hpCur =
+              typeof e?.hp?.current === "number" && Number.isFinite(e.hp.current)
+                ? Math.trunc(e.hp.current)
+                : null;
+            const isDeadLike = e?.isAlive === false || (hpCur != null && hpCur <= 0);
+            // Garde-fou anti "cadavres téléportés" : si une entité hostile morte
+            // existe déjà dans la salle source, ne pas la réinjecter dans la salle cible.
+            return !(isHostile && isDeadLike);
+          });
         }
 
         setCurrentRoomId(nextRoomId);
@@ -12398,18 +13425,58 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
 
     if (kind === "gm_secret_resolution") return false;
 
+    // Règle stricte demandée : si l'arbitre dit "no_roll_needed",
+    // on ne déclenche jamais de narration GM depuis ce hook.
+    if (cleanResolution === "no_roll_needed") return false;
+
     if (cleanPhase === "combat_turn_end") {
       return false;
     }
 
   if (cleanPhase === "combat_turn_start") {
-    // Les hooks de début de tour combat sont mécaniques (états, auras, ajustements, etc.).
-    // Narrer ici crée du bruit et des doublons visibles "avant/après" les fins de tour.
-    // On conserve donc ces résolutions côté moteur, sans narration GM automatique.
-    return false;
+    // En début de tour combat, on garde le silence sur le purement procédural,
+    // mais on autorise la narration quand l'arbitre applique un événement spécial visible.
+    const combined = `${details} ${reason}`.trim();
+    if (!combined) return false;
+    if (cleanResolution !== "apply_consequences") return false;
+    if (isPurelyProceduralNarratorReason(combined)) return false;
+    return true;
   }
 
     return !!details || !!reason;
+  }
+
+  function hasMeaningfulCombatStateDiff(beforeEntities, afterEntities) {
+    const before = Array.isArray(beforeEntities) ? beforeEntities : [];
+    const after = Array.isArray(afterEntities) ? afterEntities : [];
+    if (before.length !== after.length) return true;
+    const beforeById = new Map(before.map((e) => [String(e?.id ?? ""), e]).filter(([id]) => !!id));
+    const afterById = new Map(after.map((e) => [String(e?.id ?? ""), e]).filter(([id]) => !!id));
+    if (beforeById.size !== afterById.size) return true;
+    const sameArray = (a, b) => {
+      const aa = Array.isArray(a) ? a.map((x) => String(x)).sort() : [];
+      const bb = Array.isArray(b) ? b.map((x) => String(x)).sort() : [];
+      if (aa.length !== bb.length) return false;
+      for (let i = 0; i < aa.length; i += 1) if (aa[i] !== bb[i]) return false;
+      return true;
+    };
+    for (const [id, prev] of beforeById.entries()) {
+      const next = afterById.get(id);
+      if (!next) return true;
+      const prevHpCur = prev?.hp?.current ?? null;
+      const nextHpCur = next?.hp?.current ?? null;
+      const prevHpMax = prev?.hp?.max ?? null;
+      const nextHpMax = next?.hp?.max ?? null;
+      if (prevHpCur !== nextHpCur || prevHpMax !== nextHpMax) return true;
+      if ((prev?.isAlive ?? true) !== (next?.isAlive ?? true)) return true;
+      if ((prev?.ac ?? null) !== (next?.ac ?? null)) return true;
+      if ((prev?.awareOfPlayer ?? null) !== (next?.awareOfPlayer ?? null)) return true;
+      if ((prev?.surprised ?? null) !== (next?.surprised ?? null)) return true;
+      if ((prev?.visible ?? null) !== (next?.visible ?? null)) return true;
+      if (!sameArray(prev?.conditions, next?.conditions)) return true;
+      if (!sameArray(prev?.combatTimedStates, next?.combatTimedStates)) return true;
+    }
+    return false;
   }
 
   async function runCombatTurnStartArbiter({
@@ -12456,7 +13523,15 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         typeof resolved?.engineEvent?.details === "string" ? resolved.engineEvent.details.trim() : "";
       const eventReason =
         typeof resolved?.engineEvent?.reason === "string" ? resolved.engineEvent.reason.trim() : "";
-      if (resolved?.shouldNarrateResolution === true && (eventDetails || eventReason)) {
+      const hasMeaningfulStateChange = hasMeaningfulCombatStateDiff(
+        activeEntities,
+        resolved?.nextEntities ?? activeEntities
+      );
+      if (
+        resolved?.shouldNarrateResolution === true &&
+        (eventDetails || eventReason) &&
+        (hasMeaningfulStateChange || String(resolved?.engineEvent?.kind ?? "") === "scene_transition")
+      ) {
         await callApi("", "meta", false, {
           hideUserMessage: true,
           bypassIntentParser: true,
@@ -12657,10 +13732,32 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       const priorAnyNaturalAt = naturalParserReplayKey
         ? recentNaturalParserCallsRef.current.get(naturalParserReplayKey) ?? 0
         : 0;
+      const textReplayKey = naturalNormText
+        ? `${naturalNormText}|${naturalSubmitterKey}`
+        : "";
+      const priorSameTextAt = textReplayKey
+        ? recentNaturalParserTextCallsRef.current.get(textReplayKey) ?? 0
+        : 0;
       if (naturalParserReplayKey && now - priorAnyNaturalAt < 90_000) {
         addMessage(
           "ai",
           `[DEBUG] Parse-intent dupliqué bloqué (replay caché): ${safeJson({
+            roomId: baseRoomId,
+            gameMode: baseGameMode,
+            text: String(userContent ?? "").slice(0, 140),
+          })}`,
+          "debug",
+          makeMsgId()
+        );
+        setIsTyping(false);
+        await releaseMultiplayerProcessingLock(sessionLockId);
+        if (naturalCallKey) naturalCallInFlightKeysRef.current.delete(naturalCallKey);
+        return;
+      }
+      if (textReplayKey && now - priorSameTextAt < 12_000) {
+        addMessage(
+          "ai",
+          `[DEBUG] Parse-intent dupliqué bloqué (replay caché cross-room): ${safeJson({
             roomId: baseRoomId,
             gameMode: baseGameMode,
             text: String(userContent ?? "").slice(0, 140),
@@ -12705,11 +13802,23 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     if (naturalParserReplayKey) {
       const now = Date.now();
       recentNaturalParserCallsRef.current.set(naturalParserReplayKey, now);
+      const textReplayKey = naturalNormText
+        ? `${naturalNormText}|${naturalSubmitterKey}`
+        : "";
+      if (textReplayKey) {
+        recentNaturalParserTextCallsRef.current.set(textReplayKey, now);
+      }
       if (recentNaturalParserCallsRef.current.size > 240) {
         const keep = new Map();
         const entries = Array.from(recentNaturalParserCallsRef.current.entries()).slice(-160);
         for (const [k, v] of entries) keep.set(k, v);
         recentNaturalParserCallsRef.current = keep;
+      }
+      if (recentNaturalParserTextCallsRef.current.size > 240) {
+        const keep = new Map();
+        const entries = Array.from(recentNaturalParserTextCallsRef.current.entries()).slice(-160);
+        for (const [k, v] of entries) keep.set(k, v);
+        recentNaturalParserTextCallsRef.current = keep;
       }
     }
     const userMsgId = makeMsgId();
@@ -13635,6 +14744,11 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                     : [...base]
               );
               void patchParticipantProfileInventory(sub, nextInv);
+              // Si la commande vient du client local, refléter immédiatement l'inventaire
+              // dans la fiche locale (sinon l'UI peut rester stale jusqu'au prochain sync).
+              if (sub === localCid) {
+                updatePlayer({ inventory: nextInv });
+              }
               const { inventory: _inv, lootItems: _loot, ...rest } = next;
               next = { ...rest, id: mpActing };
             }
@@ -13658,6 +14772,78 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             }
             return next;
           });
+        }
+      }
+
+      // Fallback robuste : si des updates visent encore `id:"player"` ici (singleplayer, ou cas MP
+      // sans submitter exploitable), on les applique directement à la fiche joueur locale.
+      // Sans cela, applyEntityUpdates (entités de scène) ignore ces updates et l'inventaire/PV
+      // peuvent sembler "perdus" après une résolution arbitre.
+      if (Array.isArray(normalizedEntityUpdates) && normalizedEntityUpdates.length > 0) {
+        const localPlayerUpdates = normalizedEntityUpdates.filter((u) => isPlayerEntityUpdate(u));
+        if (localPlayerUpdates.length > 0) {
+          for (const upd of localPlayerUpdates) {
+            if (!upd || typeof upd !== "object") continue;
+            if (!(upd.action === "update" || upd.action === "spawn")) continue;
+            const patch = {};
+            const currentInv = Array.isArray(player?.inventory) ? player.inventory : [];
+            if (Array.isArray(upd.inventory)) {
+              patch.inventory = stackInventory(
+                upd.inventory.map((x) => String(x ?? "").trim()).filter(Boolean)
+              );
+            } else if (Array.isArray(upd.lootItems) && upd.lootItems.length > 0) {
+              const gains = upd.lootItems.map((x) => String(x ?? "").trim()).filter(Boolean);
+              if (gains.length > 0) {
+                patch.inventory = stackInventory([...currentInv, ...gains]);
+              }
+            }
+            if (upd.hp !== undefined) {
+              if (typeof upd.hp === "number" && Number.isFinite(upd.hp)) {
+                patch.hp = {
+                  current: Math.max(0, Math.trunc(upd.hp)),
+                  max: Math.max(
+                    1,
+                    Math.trunc(player?.hp?.max ?? Math.max(1, Math.trunc(upd.hp)))
+                  ),
+                };
+              } else if (upd.hp && typeof upd.hp === "object") {
+                const nextCur =
+                  typeof upd.hp.current === "number" && Number.isFinite(upd.hp.current)
+                    ? Math.max(0, Math.trunc(upd.hp.current))
+                    : (player?.hp?.current ?? 0);
+                const nextMax =
+                  typeof upd.hp.max === "number" && Number.isFinite(upd.hp.max)
+                    ? Math.max(1, Math.trunc(upd.hp.max))
+                    : Math.max(1, Math.trunc(player?.hp?.max ?? nextCur));
+                patch.hp = { current: Math.min(nextCur, nextMax), max: nextMax };
+              }
+            }
+            if (upd.ac !== undefined && Number.isFinite(Number(upd.ac))) {
+              patch.ac = Math.max(0, Math.trunc(Number(upd.ac)));
+            }
+            if (Array.isArray(upd.conditions)) {
+              patch.conditions = upd.conditions
+                .map((x) => String(x ?? "").trim())
+                .filter(Boolean);
+            }
+            if (upd.spellSlots && typeof upd.spellSlots === "object" && !Array.isArray(upd.spellSlots)) {
+              patch.spellSlots = upd.spellSlots;
+            }
+            if (Object.keys(patch).length > 0) {
+              updatePlayer(patch);
+              // Multi : si `id:"player"` est traité localement (ex. submitter absent dans le flux),
+              // propager aussi l'inventaire vers le profil Firestore local pour éviter un rollback
+              // visuel au snapshot suivant.
+              if (
+                multiplayerSessionId &&
+                Array.isArray(patch.inventory) &&
+                String(clientId ?? "").trim()
+              ) {
+                void patchParticipantProfileInventory(String(clientId).trim(), patch.inventory);
+              }
+            }
+          }
+          normalizedEntityUpdates = normalizedEntityUpdates.filter((u) => !isPlayerEntityUpdate(u));
         }
       }
 
@@ -13815,9 +15001,11 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             setHasDisengagedThisTurn,
             hasDisengagedThisTurn,
             consumeResource,
+            setCombatHiddenIds,
             addMessage,
             makeMsgId,
             userContent,
+            sneakAttackUsedThisTurn,
             localCombatantId: actingMeleeCombatantId,
             dodgeActiveByCombatantIdRef,
             combatHiddenIds: gameStateRef.current?.combatHiddenIds ?? combatHiddenIds ?? [],
@@ -14208,6 +15396,77 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               );
               suppressReplyForThisResponse = true;
             } else {
+              const explicitSneakAsked = textWantsSneakAttack(userContent);
+              if (explicitSneakAsked && !isSpellAttack) {
+                const sneakActor = actingPlayer ?? player;
+                const isRogue = String(sneakActor?.entityClass ?? "").trim() === "Roublard";
+                const sneakActorId = String(actingMeleeCombatantId ?? localCombatantId ?? "").trim();
+                const sneakTargetId = String(effectiveRollRequest.targetId ?? "").trim();
+                const sneakTarget =
+                  baseEntities.find((e) => String(e?.id ?? "").trim() === sneakTargetId) ?? null;
+                const sneakWeapon =
+                  matchedWeaponForRoll ??
+                  player?.weapons?.find(
+                    (w) => normalizeFr(String(w?.name ?? "")) === normalizeFr(String(effectiveRollRequest.weaponName ?? ""))
+                  ) ??
+                  null;
+                const alreadyUsedSneak = !!sneakAttackUsedThisTurn;
+                const sneakAtkParts = computeWeaponAttackParts(sneakActor, sneakWeapon?.name ?? "");
+                const sneakWdb = sneakAtkParts?.weaponDb ?? null;
+                const sneakProps = Array.isArray(sneakWdb?.properties) ? sneakWdb.properties : [];
+                const sneakIsRanged = sneakProps.some((p) => normalizeFr(p).includes("munitions"));
+                const sneakIsFinesse = String(sneakWdb?.stat ?? "") === "FINESSE";
+                const finesseOrRanged = sneakIsRanged || sneakIsFinesse;
+                const sneakMeleeWith = getMeleeWith(sneakActorId);
+                const hiddenSet = new Set(
+                  Array.isArray(gameStateRef.current?.combatHiddenIds ?? combatHiddenIds)
+                    ? (gameStateRef.current?.combatHiddenIds ?? combatHiddenIds).map((id) => String(id ?? "").trim()).filter(Boolean)
+                    : []
+                );
+                const sneakAdvRes = computeAttackRollAdvDis({
+                  attackerHidden: hiddenSet.has(sneakActorId) || hiddenSet.has("player"),
+                  targetHidden: !!(sneakTargetId && hiddenSet.has(sneakTargetId)),
+                  attackerConditions: normalizeCombatantConditions({ conditions: sneakActor?.conditions }),
+                  targetConditions: normalizeCombatantConditions(sneakTarget),
+                  isMeleeAttack: !sneakIsRanged,
+                  isRangedAttack: sneakIsRanged,
+                  attackerRangedWeaponInMelee: sneakIsRanged && sneakMeleeWith.some((mid) => {
+                    const e = baseEntities.find((x) => String(x?.id ?? "").trim() === String(mid ?? "").trim());
+                    return e && e.isAlive !== false && e.type === "hostile";
+                  }),
+                  targetHasDodgeActive: !!(sneakTargetId && dodgeActiveByCombatantIdRef?.current?.[sneakTargetId]),
+                });
+                let allyAdjacentForSneak = false;
+                if (sneakTargetId) {
+                  for (const pid of getMeleeWith(sneakTargetId) ?? []) {
+                    if (String(pid ?? "").trim() === sneakActorId) continue;
+                    const e = baseEntities.find((x) => String(x?.id ?? "").trim() === String(pid ?? "").trim());
+                    if (e && e.isAlive !== false && controllerForCombatantId(e.id, baseEntities) === "player") {
+                      allyAdjacentForSneak = true;
+                      break;
+                    }
+                  }
+                }
+                const sneakEligibleFromRules =
+                  sneakAdvRes.adv === true || (allyAdjacentForSneak && sneakAdvRes.dis !== true);
+                let rejectSneakMsg = "";
+                if (!isRogue) {
+                  rejectSneakMsg = "⚠ Action refusée : seule la classe **Roublard** peut déclarer une attaque sournoise.";
+                } else if (alreadyUsedSneak) {
+                  rejectSneakMsg = "⚠ Action refusée : l'attaque sournoise a déjà été utilisée ce tour-ci.";
+                } else if (!finesseOrRanged) {
+                  rejectSneakMsg = "⚠ Action refusée : l'attaque sournoise exige une arme **finesse** ou **à distance**.";
+                } else if (!sneakEligibleFromRules) {
+                  rejectSneakMsg =
+                    "⚠ Action refusée : l'attaque sournoise exige l'avantage, ou un allié au contact de la cible sans désavantage.";
+                }
+                if (rejectSneakMsg) {
+                  addMessage("ai", rejectSneakMsg, multiplayerSessionId ? "meta" : "intent-error", makeMsgId());
+                  suppressReplyForThisResponse = true;
+                  effectiveRollRequest = null;
+                  return;
+                }
+              }
               // Règle moteur (ToM) : si engagé au corps Ã  corps et pas désengagé,
               // on bloque les attaques Ã  distance / sorts Ã  distance (sinon il faudrait gérer le désavantage).
               const weaponName = String(effectiveRollRequest.weaponName ?? "");
@@ -14323,7 +15582,13 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                   const r = rollDiceDetailed(dmgNotation);
                   const fullDmg = r.total;
                   const baseDmg = Math.max(0, fullDmg);
-                  const finalDmg = succeeded ? Math.floor(baseDmg / 2) : baseDmg;
+                  const saveDamageOnSuccessMode = spellSaveDamageOnSuccessMode(spell);
+                  const finalDmg =
+                    succeeded && saveDamageOnSuccessMode === "none"
+                      ? 0
+                      : succeeded
+                        ? Math.floor(baseDmg / 2)
+                        : baseDmg;
 
                   let myUpdates = [];
                   if (target.type !== "hostile") {
@@ -14385,9 +15650,13 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                       : nat === 1
                       ? `Nat **1** ðŸ’€ (échec automatique)`
                       : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}`;
-                  const outcome = succeeded ? "âœ” Réussite â€” dégâts réduits." : "âœ– Ã‰chec â€” dégâts complets.";
+                  const outcome = succeeded
+                    ? saveDamageOnSuccessMode === "none"
+                      ? "âœ” Réussite â€” aucun dégât."
+                      : "âœ” Réussite â€” dégâts réduits."
+                    : "âœ– Ã‰chec â€” dégâts complets.";
                   let dmgDetail = formatDiceNotationDetail(r, dmgNotation);
-                  if (succeeded) {
+                  if (succeeded && saveDamageOnSuccessMode !== "none") {
                     dmgDetail += " â†’ moitié dégâts";
                   }
                   const dmgLine =
@@ -14430,7 +15699,31 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
 
               // Pas un sort Ã  save â†’ on ouvre un rollRequest d'attaque normal pour le joueur.
               const stampedAtk = stampPendingRollForActor(
-                effectiveRollRequest,
+                {
+                  ...effectiveRollRequest,
+                  engineContext: {
+                    ...(effectiveRollRequest?.engineContext && typeof effectiveRollRequest.engineContext === "object"
+                      ? effectiveRollRequest.engineContext
+                      : {}),
+                    attackerHiddenAtIntent: (() => {
+                      const hiddenIds = gameStateRef.current?.combatHiddenIds ?? combatHiddenIds ?? [];
+                      const hiddenSet = new Set(
+                        Array.isArray(hiddenIds)
+                          ? hiddenIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+                          : []
+                      );
+                      const localId = String(localCombatantId ?? "").trim();
+                      const mpLocalId = multiplayerSessionId ? `mp-player-${String(rollSubmitterClientId ?? "").trim()}` : "";
+                      const actingId = String(actingMeleeCombatantId ?? "").trim();
+                      return (
+                        (actingId && hiddenSet.has(actingId)) ||
+                        (localId && hiddenSet.has(localId)) ||
+                        hiddenSet.has("player") ||
+                        (!!mpLocalId && hiddenSet.has(mpLocalId))
+                      );
+                    })(),
+                  },
+                },
                 actingPlayer,
                 rollSubmitterClientId
               );
@@ -14473,6 +15766,41 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             }
 
             const skill = effectiveRollRequest.skill ?? null;
+            if (
+              kind === "check" &&
+              (gameStateRef.current?.gameMode ?? gameMode) === "combat" &&
+              !turnResourcesForAttackGate?.action
+            ) {
+              addMessage(
+                "ai",
+                "⚠ Action impossible : l'action de ce tour a déjà été consommée.",
+                undefined,
+                makeMsgId()
+              );
+              return;
+            }
+            const skillNorm = normalizeSkillName(skill);
+            if (
+              kind === "check" &&
+              skillNorm === "Stealth" &&
+              (gameStateRef.current?.gameMode ?? gameMode) === "combat"
+            ) {
+              const actorIdFromRequest = String(effectiveRollRequest.actorId ?? "").trim();
+              const actorCombatantId =
+                actorIdFromRequest ||
+                (multiplayerSessionId && rollSubmitterClientId
+                  ? `mp-player-${String(rollSubmitterClientId).trim()}`
+                  : String(localCombatantId ?? "").trim());
+              if (actorCombatantId && (getMeleeWith(actorCombatantId) ?? []).length > 0) {
+                addMessage(
+                  "ai",
+                  "🚫 **Se cacher** — action refusée : impossible d'être caché au corps à corps d'une autre créature.",
+                  "intent-error",
+                  makeMsgId()
+                );
+                return;
+              }
+            }
             const computed = computeCheckBonus({ player: actingPlayer, stat: effectiveRollRequest.stat, skill });
             const normalizedRoll = stampPendingRollForActor(
               { ...effectiveRollRequest, skill: skill ?? undefined, totalBonus: computed },
@@ -14596,7 +15924,22 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             // (ex: cadavres hostiles), ce qui les "téléporte" visuellement à tort.
             finalEntities = safeSceneUpdate.newEntities;
           } else {
-            finalEntities = takeEntitiesForRoom(tid);
+            const sourceIds = new Set(
+              (Array.isArray(postEntities) ? postEntities : [])
+                .map((e) => String(e?.id ?? "").trim())
+                .filter(Boolean)
+            );
+            finalEntities = (takeEntitiesForRoom(tid) ?? []).filter((e) => {
+              const id = String(e?.id ?? "").trim();
+              if (!id || !sourceIds.has(id)) return true;
+              const isHostile = String(e?.type ?? "").toLowerCase() === "hostile";
+              const hpCur =
+                typeof e?.hp?.current === "number" && Number.isFinite(e.hp.current)
+                  ? Math.trunc(e.hp.current)
+                  : null;
+              const isDeadLike = e?.isAlive === false || (hpCur != null && hpCur <= 0);
+              return !(isHostile && isDeadLike);
+            });
           }
 
           const isAlreadyInTarget = !!(tid && tid === baseRoomId);
@@ -16606,6 +17949,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
 
   async function handleSend() {
     const trimmed = input.trim();
+    const hadGuidanceBudgetAtSendStart = guidancePromptBudgetRef.current > 0;
     // Le joueur humain reprend la main : annule l’appel auto-joueur en cours (fetch /api/auto-player)
     // pour éviter un second callApi en parallèle et un MJ « bloqué » sans message utilisateur affiché.
     if (trimmed && isAutoPlayerThinking && autoPlayerEnabledRef.current) {
@@ -16752,6 +18096,10 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       }
       stickToBottomRef.current = true;
       setInput("");
+      if (hadGuidanceBudgetAtSendStart) {
+        guidancePromptBudgetRef.current = 0;
+        clearGuidanceBuffEverywhere();
+      }
       return;
     }
 
@@ -16759,7 +18107,21 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     setInput("");
 
     await callApi(trimmed);
+    if (hadGuidanceBudgetAtSendStart) {
+      guidancePromptBudgetRef.current = 0;
+      clearGuidanceBuffEverywhere();
+    }
   }
+
+  useEffect(() => {
+    const previousMode = previousGameModeRef.current;
+    previousGameModeRef.current = gameMode;
+    if (previousMode !== "combat" || gameMode !== "exploration") return;
+    const activeConcSpell = getActiveConcentrationSpellName(player?.conditions);
+    const blessConcActive = /^(bénédiction|benediction)$/i.test(String(activeConcSpell ?? "").trim());
+    if (!hasBlessBuff(player?.conditions) && !blessConcActive) return;
+    clearConcentrationEffectsForSpell("Bénédiction");
+  }, [gameMode, player?.conditions]);
 
   async function handleEndTurn() {
     if (isGameOver || (player?.hp?.current ?? 1) <= 0) return;
@@ -17325,6 +18687,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         getTurnResources: () => turnResourcesRef.current,
         player,
         setHp,
+        applyDamageToPlayer,
         playerHpRef,
         updatePlayer,
         spendSpellSlot,
@@ -17350,6 +18713,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         formatDiceNotationDetail,
         fmtMod,
         setSneakAttackArmed,
+        setSneakAttackExplicitArmed,
         setSneakAttackUsedThisTurn,
         safeJson,
       });
@@ -17594,8 +18958,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       const localPlayerCombatantIdForAttack = localCombatantId;
       const hiddenArrAtk = gameStateRef.current?.combatHiddenIds ?? combatHiddenIds ?? [];
       const hiddenAtk = new Set(hiddenArrAtk);
+      const attackerHiddenFromIntent = roll?.engineContext?.attackerHiddenAtIntent === true;
+      const mpLocalCombatantIdForAttack = multiplayerSessionId
+        ? `mp-player-${String(clientId ?? "").trim()}`
+        : "";
       const playerWasHiddenForAttack =
+        attackerHiddenFromIntent ||
         hiddenAtk.has(localPlayerCombatantIdForAttack) ||
+        (!!mpLocalCombatantIdForAttack && hiddenAtk.has(mpLocalCombatantIdForAttack)) ||
         (!multiplayerSessionId && hiddenAtk.has("player"));
       let target = getEntitiesSnapshot().find((e) => e.id === roll.targetId) ?? null;
       const knownSpells = Array.isArray(player.selectedSpells) ? player.selectedSpells : [];
@@ -17716,6 +19086,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                 saveNat: nat,
                 saveTotal: total,
                 saveDc: dc,
+                saveDamageOnSuccessMode: spellSaveDamageOnSuccessMode(spell),
                 spellDamageType: spell.damageType ?? "",
                 dmgNotation,
                 slotResult,
@@ -17782,8 +19153,11 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           nat = rSpellAtk.nat;
         }
         if (debugNextRoll !== null) setDebugNextRoll(null);
-        const total = nat + (roll.totalBonus ?? 0);
-        const bonus = fmtMod(roll.totalBonus ?? 0);
+        const spellBlessD4 = hasBlessBuff(player?.conditions) ? rollDice("1d4") : 0;
+        const total = nat + (roll.totalBonus ?? 0) + spellBlessD4;
+        const bonus =
+          fmtMod(roll.totalBonus ?? 0) +
+          (spellBlessD4 ? ` + Bénédiction [${spellBlessD4}]` : "");
         const ac = target?.ac ?? 10;
 
         let hit = false;
@@ -18015,6 +19389,43 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       }
       const sneakEligibleFromRules =
         advResWpn.adv === true || (allyAdjacentForSneak && advResWpn.dis !== true);
+      const atkParts = computeWeaponAttackParts(player, weapon.name);
+      const wdb = atkParts?.weaponDb ?? null;
+      const props = Array.isArray(wdb?.properties) ? wdb.properties : [];
+      const isRanged = props.some((p) => normalizeFr(p).includes("munitions"));
+      const isFinesse = String(wdb?.stat ?? "") === "FINESSE";
+      const finesseOrRanged = isRanged || isFinesse;
+      const explicitSneakAsked =
+        sneakAttackExplicitArmed ||
+        textWantsSneakAttack(roll?.raison) ||
+        textWantsSneakAttack(roll?.skill);
+      const isRogueForSneak = String(player?.entityClass ?? "").trim() === "Roublard";
+      const autoSneakForThisAttack =
+        isRogueForSneak && !sneakAttackUsedThisTurn && finesseOrRanged && sneakEligibleFromRules;
+      const sneakAttackArmedForThisAttack =
+        explicitSneakAsked ? true : autoSneakForThisAttack || sneakAttackArmed;
+      if (explicitSneakAsked) {
+        const isRogue = String(player?.entityClass ?? "").trim() === "Roublard";
+        let rejectSneakMsg = "";
+        if (!isRogue) {
+          rejectSneakMsg = "⚠ Action refusée : seule la classe **Roublard** peut déclarer une attaque sournoise.";
+        } else if (sneakAttackUsedThisTurn) {
+          rejectSneakMsg = "⚠ Action refusée : l'attaque sournoise a déjà été utilisée ce tour-ci.";
+        } else if (!finesseOrRanged) {
+          rejectSneakMsg = "⚠ Action refusée : l'attaque sournoise exige une arme **finesse** ou **à distance**.";
+        } else if (!sneakEligibleFromRules) {
+          rejectSneakMsg =
+            "⚠ Action refusée : l'attaque sournoise exige l'avantage, ou un allié au contact de la cible sans désavantage.";
+        }
+        if (rejectSneakMsg) {
+          pendingRollRef.current = null;
+          setPendingRoll(null);
+          setSneakAttackArmed(false);
+          setSneakAttackExplicitArmed(false);
+          addMessage("ai", rejectSneakMsg, "intent-error", makeMsgId());
+          return;
+        }
+      }
       let nat;
       if (manualNatOverride != null) {
         nat = manualNatOverride;
@@ -18025,10 +19436,10 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         nat = rWpnAtk.nat;
       }
       if (debugNextRoll !== null) setDebugNextRoll(null);
-      const atkParts = computeWeaponAttackParts(player, weapon.name);
       const atkBonus = atkParts.totalBonus;
-      const total = nat + atkBonus;
-      const bonusStr = fmtMod(atkBonus);
+      const blessD4 = hasBlessBuff(player?.conditions) ? rollDice("1d4") : 0;
+      const total = nat + atkBonus + blessD4;
+      const bonusStr = fmtMod(atkBonus) + (blessD4 ? ` + Bénédiction [${blessD4}]` : "");
       const ac = target.ac ?? 10;
 
       let hit = false;
@@ -18059,25 +19470,22 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           atkParts.abilityModValue + (atkParts?.style?.duelBonusDmg ?? 0) + (splitDmg.flatBonus ?? 0);
         const rollNotation = crit ? doubleWeaponDiceNotationDiceOnly(diceOnly) : diceOnly;
 
-        const wdb = atkParts?.weaponDb ?? null;
-        const props = Array.isArray(wdb?.properties) ? wdb.properties : [];
-        const isRanged = props.some((p) => normalizeFr(p).includes("munitions"));
-        const isFinesse = String(wdb?.stat ?? "") === "FINESSE";
-        const finesseOrRanged = isRanged || isFinesse;
-
         const sneakAttackContext = {
-          enabled: player?.entityClass === "Roublard",
-          sneakAttackArmed,
+          enabled: isRogueForSneak,
+          sneakAttackArmed: sneakAttackArmedForThisAttack,
+          sneakExplicitRequest: explicitSneakAsked,
           sneakAttackUsedThisTurn,
           sneakEligibleFromRules,
           sneakDice: ROGUE_SNEAK_ATTACK_DICE_BY_LEVEL?.[player.level ?? 1] ?? "1d6",
           finesseOrRanged,
+          autoArmedByRules: autoSneakForThisAttack,
         };
 
         const styleAtkStr = (atkParts?.style?.archeryBonus ?? 0) ? ` + Style ${fmtMod(atkParts.style.archeryBonus)}` : "";
+        const blessSuffix = blessD4 ? ` + Bénédiction [${blessD4}]` : "";
         const atkBreakdown =
           `${nat} + ${atkParts.abilityKey} ${fmtMod(atkParts.abilityModValue)} + PB ${fmtMod(atkParts.pb)}` +
-          `${styleAtkStr} = **${total}**`;
+          `${styleAtkStr}${blessSuffix} = **${total}**`;
 
         const weaponAttackCtx = {
           stage: "weapon_attack_followup",
@@ -18109,10 +19517,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         const nextEntities = myUpdates.length ? applyUpdatesLocally(entPoolWpnHit, myUpdates) : entPoolWpnHit;
         if (myUpdates.length) applyEntityUpdates(myUpdates);
         ensureCombatState(nextEntities);
-
-        if (shouldEngageMeleeAfterWeaponHit(roll, weapon, player, localCombatantId, target.id, getMeleeWith)) {
-          addMeleeMutual(localCombatantId, target.id);
-        }
 
         consumeResource(setTurnResourcesSynced, "combat", "action");
 
@@ -18165,6 +19569,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
 
         pendingRollRef.current = pendingDmg;
         setPendingRoll(pendingDmg);
+        setSneakAttackArmed(false);
+        setSneakAttackExplicitArmed(false);
 
         if (playerWasHiddenForAttack) {
           setCombatHiddenIds((prev) =>
@@ -18236,10 +19642,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         content = `ðŸŽ² Attaque (${weapon.name} â†’ ${target.name}) â€” ${atkBreakdown} â†’ Raté.`;
       }
 
-      if (shouldEngageMeleeAfterWeaponHit(roll, weapon, player, localCombatantId, target.id, getMeleeWith)) {
-        addMeleeMutual(localCombatantId, target.id);
-      }
-
       consumeResource(setTurnResourcesSynced, "combat", "action");
 
       addMessage(
@@ -18256,6 +19658,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
 
       pendingRollRef.current = null;
       setPendingRoll(null);
+      setSneakAttackArmed(false);
+      setSneakAttackExplicitArmed(false);
       const hpAfter =
         target.hp
           ? (myUpdates.some((u) => u.action === "kill" && u.id === target.id) ? 0 :
@@ -18384,8 +19788,20 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       player
         ? computeCheckBonus({ player, stat: roll.stat, skill: roll.skill })
         : roll.totalBonus;
-    const total = nat + bonusForCheck;
-    const bonus = fmtMod(bonusForCheck);
+    let guidanceD4 = 0;
+    let blessExtraD4 = 0;
+    if (roll.kind === "check" && hasGuidanceBuff(player?.conditions)) {
+      guidanceD4 = rollDice("1d4");
+      updatePlayer({ conditions: stripGuidanceBuff(player.conditions) });
+    }
+    if (roll.kind === "save" && hasBlessBuff(player?.conditions)) {
+      blessExtraD4 = rollDice("1d4");
+    }
+    const total = nat + bonusForCheck + guidanceD4 + blessExtraD4;
+    const bonus =
+      fmtMod(bonusForCheck) +
+      (guidanceD4 ? ` + Assistance [${guidanceD4}]` : "") +
+      (blessExtraD4 ? ` + Bénédiction [${blessExtraD4}]` : "");
 
     const dc = typeof roll.dc === "number" ? roll.dc : null;
     const success = dc != null ? total >= dc : null;
@@ -18414,7 +19830,12 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       const dmgNotation = String(engineContext.damageNotation ?? "1d6");
       const r = rollDiceDetailed(dmgNotation);
       const baseDmg = Math.max(0, r.total);
-      const finalDmg = success ? Math.floor(baseDmg / 2) : baseDmg;
+      const saveDamageOnSuccessMode =
+        String(engineContext.saveDamageOnSuccessMode ?? "").trim().toLowerCase() === "none"
+          ? "none"
+          : "half";
+      const finalDmg =
+        success && saveDamageOnSuccessMode === "none" ? 0 : success ? Math.floor(baseDmg / 2) : baseDmg;
       const hpBefore = playerHpRef.current;
       const damageResult = finalDmg > 0 ? applyDamageToPlayer(finalDmg, { critical: false }) : null;
       const hpAfter = damageResult ? damageResult.hpAfter : hpBefore;
@@ -18425,8 +19846,18 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       addMessage(
         "ai",
         `${content}\n${
-          success ? "✔ Réussite — dégâts réduits." : "✖ Échec — dégâts complets."
-        } ${finalDmg > 0 ? `${formatDiceNotationDetail(r, dmgNotation)} = **${finalDmg} dégâts ${engineContext.damageType ?? ""}**.` : "Aucun dégât."}`,
+          success
+            ? saveDamageOnSuccessMode === "none"
+              ? "✔ Réussite — aucun dégât."
+              : "✔ Réussite — dégâts réduits."
+            : "✖ Échec — dégâts complets."
+        } ${
+          finalDmg > 0
+            ? `${formatDiceNotationDetail(r, dmgNotation)}${
+                success && saveDamageOnSuccessMode !== "none" ? " → moitié dégâts" : ""
+              } = **${finalDmg} dégâts ${engineContext.damageType ?? ""}**.`
+            : "Aucun dégât."
+        }`,
         "combat-detail",
         makeMsgId()
       );
@@ -19202,7 +20633,16 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         : isLocalPlayerCombatantId(activeIdForTurnGate));
   // Bandeau jaune « Jet requis » : bloquer saisie (humain + cohérence avec l’auto-joueur)
   const playerDeadOrOver =
-    isGameOver || (typeof player?.hp?.current === "number" && player.hp.current <= 0);
+    isGameOver || ((playerHpRef.current ?? player?.hp?.current ?? 0) <= 0);
+  useEffect(() => {
+    if (!opportunityAttackPrompt || !playerDeadOrOver) return;
+    const resolver = opportunityAttackPromptResolverRef.current;
+    opportunityAttackPromptResolverRef.current = null;
+    setOpportunityAttackPrompt(null);
+    if (typeof resolver === "function") {
+      resolver({ performed: false, targetAlive: true });
+    }
+  }, [opportunityAttackPrompt, playerDeadOrOver]);
   // Multijoueur : bloquer saisie si MJ ou autre client réserve l’auto-joueur ; ce client peut
   // toujours envoyer pour préempter sa propre réservation (fire-and-forget annule l’auto dans handleSend).
   const mpThisClientAutoIntentHeld =
@@ -20321,24 +21761,6 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         )}
         {player?.entityClass === "Roublard" && (
           <>
-            <button
-              type="button"
-              onClick={() => setSneakAttackArmed((v) => !v)}
-              disabled={inputBlocked || !isMyTurn || sneakAttackUsedThisTurn}
-              className={
-                "rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed " +
-                (sneakAttackArmed
-                  ? "border-emerald-500/70 bg-emerald-950/40 text-emerald-100 hover:bg-emerald-950/60"
-                  : "border-slate-600 bg-slate-950/20 text-slate-200 hover:bg-slate-800 hover:border-slate-500")
-              }
-              title="Attaque sournoise (1/ tour) â€” s'applique Ã  la prochaine attaque touchée avec une arme finesse ou Ã  distance."
-            >
-              Attaque sournoise
-              <span className="ml-1 text-[10px] text-emerald-200 tabular-nums">
-                ({sneakAttackUsedThisTurn ? "0" : "1"}/1)
-              </span>
-            </button>
-
             {(player?.level ?? 1) >= 2 && (
               <>
                 <button

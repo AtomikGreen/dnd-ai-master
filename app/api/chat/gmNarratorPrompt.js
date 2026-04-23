@@ -32,6 +32,7 @@ function shouldIncludeDeadEntitiesInNarratorContext(engineEvent, gameMode) {
     kind === "attack_resolution" ||
     kind === "spell_attack_resolution" ||
     kind === "spell_save_resolution" ||
+    kind === "spell_utility_resolution" ||
     kind === "loot_resolution"
   );
 }
@@ -292,6 +293,8 @@ function buildStaticSystemRules() {
     `Ne donne jamais au joueur les informations des secrets « gratuitement » (pas de spoil des mécaniques, pas de liste de ce qui est caché tant que le PJ ne l’a pas découvert).`,
     `Ne révèle jamais des informations dans le champt "secrets" dans ta narration si le joueur n'en a pas connaissance/ne l'a pas encore découvert`,
     `Fait attention à ne pas donner par megarde des informations que les joueurs n'ont pas encore découvert/ne sont pas sensés savoir.`,
+    `RÈGLE ANTI-SPOIL ABSOLUE : si une information apparaît dans reason/details/MÉMOIRE DE SCÈNE/LIEUX AUTORISÉS mais qu'elle n'est pas clairement perceptible/observable maintenant (ou explicitement découverte auparavant par les PJ), tu ne la révèles pas dans la narration. Privilégie une formulation neutre non-spoil.`,
+    `Exemple : n'écris jamais "le passage secret est ouvert" ni "le chef a fui par le passage secret" tant que cette information n'a pas été explicitement découverte en fiction.`,
     `Les noms techniques internes des salles, leurs ids, titres de graphe, ou labels de destination ne sont pas des informations joueur. Même si un tel label apparaît dans le contexte, ne le révèle jamais avant une véritable entrée dans le lieu concerné via engineEvent.scene_transition ou équivalent.`,
     ``,
     `=== LIEU DÉJÀ VU / MÉMOIRE DE SCÈNE ===`,
@@ -329,6 +332,7 @@ function buildStaticSystemRules() {
     `Si engineEvent.kind="skill_check_resolution", raconte la conséquence du jet résolu par le moteur.`,
     `Si engineEvent.kind="attack_resolution", raconte l'attaque résolue par le moteur.`,
     `Si engineEvent.kind="spell_save_resolution", raconte la résolution du sort conformément aux données moteur.`,
+    `Si engineEvent.kind="spell_utility_resolution", reflète le sort utilitaire (buff, lumière, détection) déjà appliqué dans le message joueur (dice).`,
     `Si engineEvent.kind="gm_secret_resolution", raconte la conséquence du jet secret sans révéler le jet.`,
     `Si engineEvent.kind="scene_transition", raconte l'entrée dans le nouveau lieu.`,
     `Même en scene_transition, n'annonce pas des créatures "par défaut" juste parce qu'elles sont mentionnées dans la description statique : vérifie d'abord ENTITÉS PRÉSENTES et MÉMOIRE DE SCÈNE.`,
@@ -340,6 +344,7 @@ function buildStaticSystemRules() {
     `Si engineEvent.kind="scene_rule_resolution", la mécanique est déjà réglée : reflète strictement reason/details sans ajouter de nouveaux faits. En général ce sera bref, mais pas mécaniquement uniforme : si reason/details décrivent une découverte notable, une entrée de lieu importante ou un changement marquant, tu peux développer davantage tout en restant fidèle aux faits fournis.`,
     `Si engineEvent.kind="scene_rule_resolution" accompagne une arrivée ou un positionnement au seuil d'un lieu et que recentChat a déjà narré l'approche par un chemin cardinal (colline, sentier, etc.), ne refais pas ce même chemin comme « issue derrière soi » ou retour spectaculaire : garde la prose sur le cadre actuel (ENVIRONNEMENT ACTUEL) et les issues qui ouvrent la fiction devant les PJ.`,
     `Attention : engineEvent.reason peut être un résumé procédural interne du moteur. Si reason/details sont absents, vagues, ou purement procéduraux, ne les paraphrase pas et n'en fais pas une prose artificielle ; reviens simplement à l'action visible du joueur, au décor actuel et aux lieux autorisés.`,
+    `Même si reason/details sont fournis, ils ne valent pas autorisation de spoiler : n'en retiens que la partie joueur-visible. Si un passage de reason/details ressemble à une note interne ou à un secret non découvert, ignore-le dans la narration.`,
     `N'écris jamais dans la narration qu'aucun piège ne s'est déclenché, qu'aucun secret ne s'applique, qu'aucune règle spéciale n'a été activée, ou toute autre information de coulisses, sauf si cet élément est effectivement perceptible dans la fiction.`,
     `Si engineEvent.kind="action_unclear", tu rédiges une relance immersive et brève au lieu d'un message procédural. Transforme la cause d'ambiguïté en constat de scène naturel. Si plusieurs directions existent, intègre-les dans une prose de MJ ("au nord...", "vers l'ouest...") plutôt qu'en liste sèche, et ne recopie jamais littéralement reason.`,
     `Pour engineEvent.kind="action_unclear", la narration doit rester purement descriptive : aucun adressage direct au PJ, aucun prénom du héros en apostrophe, aucune question finale, aucune formule du type "Que faites-vous ?", "Quelle voie choisissez-vous ?" ou équivalent.`,

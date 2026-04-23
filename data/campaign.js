@@ -71,7 +71,7 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 90% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
     exits: [
       {
         id: "room_intro",
@@ -342,7 +342,7 @@ export const GOBLIN_CAVE = {
         description: "Le long couloir s'étend sur quelques metres avant d'arriver a une autre intersection."
       },
       {
-        id: "room_9",
+        id: "room_13",
         direction: "nord",
         description: "Un passage monte vers une porte fermée."
       }
@@ -487,36 +487,6 @@ export const GOBLIN_CAVE = {
   }
 };
 
-const SECRET_EXIT_TOKEN_STOPWORDS = new Set([
-  "dans",
-  "avec",
-  "vers",
-  "pour",
-  "cette",
-  "cela",
-  "ceci",
-  "ainsi",
-  "sous",
-  "sans",
-  "entre",
-  "apres",
-  "avant",
-  "ici",
-  "une",
-  "des",
-  "les",
-  "sur",
-  "par",
-  "est",
-  "sont",
-  "du",
-  "de",
-  "la",
-  "le",
-  "un",
-  "en"
-]);
-
 function normalizeSecretExitText(value) {
   return String(value ?? "")
     .trim()
@@ -528,13 +498,6 @@ function normalizeSecretExitText(value) {
     .trim();
 }
 
-function extractSecretExitTokens(value) {
-  return normalizeSecretExitText(value)
-    .split(" ")
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 4 && !SECRET_EXIT_TOKEN_STOPWORDS.has(token));
-}
-
 function roomMemoryRevealsSecretExit(secretExit, roomMemoryText) {
   const memory = normalizeSecretExitText(roomMemoryText);
   if (!memory) return false;
@@ -544,14 +507,7 @@ function roomMemoryRevealsSecretExit(secretExit, roomMemoryText) {
 
   const discoveredDescription = normalizeSecretExitText(secretExit?.descriptionWhenDiscovered);
   if (discoveredDescription && memory.includes(discoveredDescription)) return true;
-
-  const memoryWords = new Set(memory.split(" ").filter(Boolean));
-  const descriptionTokens = extractSecretExitTokens(secretExit?.descriptionWhenDiscovered);
-  if (descriptionTokens.length === 0) return false;
-
-  const overlapCount = descriptionTokens.filter((token) => memoryWords.has(token)).length;
-  const minimumTokensRequired = Math.min(3, descriptionTokens.length);
-  return overlapCount >= minimumTokensRequired;
+  return false;
 }
 
 export function getVisibleExitsForRoom(roomId, roomMemoryText = "") {
