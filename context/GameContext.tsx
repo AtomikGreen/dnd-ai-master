@@ -2068,6 +2068,9 @@ function chatMessagesVisualEqual(a: Message[], b: Message[]): boolean {
 /** Salon : partie non lancée, URL partageable avant « Démarrer l'aventure ». */
 function buildLobbySharedSessionPayload(): SharedSessionPayload {
   const lobbyMsgId = `lobby-welcome-${Date.now()}`;
+  const lobbySceneName =
+    (GOBLIN_CAVE as any)?.scene_village?.title ??
+    DEFAULT_SCENE_NAME;
   return {
     worldTimeMinutes: 0,
     messages: [
@@ -2082,7 +2085,7 @@ function buildLobbySharedSessionPayload(): SharedSessionPayload {
     ],
     pendingRoll: null,
     isGameStarted: false,
-    currentSceneName: "Salon multijoueur",
+    currentSceneName: lobbySceneName,
     currentScene:
       "Les aventuriers se retrouvent avant d’entrer dans la campagne. Choisissez vos personnages, partagez le lien, puis lancez quand vous êtes prêts.",
     currentRoomId: "lobby",
@@ -3122,6 +3125,32 @@ export function GameProvider({ children }: { children: ReactNode }) {
     // (meta-reply collant) même après lancement, tout en affichant l’UI « en jeu » / combat.
     const isStartingAdventureTransition =
       prevRemoteIsGameStarted !== true && nowRemoteIsGameStarted === true;
+    const incomingRoomId = typeof p.currentRoomId === "string" ? p.currentRoomId.trim() : "";
+    const isLobbyPayload = !p.isGameStarted && incomingRoomId === "lobby";
+    const localRoomAtApplyStart = String(currentRoomIdLiveRef.current ?? "").trim();
+    const localSceneVersionAtApplyStart = Math.trunc(Number(sceneVersionRef.current ?? 0) || 0);
+    const localAlreadyInAdventure =
+      localSceneVersionAtApplyStart > 0 ||
+      (localRoomAtApplyStart !== "" && localRoomAtApplyStart !== "lobby");
+    const payloadCarriesGameplayHints =
+      ((Array.isArray(p.entities) && p.entities.length > 0) ||
+        (Array.isArray(p.combatOrder) && p.combatOrder.length > 0) ||
+        p.gameMode === "combat" ||
+        (typeof p.worldTimeMinutes === "number" && Number.isFinite(p.worldTimeMinutes) && p.worldTimeMinutes > 0) ||
+        (Array.isArray(p.messages) &&
+          p.messages.some((m) => {
+            const t = String((m as Message | null | undefined)?.type ?? "").trim();
+            if (t === "enemy-turn" || t === "turn-end" || t === "turn-divider" || t === "dice") return true;
+            const c = String((m as Message | null | undefined)?.content ?? "").toLowerCase();
+            return c.includes("combat") || c.includes("initiative") || c.includes("attaque");
+          })));
+    const shouldIgnoreStaleLobbyPayload =
+      isLobbyPayload && localAlreadyInAdventure && payloadCarriesGameplayHints;
+    if (shouldIgnoreStaleLobbyPayload) {
+      // Snapshot Firestore obsolète (retour salon) reçu après une partie déjà engagée :
+      // l'appliquer remettrait currentRoomId=lobby et supprimerait les sorties visibles.
+      return;
+    }
 
     if (!skipRemotePendingRollApplyRef.current) {
       setWorldTimeMinutes(
@@ -3156,11 +3185,6 @@ export function GameProvider({ children }: { children: ReactNode }) {
       const remoteHasInitiativeDice = remoteForMerge.some(
         (m) => typeof m?.id === "string" && m.id.startsWith("initiative-order-")
       );
-
-      const isLobbyPayload =
-        !p.isGameStarted &&
-        typeof p.currentRoomId === "string" &&
-        p.currentRoomId.trim() === "lobby";
 
       // Au moment où on passe "salon" -> "aventure", on veut 100% refléter le snapshot distant.
       // Sinon, on peut conserver des "initiative-order-*" anciens (localStorage précédent) et
@@ -4193,6 +4217,60 @@ export function GameProvider({ children }: { children: ReactNode }) {
       );
       if (JSON.stringify(cur) === JSON.stringify(profInv)) return p;
       return { ...p, inventory: profInv };
+    });
+  }, [multiplayerSessionId, clientId, multiplayerParticipantProfiles]);
+
+  /**
+   * Multijoueur : lors d'un repos long déclenché par un autre client, notre profil Firestore reçoit
+   * un `playerSnapshot` restauré (slots, dés de vie, marqueur de repos), mais la vue locale ne
+   * resynchronisait jusque-là que les PV + inventaire.
+   */
+  useEffect(() => {
+    if (!multiplayerSessionId || !clientId) return;
+    const me = String(clientId).trim();
+    const prof = multiplayerParticipantProfiles.find((p) => String(p?.clientId ?? "").trim() === me);
+    if (!prof?.playerSnapshot) return;
+    const profSnap = normalizePlayerShape(prof.playerSnapshot);
+    if (!profSnap) return;
+
+    const profMs =
+      typeof prof.updatedAtMs === "number" && Number.isFinite(prof.updatedAtMs) ? prof.updatedAtMs : 0;
+    const lastPush = lastLocalParticipantProfilePushAtMsRef.current;
+    if (lastPush >= 0 && profMs + MULTIPLAYER_PROFILE_CLOCK_SKEW_TOLERANCE_MS < lastPush) return;
+
+    const prev = playerRef.current;
+    if (!prev) return;
+
+    const slotsChanged = JSON.stringify(prev.spellSlots ?? null) !== JSON.stringify(profSnap.spellSlots ?? null);
+    const hdRemainingChanged = (prev.hitDiceRemaining ?? null) !== (profSnap.hitDiceRemaining ?? null);
+    const hdTotalChanged = (prev.hitDiceTotal ?? null) !== (profSnap.hitDiceTotal ?? null);
+    const lastLongRestChanged =
+      (prev.lastLongRestFinishedAtMinute ?? null) !== (profSnap.lastLongRestFinishedAtMinute ?? null);
+
+    if (!slotsChanged && !hdRemainingChanged && !hdTotalChanged && !lastLongRestChanged) return;
+
+    setPlayerState((p) => {
+      if (!p) return p;
+      const curSlots = JSON.stringify(p.spellSlots ?? null);
+      const nextSlots = JSON.stringify(profSnap.spellSlots ?? null);
+      const curHdRemaining = p.hitDiceRemaining ?? null;
+      const curHdTotal = p.hitDiceTotal ?? null;
+      const curLastLongRest = p.lastLongRestFinishedAtMinute ?? null;
+      if (
+        curSlots === nextSlots &&
+        curHdRemaining === (profSnap.hitDiceRemaining ?? null) &&
+        curHdTotal === (profSnap.hitDiceTotal ?? null) &&
+        curLastLongRest === (profSnap.lastLongRestFinishedAtMinute ?? null)
+      ) {
+        return p;
+      }
+      return {
+        ...p,
+        spellSlots: profSnap.spellSlots ?? p.spellSlots,
+        hitDiceRemaining: profSnap.hitDiceRemaining ?? p.hitDiceRemaining,
+        hitDiceTotal: profSnap.hitDiceTotal ?? p.hitDiceTotal,
+        lastLongRestFinishedAtMinute: profSnap.lastLongRestFinishedAtMinute ?? p.lastLongRestFinishedAtMinute,
+      };
     });
   }, [multiplayerSessionId, clientId, multiplayerParticipantProfiles]);
 

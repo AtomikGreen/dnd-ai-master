@@ -2094,6 +2094,22 @@ function executeCombatActionIntent(intent, ctx) {
     const healDice = extractDiceAndFlatBonusFromText(gear.effect, "1d4");
     const effectiveTargetId = String(targetEnt?.id ?? targetMp?.id ?? tid).trim() || tid;
     const tgtName = targetEnt?.name ?? targetMp?.name ?? (isSelf ? giverName : tid);
+    const targetHpCurrentForContext =
+      typeof targetEnt?.hp?.current === "number" && Number.isFinite(targetEnt.hp.current)
+        ? Math.trunc(targetEnt.hp.current)
+        : typeof targetMp?.hp === "number" && Number.isFinite(targetMp.hp)
+          ? Math.trunc(targetMp.hp)
+          : isSelf && typeof player?.hp?.current === "number" && Number.isFinite(player.hp.current)
+            ? Math.trunc(player.hp.current)
+            : null;
+    const targetHpMaxForContext =
+      typeof targetEnt?.hp?.max === "number" && Number.isFinite(targetEnt.hp.max)
+        ? Math.max(1, Math.trunc(targetEnt.hp.max))
+        : typeof targetMp?.hpMax === "number" && Number.isFinite(targetMp.hpMax)
+          ? Math.max(1, Math.trunc(targetMp.hpMax))
+          : isSelf && typeof player?.hp?.max === "number" && Number.isFinite(player.hp.max)
+            ? Math.max(1, Math.trunc(player.hp.max))
+            : null;
     const healPending = buildPendingDiceRoll({
       kind: "damage_roll",
       roll: healDice.diceNotation,
@@ -2108,6 +2124,8 @@ function executeCombatActionIntent(intent, ctx) {
         itemName: gear.name,
         targetId: effectiveTargetId,
         targetName: tgtName,
+        targetHpCurrent: targetHpCurrentForContext,
+        targetHpMax: targetHpMaxForContext,
         isSelf,
       },
     });
@@ -2565,6 +2583,14 @@ function executeCombatActionIntent(intent, ctx) {
       if (healLike) {
         const healBonus =
           healDice.flatBonus + abilityMod(player?.stats?.[spellcastingAbilityAbbrevForCombatant(player)]);
+        const spellHealTargetHpCurrent =
+          typeof targetEnt?.hp?.current === "number" && Number.isFinite(targetEnt.hp.current)
+            ? Math.trunc(targetEnt.hp.current)
+            : null;
+        const spellHealTargetHpMax =
+          typeof targetEnt?.hp?.max === "number" && Number.isFinite(targetEnt.hp.max)
+            ? Math.max(1, Math.trunc(targetEnt.hp.max))
+            : null;
         return {
           ok: true,
           pendingRoll: buildPendingDiceRoll({
@@ -2581,6 +2607,8 @@ function executeCombatActionIntent(intent, ctx) {
               spellName: resolved.spellName,
               targetId: targetEnt.id,
               targetName: targetEnt.name,
+              targetHpCurrent: spellHealTargetHpCurrent,
+              targetHpMax: spellHealTargetHpMax,
               spellLevel: typeof spell?.level === "number" ? spell.level : 0,
               resourceKind,
             },
@@ -5515,11 +5543,15 @@ export default function ChatInterface() {
       for (const prof of multiplayerParticipantProfiles) {
         const pid = String(prof?.clientId ?? "").trim();
         if (!pid) continue;
+        const runtimeEntityFallback =
+          entities.find((ent) => String(ent?.id ?? "").trim() === `mp-player-${pid}`) ?? null;
         const sourceSnapshot =
           pid === localCid
             ? localRestoredSnapshot ?? player
             : prof?.playerSnapshot && typeof prof.playerSnapshot === "object"
               ? prof.playerSnapshot
+              : runtimeEntityFallback && typeof runtimeEntityFallback === "object"
+                ? runtimeEntityFallback
               : null;
         const restored = restoreLongRestPlayer(sourceSnapshot, nextMinute);
         if (!restored) continue;
@@ -5728,7 +5760,7 @@ export default function ChatInterface() {
   const tacticianFetchTailRef = useRef(Promise.resolve());
   /** Promesses en cours par clé tacticien : deux appels concurrents avec la même clé partagent le même fetch. */
   const tacticianInFlightByKeyRef = useRef(new Map());
-  /** Anti-rejeu robuste : tours ennemis déjà résolus pour (engagement, round, idx, enemyId). */
+  /** Anti-rejeu robuste : tours ennemis déjà résolus pour (engagement, round, enemyId). */
   const processedEnemyTurnKeysRef = useRef(new Set());
 
   function commitCombatTurnIndex(next) {
@@ -6833,7 +6865,7 @@ export default function ChatInterface() {
         const uid = String(up?.id ?? "").trim();
         if (!uid.startsWith("mp-player-")) continue;
         const targetCid = uid.slice("mp-player-".length).trim();
-        if (!targetCid || targetCid === localCid) continue;
+        if (!targetCid) continue;
         let hpCurrent = null;
         if (typeof up?.hp === "number" && Number.isFinite(up.hp)) {
           hpCurrent = Math.max(0, Math.trunc(up.hp));
@@ -7774,8 +7806,24 @@ export default function ChatInterface() {
     const liveTarget = getRuntimeCombatant(target.id);
     return {
       performed: atkResult !== false,
-      targetAlive: atkResult === "player_dead" ? false : liveTarget?.isAlive !== false,
+      targetAlive: atkResult === "player_dead" ? false : isCombatantStillActiveAfterHit(liveTarget),
     };
+  }
+
+  function isCombatantStillActiveAfterHit(combatant) {
+    if (!combatant || typeof combatant !== "object") return false;
+    if (combatant.isAlive === false) return false;
+    const hpNow =
+      typeof combatant?.hp?.current === "number" && Number.isFinite(combatant.hp.current)
+        ? Math.trunc(combatant.hp.current)
+        : null;
+    if (hpNow != null && hpNow <= 0) return false;
+    const ds =
+      combatant?.deathState && typeof combatant.deathState === "object"
+        ? combatant.deathState
+        : null;
+    if (ds?.dead === true || ds?.unconscious === true) return false;
+    return true;
   }
 
   function pickCombatantOpportunityWeapon(combatant) {
@@ -7807,9 +7855,9 @@ export default function ChatInterface() {
   }
 
   async function resolveEnemyOpportunityAttack(reactor, target) {
-    if (!reactor || !target) return { performed: false, targetAlive: target?.isAlive !== false };
+    if (!reactor || !target) return { performed: false, targetAlive: isCombatantStillActiveAfterHit(target) };
     if (!hasReaction(reactor.id)) {
-      return { performed: false, targetAlive: target?.isAlive !== false };
+      return { performed: false, targetAlive: isCombatantStillActiveAfterHit(target) };
     }
     const chosenWeapon = pickCombatantOpportunityWeapon(reactor);
     if (!chosenWeapon) {
@@ -7820,7 +7868,7 @@ export default function ChatInterface() {
         makeMsgId()
       );
       setReactionFor(reactor.id, false);
-      return { performed: false, targetAlive: target?.isAlive !== false };
+      return { performed: false, targetAlive: isCombatantStillActiveAfterHit(target) };
     }
     setReactionFor(reactor.id, false);
     const result = await resolveCombatantWeaponAttack(
@@ -7834,8 +7882,7 @@ export default function ChatInterface() {
     const liveTarget = getRuntimeCombatant(target.id);
     return {
       performed: true,
-      targetAlive:
-        result === "player_dead" ? false : liveTarget?.isAlive !== false,
+      targetAlive: result === "player_dead" ? false : isCombatantStillActiveAfterHit(liveTarget),
     };
   }
 
@@ -8005,7 +8052,7 @@ export default function ChatInterface() {
         continue;
       }
 
-      let result = { performed: false, targetAlive: mover.isAlive !== false };
+      let result = { performed: false, targetAlive: isCombatantStillActiveAfterHit(mover) };
       if (reactor.id === "player" || controllerForCombatantId(reactor.id) === "player") {
         const rid = String(reactor.id ?? "").trim();
         if (isLocalPlayerCombatantId(rid)) {
@@ -8045,7 +8092,7 @@ export default function ChatInterface() {
       await yieldCombatUiSync();
 
       const liveMover = getRuntimeCombatant(movingCombatantId);
-      if (result.targetAlive === false || liveMover?.isAlive === false) {
+      if (result.targetAlive === false || !isCombatantStillActiveAfterHit(liveMover)) {
         await maybeAutoEndLocalTurnWhenDowned();
         return false;
       }
@@ -9750,7 +9797,7 @@ export default function ChatInterface() {
           Number.isFinite(gameStateRef.current.combatTurnWriteSeq)
             ? Math.trunc(gameStateRef.current.combatTurnWriteSeq)
             : Math.trunc(combatTurnWriteSeq ?? 0);
-        const turnKey = `${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${liveEnemy.id}`;
+        const turnKey = `${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${liveEnemy.id}`;
         if (shouldSkipTurnForCommand(liveEnemy.conditions)) {
           commitCombatTurnIndex(idx);
           const cmdSkipMsgId = `npc-command-skip:${turnKey.replace(/:/g, "-")}`;
@@ -11114,7 +11161,9 @@ export default function ChatInterface() {
             meleeIdForCombat,
             hostileEngaged
           );
-          if (!moverSurvived || (playerHpRef.current ?? combatPlayer?.hp?.current ?? 0) <= 0) {
+          const moverAfterAoO = getRuntimeCombatant(meleeIdForCombat);
+          const moverDownAfterAoO = !isCombatantStillActiveAfterHit(moverAfterAoO);
+          if (!moverSurvived || moverDownAfterAoO) {
             return;
           }
         }
@@ -11196,11 +11245,14 @@ export default function ChatInterface() {
 
     if (intentResult.endTurnRequested) {
       clearPlayerSurprisedState();
+      const endTurnActorName = combatPlayer?.name ?? "Vous";
       addMessage(
-        "ai",
-        `**${combatPlayer?.name ?? "Vous"}** met fin à son tour.`,
-        "turn-end",
-        makeMsgId()
+        "user",
+        `${endTurnActorName} met fin à son tour.`,
+        "player-utterance",
+        makeMsgId(),
+        undefined,
+        endTurnActorName
       );
       addMessage("ai", "", "turn-divider", makeMsgId());
       await nextTurn();
@@ -13873,7 +13925,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       const turnEndId = cmdId ? `mp-engine-end-turn:${cmdId}` : null;
       const turnDivId = cmdId ? `mp-engine-end-turn-div:${cmdId}` : null;
       if (!turnEndId || !messagesRef.current.some((m) => m && m.id === turnEndId)) {
-        addMessage("ai", `**${endName}** met fin à son tour.`, "turn-end", turnEndId ?? makeMsgId());
+        addMessage(
+          "user",
+          `${endName} met fin à son tour.`,
+          "player-utterance",
+          turnEndId ?? makeMsgId(),
+          undefined,
+          endName
+        );
       }
       if (!turnDivId || !messagesRef.current.some((m) => m && m.id === turnDivId)) {
         addMessage("ai", "", "turn-divider", turnDivId ?? makeMsgId());
@@ -18178,11 +18237,14 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
     setIsTyping(true);
     try {
       clearPlayerSurprisedState();
+      const endTurnActorName = player?.name ?? "Vous";
       addMessage(
-        "ai",
-        `**${player?.name ?? "Vous"}** met fin à son tour.`,
-        "turn-end",
-        makeMsgId()
+        "user",
+        `${endTurnActorName} met fin à son tour.`,
+        "player-utterance",
+        makeMsgId(),
+        undefined,
+        endTurnActorName
       );
       addMessage("ai", "", "turn-divider", makeMsgId());
       // Boucle tour par tour (enregistrée sur le contexte comme nextTurn)
@@ -18701,6 +18763,18 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         pendingRollRef,
         multiplayerSessionId,
         patchParticipantProfileHp,
+        getParticipantProfileByCombatantId: (combatantId) => {
+          const raw = String(combatantId ?? "").trim();
+          if (!raw.startsWith("mp-player-")) return null;
+          const cid = raw.slice("mp-player-".length).trim();
+          if (!cid) return null;
+          const list = Array.isArray(multiplayerParticipantProfilesRef.current)
+            ? multiplayerParticipantProfilesRef.current
+            : [];
+          return (
+            list.find((p) => String(p?.clientId ?? "").trim() === cid) ?? null
+          );
+        },
         applyEntityUpdates,
         applyUpdatesLocally,
         markSceneHostilesAware,
@@ -18817,6 +18891,12 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           hitDiceRemaining: remainingAfter,
         };
       });
+      if (multiplayerSessionId) {
+        const cid = String(clientId ?? "").trim();
+        if (cid && typeof patchParticipantProfileHp === "function") {
+          void patchParticipantProfileHp(cid, nextHp);
+        }
+      }
       setShortRestState((prev) =>
         prev ? { ...prev, spentDice: Math.max(0, (prev.spentDice ?? 0) + 1) } : prev
       );
