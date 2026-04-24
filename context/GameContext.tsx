@@ -1617,6 +1617,16 @@ function buildMergedInitiativeOrder(
   localPlayerName: string | null,
   participantNameById: Record<string, string> = {}
 ): CombatEntry[] {
+  const compareInitiativeEntries = (a: CombatEntry, b: CombatEntry): number => {
+    const initDiff = Math.trunc(b?.initiative ?? 0) - Math.trunc(a?.initiative ?? 0);
+    if (initDiff !== 0) return initDiff;
+    const aId = String(a?.id ?? "").trim();
+    const bId = String(b?.id ?? "").trim();
+    if (aId && bId) return aId.localeCompare(bId);
+    if (aId) return -1;
+    if (bId) return 1;
+    return 0;
+  };
   const playerEntries: CombatEntry[] = playerIds.map((id) => {
     const ent = entities.find((e) => e.id === id) ?? null;
     const knownName = String(participantNameById?.[id] ?? "").trim();
@@ -1630,7 +1640,7 @@ function buildMergedInitiativeOrder(
       initiative: rolls[id]!,
     };
   });
-  return [...npcDraft, ...playerEntries].sort((a, b) => b.initiative - a.initiative);
+  return [...npcDraft, ...playerEntries].sort(compareInitiativeEntries);
 }
 
 interface PersistedPayload {
@@ -3310,6 +3320,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const localSvBeforeApply = sceneVersionRef.current;
     const remoteSv = typeof p.sceneVersion === "number" ? p.sceneVersion : 0;
     const canApplyRemoteSceneIdentity = remoteSv >= localSvBeforeApply;
+    const remoteRoomId = typeof p.currentRoomId === "string" ? p.currentRoomId : "";
+    const isRemoteRoomDifferent =
+      !!remoteRoomId && !!localRoomBeforeApply && String(remoteRoomId) !== String(localRoomBeforeApply);
+    // Snapshot stale d'une autre salle : ne jamais appliquer ses entités "actives"
+    // sur la scène locale courante (sinon apparition de PNJ fantômes pendant "MJ réfléchit").
+    const canApplyRemoteActiveEntities = canApplyRemoteSceneIdentity || !isRemoteRoomDifferent;
     if (canApplyRemoteSceneIdentity) {
       setCurrentSceneName(typeof p.currentSceneName === "string" ? p.currentSceneName : DEFAULT_SCENE_NAME);
       setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
@@ -3322,7 +3338,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
     let hostileCheckEntities: Entity[] = loadedEntities;
-    if (Array.isArray(p.entities)) {
+    if (Array.isArray(p.entities) && canApplyRemoteActiveEntities) {
       const prevEnts = (entitiesRef.current ?? []) as Entity[];
       // Toujours fusionner : `mergeIncomingEntitiesHpWithPrev` empêche un snapshot Firestore « en retard »
       // (PV encore pleins avant flush local) d'écraser des dégâts déjà appliqués ici (ic > pc → garde pc).
@@ -3351,10 +3367,13 @@ export function GameProvider({ children }: { children: ReactNode }) {
       } else {
         hostileCheckEntities = prevEnts;
       }
+    } else if (!canApplyRemoteActiveEntities) {
+      hostileCheckEntities = (entitiesRef.current ?? []) as Entity[];
     }
     setSceneVersion(Math.max(remoteSv, localSvBeforeApply));
 
-    if (!skipRemotePendingRollApplyRef.current) {
+    const canApplyRemoteRoomSnapshots = canApplyRemoteSceneIdentity || !isRemoteRoomDifferent;
+    if (!skipRemotePendingRollApplyRef.current && canApplyRemoteRoomSnapshots) {
       if (p.entitiesByRoom && typeof p.entitiesByRoom === "object" && !Array.isArray(p.entitiesByRoom)) {
         const nextMap: Record<string, Entity[]> = {};
         for (const [k, v] of Object.entries(p.entitiesByRoom)) {
@@ -3381,8 +3400,20 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     const hostileAlive = hostileCheckEntities.some((e) => isHostileReadyForCombat(e));
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
-    const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
+    const hostileInIncomingOrderStillAlive =
+      Array.isArray(p.combatOrder) &&
+      p.combatOrder.some((entry) => {
+        const id = String(entry?.id ?? "").trim();
+        if (!id) return false;
+        const ent = hostileCheckEntities.find((e) => String(e?.id ?? "").trim() === id);
+        return !!ent && isHostileReadyForCombat(ent);
+      });
+    // Combat déclenché côté hôte : même si ce client n'a pas encore reçu les hostiles
+    // (snapshot partiel/stale), on ne doit pas rétrograder immédiatement en exploration.
+    const preserveCombatFromPayload =
+      p.gameMode === "combat" &&
+      (hostileAlive || hostileInIncomingOrderStillAlive || inInitiativePhase);
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3403,6 +3434,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           setGameModeState("exploration");
         } else {
           const shouldCombat =
+            want === "combat" ||
             hasCombatOrder ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);
@@ -3455,8 +3487,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
     // Anti-stale : par défaut on n'applique que si le snapshot est >= local,
     // mais on force l'application si le serveur a déjà progressé l'initiative
     // (ordre final / rolls déjà reçus) : sinon l'UI redemande à tort sur reload.
+    const canApplyRemoteInitiativeState = canApplyRemoteSceneIdentity || !isRemoteRoomDifferent;
     const canApplyIncomingInitiative =
-      incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current || hasCombatOrderInPayload || hasAnyInitiativeRollInPayload;
+      canApplyRemoteInitiativeState &&
+      (incomingInitiativeMs >= initiativeStateUpdatedAtMsRef.current ||
+        hasCombatOrderInPayload ||
+        hasAnyInitiativeRollInPayload);
     /** Ref locale (bump clear-wait, etc.) avant ce merge — ne pas réarmer `wait` depuis un snapshot plus vieux. */
     const initiativeMsBaselineBeforeInitiativeMerge = initiativeStateUpdatedAtMsRef.current;
     if (canApplyIncomingInitiative) {
@@ -3808,8 +3844,9 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
     const hostileAlive = loadedEntities.some((e) => isHostileReadyForCombat(e));
     const hasCombatOrder = Array.isArray(p.combatOrder) && p.combatOrder.length > 0;
-    const preserveCombatFromPayload = p.gameMode === "combat" && hasCombatOrder;
     const inInitiativePhase = p.awaitingPlayerInitiative === true;
+    // Même logique dans la voie de chargement initial/snapshot complet.
+    const preserveCombatFromPayload = p.gameMode === "combat";
     if (p.gameMode === "combat" || p.gameMode === "exploration" || p.gameMode === "short_rest") {
       const incomingModeMs =
         typeof p.gameModeUpdatedAtMs === "number" && Number.isFinite(p.gameModeUpdatedAtMs)
@@ -3824,6 +3861,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
           setGameModeState("exploration");
         } else {
           const shouldCombat =
+            want === "combat" ||
             hasCombatOrder ||
             (hostileAlive && (want === "combat" || inInitiativePhase));
           setGameModeState(shouldCombat ? "combat" : want);

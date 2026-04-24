@@ -238,8 +238,8 @@ export const GOBLIN_CAVE = {
       },
       {
         id: "room_7",
-        direction: "sud",
-        description: "Dans le mur ouest, une autre porte se trouve au bout d'un couloir."
+        direction: "ouest",
+        description: "Dans le mur, une autre porte se trouve au bout d'un court couloir."
       },
       {
         id: "room_6",

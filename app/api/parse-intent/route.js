@@ -25,7 +25,7 @@ Sortie obligatoire :
 {
   "resolution": "combat_intent" | "requires_roll" | "trivial_success" | "impossible" | "unclear_input",
   "reason": "texte court",
-  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"use_item"|"stabilize"|"short_rest"|"end_short_rest"|"long_rest"|"wait"|"wait_until_recover_1hp"|"end_turn"|"loot", "targetId": "" | null, "weapon": "" },
+  "intent": null | { "type": "move"|"attack"|"move_and_attack"|"disengage"|"spell"|"dodge"|"second_wind"|"use_item"|"stabilize"|"short_rest"|"end_short_rest"|"long_rest"|"wait"|"wait_until_recover_1hp"|"end_turn"|"loot", "targetId": "" | null, "targetIds": ["id1","id2","id3"], "weapon": "" },
   "rollRequest": null | { "kind": "check"|"save"|"attack"|"gm_secret", "stat": "FOR"|"DEX"|"CON"|"INT"|"SAG"|"CHA", "skill": "Athlétisme", "dc": <nombre>, "raison": "...", "roll": "1d100", "audience": "single"|"global"|"selected", "rollTargetEntityIds": ["id_entité_pj", "..."] },
   "sceneUpdate": null | { "hasChanged": true, "targetRoomId": "..." }
 }
@@ -72,6 +72,11 @@ MÉDECINE / STABILISATION (priorité haute) :
 
 Combat : intent parmi move, attack, move_and_attack, disengage, spell, dodge, second_wind, use_item, stabilize, short_rest, end_short_rest, long_rest, wait_until_recover_1hp, end_turn, loot ; playerMeleeTargets distingue attack vs move_and_attack ; disengage/dodge/end_turn/second_wind/short_rest/long_rest : targetId peut être "" ou null. rollRequest=null et sceneUpdate=null.
 
+SORTS MULTI-CIBLES (important) :
+- Pour un sort visant plusieurs créatures (ex: Bénédiction), renseigne intent.targetIds avec les ids exacts des bénéficiaires (max 3 pour Bénédiction), dans l'ordre voulu.
+- intent.targetId peut rester vide dans ce cas, ou contenir la cible principale.
+- N'invente jamais d'id : utilise uniquement les ids présents dans Entités.
+
 RESSOURCES DE TOUR (Action, bonus, mouvement, réaction) : tu ne reçois pas cet état dans le message joueur. Ne déduis jamais resolution="impossible" du seul fait qu'il « manquerait » une Action, du mouvement ou une action bonus : le moteur client vérifie et affiche les refus. Dès que l'intention de combat est claire, renvoie combat_intent (ou move / attack selon le schéma).
 
 DÉPLACEMENT TACTIQUE (intent.type "move") — rapprochement vs repositionnement sans contact au corps à corps :
@@ -108,6 +113,9 @@ function normalizeEntitiesForPrompt(entities) {
           ? Math.trunc(e.hp.max)
           : null;
       const ds = e?.deathState && typeof e.deathState === "object" ? e.deathState : null;
+      const conditions = Array.isArray(e?.conditions)
+        ? e.conditions.map((x) => String(x ?? "").trim()).filter(Boolean)
+        : [];
       return {
         id: String(e.id).trim(),
         name: String(e.name ?? e.id).trim(),
@@ -129,6 +137,7 @@ function normalizeEntitiesForPrompt(entities) {
                 dead: ds.dead === true,
               }
             : null,
+        conditions,
       };
     });
 }
@@ -237,7 +246,7 @@ function buildUserContent({
       : entities
           .map(
             (e) =>
-              `- id: "${e.id}", name: "${e.name}", type: "${e.type ?? ""}", visible: ${e.visible}, isAlive: ${e.isAlive}, hp: ${e?.hp?.current ?? "?"}/${e?.hp?.max ?? "?"}, deathState: stable=${e?.deathState?.stable === true}, unconscious=${e?.deathState?.unconscious === true}, dead=${e?.deathState?.dead === true}`
+              `- id: "${e.id}", name: "${e.name}", type: "${e.type ?? ""}", visible: ${e.visible}, isAlive: ${e.isAlive}, hp: ${e?.hp?.current ?? "?"}/${e?.hp?.max ?? "?"}, deathState: stable=${e?.deathState?.stable === true}, unconscious=${e?.deathState?.unconscious === true}, dead=${e?.deathState?.dead === true}, conditions: [${Array.isArray(e?.conditions) ? e.conditions.map((c) => `"${c}"`).join(", ") : ""}]`
           )
           .join("\n");
   const wBlock =
@@ -382,6 +391,9 @@ function safeParseArbiterJson(raw) {
       intent = {
         type,
         targetId: data.intent.targetId == null ? "" : String(data.intent.targetId).trim(),
+        targetIds: Array.isArray(data.intent.targetIds)
+          ? [...new Set(data.intent.targetIds.map((x) => String(x ?? "").trim()).filter(Boolean))]
+          : [],
         weapon: data.intent.weapon == null ? "" : String(data.intent.weapon).trim(),
       };
     }
@@ -512,6 +524,19 @@ function sanitizeIntentRollRequestAgainstEntities(rollRequest, entList) {
   }
   const { audience: _a, rollTargetEntityIds: _r, ...rest } = rollRequest;
   return rest;
+}
+
+function sanitizeIntentTargetIdsAgainstEntities(intent, entList) {
+  if (!intent || typeof intent !== "object") return intent;
+  const rawTargetIds = Array.isArray(intent.targetIds) ? intent.targetIds : [];
+  if (!rawTargetIds.length) return { ...intent, targetIds: [] };
+  const entityIds = new Set(
+    (Array.isArray(entList) ? entList : [])
+      .map((e) => (e && e.id != null ? String(e.id).trim() : ""))
+      .filter(Boolean)
+  );
+  const targetIds = [...new Set(rawTargetIds.map((x) => String(x ?? "").trim()).filter((id) => entityIds.has(id)))];
+  return { ...intent, targetIds };
 }
 
 // Aucune heuristique locale basée sur des mots-clés utilisateur ici.
@@ -673,6 +698,9 @@ export async function POST(request) {
           parsedDecision.rollRequest,
           entList
         );
+      }
+      if (parsedDecision?.intent) {
+        parsedDecision.intent = sanitizeIntentTargetIdsAgainstEntities(parsedDecision.intent, entList);
       }
     }
 
