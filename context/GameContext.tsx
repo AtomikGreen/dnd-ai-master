@@ -3638,8 +3638,12 @@ export function GameProvider({ children }: { children: ReactNode }) {
         // Même index ne veut pas forcément dire même tour (wrap de round, bump seq).
         // Sans ce garde, un snapshot peut AND-fusionner des ressources "consommées"
         // du tour précédent sur un nouveau tour du même combattant.
+        // IMPORTANT MP : après établissement de l'initiative locale, un payload sans write-seq
+        // n'est pas autoritaire ; il ne doit jamais être considéré comme "même segment".
         const sameCombatSegmentBySeq =
-          incomingTurnWriteSeq === null || incomingTurnWriteSeq === localTurnWriteSeqBeforeApply;
+          incomingTurnWriteSeq !== null
+            ? incomingTurnWriteSeq === localTurnWriteSeqBeforeApply
+            : !localInitiativeAlreadyEstablished;
         const sameCombatSegment =
           p.gameMode === "combat" &&
           sameCombatSegmentBySeq &&
@@ -3703,6 +3707,23 @@ export function GameProvider({ children }: { children: ReactNode }) {
                 [mpId]: normalizeTurnResourcesInput(selfLocal),
               };
             }
+          }
+          // Hors du tour local : conserver l'état local des ressources du PJ courant.
+          // Sinon, un snapshot distant plus ancien (même segment global) peut AND-fusionner
+          // `action/movement=false` et faire "disparaître" les ressources de ce PJ hors-tour.
+          if (!imActiveNow && selfLocal) {
+            mergedMap = {
+              ...mergedMap,
+              [mpId]: normalizeTurnResourcesInput(selfLocal),
+            };
+          }
+          // Snapshot partiel/non autoritaire (sans write-seq) : ne jamais laisser un état distant
+          // rétrograder les ressources locales du PJ courant hors de son tour.
+          if (!hasAuthoritativeIncomingTurnSeq && selfLocal) {
+            mergedMap = {
+              ...mergedMap,
+              [mpId]: normalizeTurnResourcesInput(selfLocal),
+            };
           }
         }
         turnResourcesByCombatantIdRef.current = mergedMap;

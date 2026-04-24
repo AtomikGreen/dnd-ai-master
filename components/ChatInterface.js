@@ -4073,7 +4073,20 @@ export default function ChatInterface() {
       reaction: true,
       movement: true,
     });
-  }, [localCombatantId, setReactionFor, setTurnResourcesSynced]);
+    // MP : le grant de début de tour doit être persistant immédiatement (Firestore),
+    // sinon un snapshot distant peut réafficher un ancien état hors-tour.
+    if (multiplayerSessionId) {
+      queueMicrotask(() => {
+        void flushMultiplayerSharedState().catch(() => {});
+      });
+    }
+  }, [
+    flushMultiplayerSharedState,
+    localCombatantId,
+    multiplayerSessionId,
+    setReactionFor,
+    setTurnResourcesSynced,
+  ]);
   const lockPlayerTurnResourcesForSurprise = useCallback(() => {
     setReactionFor(localCombatantId, false);
     setTurnResourcesSynced({
@@ -4082,7 +4095,19 @@ export default function ChatInterface() {
       reaction: false,
       movement: false,
     });
-  }, [localCombatantId, setReactionFor, setTurnResourcesSynced]);
+    // MP : idem pour le cas surprise (état "tour perdu" partagé immédiatement).
+    if (multiplayerSessionId) {
+      queueMicrotask(() => {
+        void flushMultiplayerSharedState().catch(() => {});
+      });
+    }
+  }, [
+    flushMultiplayerSharedState,
+    localCombatantId,
+    multiplayerSessionId,
+    setReactionFor,
+    setTurnResourcesSynced,
+  ]);
   const clearPlayerSurprisedState = useCallback(() => {
     if (player?.surprised !== true) return false;
     updatePlayer({ surprised: false });
@@ -11295,7 +11320,11 @@ export default function ChatInterface() {
               const next = fnOrObj(prevNorm);
               if (next && typeof next === "object") {
                 Object.assign(trWork, next);
-                turnResourcesRef.current = normalizeTurnResourcesInput(next);
+                // Ne jamais écraser la ref locale du PJ avec les ressources d'un autre combattant.
+                // Sinon l'UI/les gardes locaux lisent un faux état hors-tour (ex. Action=false fantôme).
+                if (actingIsLocalMpPuppet) {
+                  turnResourcesRef.current = normalizeTurnResourcesInput(next);
+                }
               }
               setTurnResourcesForCombatant(meleeIdForCombat, () =>
                 normalizeTurnResourcesInput(trWork)
@@ -11304,7 +11333,9 @@ export default function ChatInterface() {
               const prevNorm = normalizeTurnResourcesInput(trWork);
               const merged = { ...prevNorm, ...fnOrObj };
               Object.assign(trWork, merged);
-              turnResourcesRef.current = normalizeTurnResourcesInput(merged);
+              if (actingIsLocalMpPuppet) {
+                turnResourcesRef.current = normalizeTurnResourcesInput(merged);
+              }
               setTurnResourcesForCombatant(meleeIdForCombat, () =>
                 normalizeTurnResourcesInput(trWork)
               );
