@@ -2140,11 +2140,25 @@ function buildInitialCampaignSharedPayload(): SharedSessionPayload {
     id: OPENING_MSG_ID_FORGE_INTRO,
     role: "ai",
     content:
-      `À la forge de Thron, l'ambiance est lourde : le chef du village vous a convoqués à l'abri des oreilles indiscrètes. ` +
-      `Il essuie ses mains noircies sur son tablier, puis baisse la voix.\n\n` +
-      `« Mes enfants… le commis du meunier a vu des gobelins sur la colline à l’ouest. Ils portaient une jeune femme… et elle ressemblait à ma Lanéa. »\n` +
-      `Sa mâchoire se crispe; le feu crépite dans le foyer.\n\n` +
-      `« Je vous en supplie. Ramenez-la discrètement. Si sa mère l’apprend… elle en mourra d’inquiétude. »`,
+      `En début d’après-midi, Thron, le forgeron qui fait également\n` +
+      `office de chef du village, convoque les personnages.\n` +
+      `Mes enfants, vous êtes les jeunes les plus aguerris du\n` +
+      `village, et certains d’entre vous sont des amis de ma fille\n` +
+      `Lanéa.\n` +
+      `Un commis du vieil Erdrios, le meunier, vient de\n` +
+      `m’apprendre qu’il vient de voir sur la colline un petit\n` +
+      `groupe de gobelins portant une jeune femme qui\n` +
+      `ressemblait beaucoup à ma fille. Or justement Lanéa est\n` +
+      `partie tôt ce matin dans cette direction, et elle n’est pas\n` +
+      `revenue à l’heure du repas. Je ne vous cache pas ma\n` +
+      `préoccupation, et si sa mère l’apprend, elle risque de\n` +
+      `mourir d’inquiétude.\n` +
+      `Alors en toute franchise, je voudrais vous demander un\n` +
+      `énorme service : pourriez-vous aller vérifier si c’est bien\n` +
+      `ma fille que ces monstres ont attrapée et, si vous le\n` +
+      `pensez possible, en profiter pour la délivrer des mains de\n` +
+      `ces créatures ? Si j’y vais moi, ma femme va se douter\n` +
+      `que quelque chose de grave est en train de se passer.`,
   });
   const rawEntities = [
     {
@@ -3410,6 +3424,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
       typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
         ? Math.trunc(p.combatTurnWriteSeq)
         : null;
+    const hasAuthoritativeIncomingTurnSeq =
+      incomingTurnWriteSeq !== null || combatTurnWriteSeqRef.current <= 0;
     /** Snapshot plus ancien que nos derniers commits locaux d’index — ne pas réappliquer l’index (vas-et-vient initiative). */
     const staleCombatTurnWrite =
       incomingTurnWriteSeq !== null && incomingTurnWriteSeq < combatTurnWriteSeqRef.current;
@@ -3443,15 +3459,23 @@ export function GameProvider({ children }: { children: ReactNode }) {
         setCombatTurnIndexState(0);
         setCombatTurnWriteSeqState(0);
       } else if (Array.isArray(p.combatOrder)) {
-        setCombatOrderState(p.combatOrder);
-        combatOrderRef.current = p.combatOrder;
-        if (!staleCombatTurnWrite) {
-          setCombatTurnIndex(
-            incomingCombatTurnIdx,
-            incomingTurnWriteSeq !== null ? { forceWriteSeq: incomingTurnWriteSeq } : undefined
-          );
+        const incomingCombatOrder = p.combatOrder;
+        const localCombatOrderLen = Array.isArray(combatOrderRef.current) ? combatOrderRef.current.length : 0;
+        const shouldIgnoreTransientEmptyCombatOrder =
+          incomingCombatOrder.length === 0 &&
+          localCombatOrderLen > 0 &&
+          (hostileAlive || preserveCombatFromPayload);
+        if (!shouldIgnoreTransientEmptyCombatOrder && hasAuthoritativeIncomingTurnSeq) {
+          setCombatOrderState(incomingCombatOrder);
+          combatOrderRef.current = incomingCombatOrder;
+          if (!staleCombatTurnWrite) {
+            setCombatTurnIndex(
+              incomingCombatTurnIdx,
+              incomingTurnWriteSeq !== null ? { forceWriteSeq: incomingTurnWriteSeq } : undefined
+            );
+          }
         }
-      } else if (!staleCombatTurnWrite) {
+      } else if (!staleCombatTurnWrite && hasAuthoritativeIncomingTurnSeq) {
         setCombatTurnIndex(
           incomingCombatTurnIdx,
           incomingTurnWriteSeq !== null ? { forceWriteSeq: incomingTurnWriteSeq } : undefined
@@ -3781,6 +3805,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
         typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
           ? Math.trunc(p.combatTurnWriteSeq)
           : null;
+      const hasAuthoritativeIncomingTurnSeqP =
+        incomingTurnWriteSeqP !== null || combatTurnWriteSeqRef.current <= 0;
       const staleCombatTurnWriteP =
         incomingTurnWriteSeqP !== null && incomingTurnWriteSeqP < combatTurnWriteSeqRef.current;
       if (canApplyIncomingInitiativeP) {
@@ -3796,19 +3822,27 @@ export function GameProvider({ children }: { children: ReactNode }) {
           setCombatTurnIndexState(0);
           setCombatTurnWriteSeqState(0);
         } else if (Array.isArray(p.combatOrder)) {
-          setCombatOrderState(p.combatOrder);
-          combatOrderRef.current = p.combatOrder;
-          if (!staleCombatTurnWriteP) {
-            const idx =
-              typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
-                ? Math.trunc(p.combatTurnIndex)
-                : 0;
-            setCombatTurnIndex(
-              idx,
-              incomingTurnWriteSeqP !== null ? { forceWriteSeq: incomingTurnWriteSeqP } : undefined
-            );
+          const incomingCombatOrderP = p.combatOrder;
+          const localCombatOrderLenP = Array.isArray(combatOrderRef.current) ? combatOrderRef.current.length : 0;
+          const shouldIgnoreTransientEmptyCombatOrderP =
+            incomingCombatOrderP.length === 0 &&
+            localCombatOrderLenP > 0 &&
+            (hostileAlive || preserveCombatFromPayload);
+          if (!shouldIgnoreTransientEmptyCombatOrderP && hasAuthoritativeIncomingTurnSeqP) {
+            setCombatOrderState(incomingCombatOrderP);
+            combatOrderRef.current = incomingCombatOrderP;
+            if (!staleCombatTurnWriteP) {
+              const idx =
+                typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
+                  ? Math.trunc(p.combatTurnIndex)
+                  : 0;
+              setCombatTurnIndex(
+                idx,
+                incomingTurnWriteSeqP !== null ? { forceWriteSeq: incomingTurnWriteSeqP } : undefined
+              );
+            }
           }
-        } else if (!staleCombatTurnWriteP) {
+        } else if (!staleCombatTurnWriteP && hasAuthoritativeIncomingTurnSeqP) {
           const idx =
             typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
               ? Math.trunc(p.combatTurnIndex)
@@ -4168,7 +4202,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const profMs =
       typeof prof.updatedAtMs === "number" && Number.isFinite(prof.updatedAtMs) ? prof.updatedAtMs : 0;
     const lastPush = lastLocalParticipantProfilePushAtMsRef.current;
-    if (lastPush >= 0 && profMs + MULTIPLAYER_PROFILE_CLOCK_SKEW_TOLERANCE_MS < lastPush) return;
+    // PV locaux : on refuse strictement tout profil plus ancien que notre dernier push.
+    // Une large tolérance temporelle ici provoque des oscillations (valeur locale fraîche
+    // écrasée par un snapshot Firestore arrivé en retard).
+    if (lastPush >= 0 && profMs < lastPush) return;
     const prev = playerRef.current;
     if (!prev?.hp) return;
     const nextCur = Math.max(0, Math.trunc(prof.hpCurrent));
@@ -7518,11 +7555,25 @@ export function GameProvider({ children }: { children: ReactNode }) {
       id: OPENING_MSG_ID_FORGE_INTRO,
       role: "ai",
       content:
-        `À la forge de Thron, l'ambiance est lourde : le chef du village vous a convoqués à l'abri des oreilles indiscrètes. ` +
-        `Il essuie ses mains noircies sur son tablier, puis baisse la voix.\n\n` +
-        `« Mes enfants… le commis du meunier a vu des gobelins sur la colline à l’ouest. Ils portaient une jeune femme… et elle ressemblait à ma Lanéa. »\n` +
-        `Sa mâchoire se crispe; le feu crépite dans le foyer.\n\n` +
-        `« Je vous en supplie. Ramenez-la discrètement. Si sa mère l’apprend… elle en mourra d’inquiétude. »`,
+        `En début d’après-midi, Thron, le forgeron qui fait également\n` +
+        `office de chef du village, convoque les personnages.\n` +
+        `Mes enfants, vous êtes les jeunes les plus aguerris du\n` +
+        `village, et certains d’entre vous sont des amis de ma fille\n` +
+        `Lanéa.\n` +
+        `Un commis du vieil Erdrios, le meunier, vient de\n` +
+        `m’apprendre qu’il vient de voir sur la colline un petit\n` +
+        `groupe de gobelins portant une jeune femme qui\n` +
+        `ressemblait beaucoup à ma fille. Or justement Lanéa est\n` +
+        `partie tôt ce matin dans cette direction, et elle n’est pas\n` +
+        `revenue à l’heure du repas. Je ne vous cache pas ma\n` +
+        `préoccupation, et si sa mère l’apprend, elle risque de\n` +
+        `mourir d’inquiétude.\n` +
+        `Alors en toute franchise, je voudrais vous demander un\n` +
+        `énorme service : pourriez-vous aller vérifier si c’est bien\n` +
+        `ma fille que ces monstres ont attrapée et, si vous le\n` +
+        `pensez possible, en profiter pour la délivrer des mains de\n` +
+        `ces créatures ? Si j’y vais moi, ma femme va se douter\n` +
+        `que quelque chose de grave est en train de se passer.`,
     });
     messagesStateRef.current = openingMsgs;
     setMessages(openingMsgs);

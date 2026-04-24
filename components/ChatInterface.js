@@ -2374,7 +2374,10 @@ function executeCombatActionIntent(intent, ctx) {
     return fail("Action impossible : aucune cible indiquée.");
   }
   let targetEnt = findLivingTarget(targetId);
-  if (!targetEnt && type === "spell") {
+  if (
+    !targetEnt &&
+    (type === "spell" || type === "move" || type === "stabilize" || type === "use_item")
+  ) {
     const targetRefNorm = normalizeFr(String(targetId ?? ""));
     const participantProfilesLive = multiplayerParticipantProfilesRef.current;
     const mpSpellTarget = Array.isArray(participantProfilesLive)
@@ -2399,6 +2402,8 @@ function executeCombatActionIntent(intent, ctx) {
         mpSpellTarget?.playerSnapshot && typeof mpSpellTarget.playerSnapshot === "object"
           ? mpSpellTarget.playerSnapshot
           : null;
+      const snapDeathState =
+        snap?.deathState && typeof snap.deathState === "object" ? snap.deathState : null;
       const hpCur =
         typeof mpSpellTarget?.hpCurrent === "number" && Number.isFinite(mpSpellTarget.hpCurrent)
           ? Math.trunc(mpSpellTarget.hpCurrent)
@@ -2416,7 +2421,8 @@ function executeCombatActionIntent(intent, ctx) {
         name: String(mpSpellTarget?.name ?? snap?.name ?? "allié").trim() || "allié",
         type: "friendly",
         visible: true,
-        isAlive: true,
+        // En MP, un allié à 0 PV peut être inconscient et rester une cible valide (stabiliser / s'approcher).
+        isAlive: snapDeathState?.dead !== true,
         hp: { current: hpCur, max: hpMax },
         deathState:
           snap?.deathState && typeof snap.deathState === "object" ? snap.deathState : undefined,
@@ -4519,9 +4525,10 @@ export default function ChatInterface() {
   }
 
   function restorePlayerToConsciousness(nextHp) {
+    const clampedHpForSync = Math.max(1, Math.trunc(Number(nextHp) || 1));
     setPlayer((prev) => {
       if (!prev?.hp) return prev;
-      const clampedHp = Math.max(1, Math.min(nextHp, prev.hp.max));
+      const clampedHp = Math.max(1, Math.min(clampedHpForSync, prev.hp.max));
       playerHpRef.current = clampedHp;
       return {
         ...prev,
@@ -4530,6 +4537,16 @@ export default function ChatInterface() {
         deathState: resetPlayerDeathState(),
       };
     });
+    if (multiplayerSessionId) {
+      const cid = String(clientId ?? "").trim();
+      if (cid) {
+        // Nat 20 (death save) : synchroniser immédiatement HP + deathState.
+        // Sinon un snapshot profile stale peut réécrire transitoirement les anciens PV (oscillation UI).
+        void patchParticipantProfileDeathState(cid, resetPlayerDeathState(), {
+          hpCurrent: clampedHpForSync,
+        });
+      }
+    }
   }
 
   // Déduplication idempotente des secrets MJ.
@@ -5762,6 +5779,8 @@ export default function ChatInterface() {
   const tacticianInFlightByKeyRef = useRef(new Map());
   /** Anti-rejeu robuste : tours ennemis déjà résolus pour (engagement, round, enemyId). */
   const processedEnemyTurnKeysRef = useRef(new Set());
+  /** Anti-rollback : ennemis déjà joués depuis le dernier passage sur un slot joueur. */
+  const processedEnemySinceLastPlayerSlotRef = useRef(new Set());
 
   function commitCombatTurnIndex(next) {
     const prev = combatTurnIndexLiveRef.current;
@@ -6325,15 +6344,24 @@ export default function ChatInterface() {
       tacticianInFlightByKeyRef.current.clear();
       tacticianFetchTailRef.current = Promise.resolve();
       processedEnemyTurnKeysRef.current.clear();
+      processedEnemySinceLastPlayerSlotRef.current.clear();
       lastTurnResourcesGrantKeyRef.current = null;
       scheduledStableCombatTurnAdvanceKeys.clear();
     }
     if (len === 0) {
+      // Snapshot MP partiel possible (combatOrder vide transitoire alors que le combat continue).
+      // Ne pas purger les gardes anti-rejeu dans ce cas, sinon le même PNJ peut rejouer son tour.
+      const modeNow = gameStateRef.current?.gameMode ?? gameMode;
+      if (modeNow === "combat" && prevCombatOrderLenForEngagementRef.current > 0) {
+        prevCombatOrderLenForEngagementRef.current = len;
+        return;
+      }
       combatRoundInEngagementRef.current = 0;
       tacticianTurnCacheRef.current.clear();
       tacticianInFlightByKeyRef.current.clear();
       tacticianFetchTailRef.current = Promise.resolve();
       processedEnemyTurnKeysRef.current.clear();
+      processedEnemySinceLastPlayerSlotRef.current.clear();
       lastTurnResourcesGrantKeyRef.current = null;
       scheduledStableCombatTurnAdvanceKeys.clear();
     }
@@ -9717,6 +9745,7 @@ export default function ChatInterface() {
       if (!entry) break;
 
       if (controllerForCombatantId(entry.id, currentEntities) === "player") {
+        processedEnemySinceLastPlayerSlotRef.current.clear();
         commitCombatTurnIndex(idx);
         // Tour d'un autre PJ (MP ou 2ᵉ fiche solo) : à 0 PV stabilisé, avancer une seule fois (évite initiative figée / double tour PNJ).
         if (!isLocalPlayerCombatantId(entry.id)) {
@@ -9798,6 +9827,7 @@ export default function ChatInterface() {
             ? Math.trunc(gameStateRef.current.combatTurnWriteSeq)
             : Math.trunc(combatTurnWriteSeq ?? 0);
         const turnKey = `${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${liveEnemy.id}`;
+        const turnStickyKey = `${combatEngagementSeqRef.current}:${liveEnemy.id}`;
         if (shouldSkipTurnForCommand(liveEnemy.conditions)) {
           commitCombatTurnIndex(idx);
           const cmdSkipMsgId = `npc-command-skip:${turnKey.replace(/:/g, "-")}`;
@@ -9862,6 +9892,15 @@ export default function ChatInterface() {
           commitCombatTurnIndex(idx);
           continue;
         }
+        if (processedEnemySinceLastPlayerSlotRef.current.has(turnStickyKey)) {
+          // Rollback d'initiative / snapshot périmé : on est revenu sur le même ennemi
+          // sans qu'un slot joueur ait été traversé. Ne pas rejouer ce tour.
+          currentEntities = gameStateRef.current?.entities ?? entities;
+          order = gameStateRef.current?.combatOrder ?? order;
+          idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
+          commitCombatTurnIndex(idx);
+          continue;
+        }
         // Si `simulateSingleEnemyTurn` lève (ex. tacticien indisponible), aucune clé « traité » :
         // le retry ou le prochain kickoff peut rejouer le slot complet (arbitre + tactique).
         await simulateSingleEnemyTurn(liveEnemy, { tacticianSlotIndex: idx });
@@ -9873,6 +9912,7 @@ export default function ChatInterface() {
         // Désactivé volontairement : l'arbitre n'est appelé qu'au début de tour.
         // Évite un 2e appel GM_ARBITER juste après le GM_TACTICIAN.
         processedEnemyTurnKeysRef.current.add(turnKey);
+        processedEnemySinceLastPlayerSlotRef.current.add(turnStickyKey);
         // Surprise consommée dans `simulateSingleEnemyTurn` (branche surpris) — ne pas dupliquer ici.
       }
       currentEntities = gameStateRef.current?.entities ?? entities;

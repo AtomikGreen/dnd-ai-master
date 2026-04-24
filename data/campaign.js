@@ -56,7 +56,7 @@ export const GOBLIN_CAVE = {
   // --- SCÈNES D'INTRODUCTION ---
   "scene_village": {
     id: "scene_village",
-    title: "Le Village de Fial - La Forge de Thron",
+    title: "Le Village de Fial",
     description: "En début d’après-midi, Thron, le forgeron qui fait également office de chef du village, convoque les personnages. 'Mes enfants, vous êtes les jeunes les plus aguerris du village, et certains d’entre vous sont des amis de ma fille Lanéa. Un commis du vieil Erdrios, le meunier, vient de m’apprendre qu’il vient de voir sur la colline un petit groupe de gobelins portant une jeune femme qui ressemblait beaucoup à ma fille. Or justement Lanéa est partie tôt ce matin dans cette direction, et elle n’est pas revenue à l’heure du repas. Je ne vous cache pas ma préoccupation, et si sa mère l’apprend, elle risque de mourir d’inquiétude. Alors en toute franchise, je voudrais vous demander un énorme service : pourriez-vous aller vérifier si c’est bien ma fille que ces monstres ont attrapée et, si vous le pensez possible, en profiter pour la délivrer des mains de ces créatures ? Si j’y vais moi, ma femme va se douter que quelque chose de grave est en train de se passer.'",
     secrets: "Le commis du meunier, qui a suivi de loin les gobelins, pourra indiquer au groupe où se situe l’entrée de leur antre, à environ trois heures de marche à l’ouest, dans les collines, mais il se gardera bien, personnellement, de s’approcher trop près. De plus, si les personnages posent quelques questions aux autres villageois avant de partir, ils apprennent également qu’un gobelours, un monstre bien plus grand et bien plus fort qu’un gobelin, a également été aperçu du même côté il y a quelques jours.",
     exits: [
@@ -71,7 +71,7 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 90% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
     exits: [
       {
         id: "room_intro",
