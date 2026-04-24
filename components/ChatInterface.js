@@ -4922,7 +4922,7 @@ export default function ChatInterface() {
       const currentSlots = combatant?.spellSlots ?? null;
       const nextSlots = typeof updater === "function" ? updater(currentSlots) : updater;
       if (!nextSlots) return null;
-      if (combatantId === "player") {
+      if (combatantId === "player" || isLocalPlayerCombatantId(combatantId)) {
         updatePlayer({ spellSlots: nextSlots });
       } else {
         applyEntityUpdates([{ id: combatantId, action: "update", spellSlots: nextSlots }]);
@@ -5799,6 +5799,32 @@ export default function ChatInterface() {
       const prefixToDrop = `${seq}:${roundBefore}:`;
       processedEnemyTurnKeysRef.current = new Set(
         [...processedEnemyTurnKeysRef.current].filter((k) => !String(k).startsWith(prefixToDrop))
+      );
+    }
+    if (debugMode) {
+      const prevEntry = len > 0 ? order[Math.min(Math.max(0, prev), len - 1)] ?? null : null;
+      const nextEntry = len > 0 ? order[Math.min(Math.max(0, next), len - 1)] ?? null : null;
+      const prevId = String(prevEntry?.id ?? "").trim() || null;
+      const nextId = String(nextEntry?.id ?? "").trim() || null;
+      const prevName = String(prevEntry?.name ?? "").trim() || prevId || "—";
+      const nextName = String(nextEntry?.name ?? "").trim() || nextId || "—";
+      addMessage(
+        "ai",
+        `[DEBUG][TURN_COMMIT]\n` +
+          safeJson({
+            prevIdx: prev,
+            nextIdx: next,
+            prevId,
+            nextId,
+            prevName,
+            nextName,
+            orderLen: len,
+            engagementSeq: combatEngagementSeqRef.current,
+            roundInEngagement: combatRoundInEngagementRef.current,
+            sourceHint: enemyTurnLoopInProgressRef.current ? "enemy-loop" : "local/sync",
+          }),
+        "debug",
+        makeMsgId()
       );
     }
     combatTurnIndexLiveRef.current = next;
@@ -7465,19 +7491,65 @@ export default function ChatInterface() {
           player?.name ?? null
         );
         const inMelee = engagedWithEnemy.includes(id);
+        const remoteProfileForHp =
+          String(id).startsWith("mp-player-") &&
+          (!multiplayerSessionId || !clientId || id !== `mp-player-${String(clientId).trim()}`)
+            ? Array.isArray(multiplayerParticipantProfiles)
+              ? multiplayerParticipantProfiles.find(
+                  (p) => `mp-player-${String(p?.clientId ?? "").trim()}` === String(id)
+                ) ?? null
+              : null
+            : null;
         const liveHp = getCombatantCurrentHp(combatant);
+        const profileHpCurrent =
+          typeof remoteProfileForHp?.hpCurrent === "number" && Number.isFinite(remoteProfileForHp.hpCurrent)
+            ? Math.trunc(remoteProfileForHp.hpCurrent)
+            : null;
+        const profileHpMax =
+          typeof remoteProfileForHp?.hpMax === "number" && Number.isFinite(remoteProfileForHp.hpMax)
+            ? Math.max(1, Math.trunc(remoteProfileForHp.hpMax))
+            : null;
         const hpOut =
           combatant.hp && typeof combatant.hp === "object"
             ? {
-                current: liveHp ?? combatant.hp.current,
-                max: combatant.hp.max,
+                current: profileHpCurrent ?? liveHp ?? combatant.hp.current,
+                max: profileHpMax ?? combatant.hp.max,
               }
             : null;
 
         const localMpIdForDeath =
           multiplayerSessionId && clientId ? `mp-player-${String(clientId).trim()}` : null;
+        const remoteSnapForDeath =
+          remoteProfileForHp?.playerSnapshot && typeof remoteProfileForHp.playerSnapshot === "object"
+            ? remoteProfileForHp.playerSnapshot
+            : null;
+        const remoteForDeath =
+          remoteSnapForDeath || profileHpCurrent != null
+            ? {
+                ...combatant,
+                hp: {
+                  ...(combatant?.hp && typeof combatant.hp === "object" ? combatant.hp : {}),
+                  current:
+                    profileHpCurrent ??
+                    (combatant?.hp && typeof combatant.hp.current === "number"
+                      ? combatant.hp.current
+                      : 0),
+                  max:
+                    profileHpMax ??
+                    (combatant?.hp && typeof combatant.hp.max === "number"
+                      ? combatant.hp.max
+                      : Math.max(1, profileHpCurrent ?? 1)),
+                },
+                ...(remoteSnapForDeath?.deathState &&
+                typeof remoteSnapForDeath.deathState === "object"
+                  ? { deathState: remoteSnapForDeath.deathState }
+                  : {}),
+              }
+            : null;
         const srcForDeath =
-          id === "player" || (localMpIdForDeath && id === localMpIdForDeath) ? player : combatant;
+          id === "player" || (localMpIdForDeath && id === localMpIdForDeath)
+            ? player
+            : remoteForDeath ?? combatant;
         const deathSnap = getPlayerDeathStateSnapshot(srcForDeath);
         let isAliveTactic = deathSnap.dead !== true;
         if (String(id).startsWith("mp-player-") && (!localMpIdForDeath || id !== localMpIdForDeath)) {
@@ -8343,6 +8415,9 @@ export default function ChatInterface() {
           const slotResult = spendSpellSlotForCombatant(liveTarget.id, SPELLS[canon]?.level ?? 1);
           if (compV.ok && slotResult.ok) {
             setReactionFor(liveTarget.id, false);
+            if (isLocalPlayerCombatantId(liveTarget.id)) {
+              consumeResource(setTurnResourcesSynced, "combat", "reaction");
+            }
             const orderLen = Math.max(
               1,
               (gameStateRef.current?.combatOrder ?? combatOrder ?? []).length
@@ -9659,6 +9734,17 @@ export default function ChatInterface() {
 
     if (!order?.length) return;
 
+    const scheduleEnemyChainNextTurn = async (chainKey) => {
+      if (multiplayerSessionId) {
+        try {
+          await flushMultiplayerSharedState();
+        } catch {
+          /* ignore */
+        }
+      }
+      scheduleStableCombatTurnAdvance(chainKey, () => nextTurn());
+    };
+
     // Sécurité : si aucun PJ vivant n'est dans l'ordre, on met le combat en pause
     // et on évite une boucle "ennemi→ennemi..." sans point d'arrêt joueur.
     if (
@@ -9812,20 +9898,16 @@ export default function ChatInterface() {
         const liveEnemy = resolveCombatOrderEntity(entry, currentEntities, order);
         if (!liveEnemy || !liveEnemy.isAlive || liveEnemy.type !== "hostile") {
           // Ne pas `continue` sans avancer : sinon même index rejoué + journal « fin de tour » en boucle.
-          idx = nextAliveTurnIndexFromActor(order, idx, entry.id, currentEntities);
-          commitCombatTurnIndex(idx);
-          continue;
+          await scheduleEnemyChainNextTurn(
+            `enemy-chain-missing:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${String(entry?.id ?? "unknown")}`
+          );
+          return;
         }
         const enemyStartsSurprised = liveEnemy.surprised === true;
         setReactionFor(liveEnemy.id, !enemyStartsSurprised);
         // Garde anti-rejeu robuste en multijoueur :
         // l'index peut changer (snapshot/ordre compacté) sans que le tour ennemi ait réellement avancé.
         // On verrouille donc par engagement + manche + id ennemi (pas par index).
-        const turnWriteSeqForProcessed =
-          typeof gameStateRef.current?.combatTurnWriteSeq === "number" &&
-          Number.isFinite(gameStateRef.current.combatTurnWriteSeq)
-            ? Math.trunc(gameStateRef.current.combatTurnWriteSeq)
-            : Math.trunc(combatTurnWriteSeq ?? 0);
         const turnKey = `${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${liveEnemy.id}`;
         const turnStickyKey = `${combatEngagementSeqRef.current}:${liveEnemy.id}`;
         if (shouldSkipTurnForCommand(liveEnemy.conditions)) {
@@ -9857,10 +9939,11 @@ export default function ChatInterface() {
           await yieldCombatUiSync();
           currentEntities = gameStateRef.current?.entities ?? entities;
           order = gameStateRef.current?.combatOrder ?? order;
-          idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
-          commitCombatTurnIndex(idx);
           processedEnemyTurnKeysRef.current.add(turnKey);
-          continue;
+          await scheduleEnemyChainNextTurn(
+            `enemy-chain-command:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${String(liveEnemy?.id ?? "unknown")}`
+          );
+          return;
         }
         if (processedEnemyTurnKeysRef.current.has(turnKey)) {
           // Snapshot stale / redéclenchement : ce tour a déjà été résolu, ne pas rejouer.
@@ -9875,31 +9958,20 @@ export default function ChatInterface() {
               );
             }
           }
-          // MP/resync : même si le tour a déjà été traité ailleurs, on doit garder un journal
-          // local cohérent (sinon le PNJ "saute" sans trace visible côté client observateur).
-          const endEid = String(entry?.id ?? liveEnemy?.id ?? "").trim() || "unknown";
-          const turnEndMsgId = `npc-turn-end:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${endEid}`;
-          const turnEndDivId = `npc-turn-end-div:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${turnWriteSeqForProcessed}:${endEid}`;
-          if (!messagesRef.current.some((m) => m && m.id === turnEndMsgId)) {
-            addMessage("ai", `**${liveEnemy.name}** met fin à son tour.`, "turn-end", turnEndMsgId);
-          }
-          if (!messagesRef.current.some((m) => m && m.id === turnEndDivId)) {
-            addMessage("ai", "", "turn-divider", turnEndDivId);
-          }
           currentEntities = gameStateRef.current?.entities ?? entities;
           order = gameStateRef.current?.combatOrder ?? order;
-          idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
-          commitCombatTurnIndex(idx);
-          continue;
+          await scheduleEnemyChainNextTurn(
+            `enemy-chain-processed:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${String(liveEnemy?.id ?? "unknown")}`
+          );
+          return;
         }
         if (processedEnemySinceLastPlayerSlotRef.current.has(turnStickyKey)) {
           // Rollback d'initiative / snapshot périmé : on est revenu sur le même ennemi
           // sans qu'un slot joueur ait été traversé. Ne pas rejouer ce tour.
-          currentEntities = gameStateRef.current?.entities ?? entities;
-          order = gameStateRef.current?.combatOrder ?? order;
-          idx = nextAliveTurnIndexFromActor(order, idx, liveEnemy.id, currentEntities);
-          commitCombatTurnIndex(idx);
-          continue;
+          await scheduleEnemyChainNextTurn(
+            `enemy-chain-sticky:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${String(liveEnemy?.id ?? "unknown")}`
+          );
+          return;
         }
         // Si `simulateSingleEnemyTurn` lève (ex. tacticien indisponible), aucune clé « traité » :
         // le retry ou le prochain kickoff peut rejouer le slot complet (arbitre + tactique).
@@ -9981,12 +10053,6 @@ export default function ChatInterface() {
         postedNpcTurnEnd = true;
       }
 
-      // Avancer depuis l'index **de cette itération**, pas depuis combatTurnIndexLiveRef :
-      // pendant les awaits (tactique, Firestore), la ref peut être réécrite par un snapshot
-      // et faire rejouer le même combattant ou désynchroniser l'initiative affichée.
-      idx = nextAliveTurnIndexFromActor(order, idx, entry.id, currentEntities);
-      commitCombatTurnIndex(idx);
-
       // MP : pousser tout de suite attaque + fin de tour PNJ avant `runCombatTurnStartArbiter` du
       // prochain slot (Gemini peut prendre des minutes) — sinon l'autre client reste bloqué sur un
       // snapshot partiel et le debounce hôte peut écrire sans la bulle « met fin à son tour ».
@@ -10005,6 +10071,10 @@ export default function ChatInterface() {
         commitCombatTurnIndex(0);
         return;
       }
+      await scheduleEnemyChainNextTurn(
+        `enemy-chain-normal:${combatEngagementSeqRef.current}:${combatRoundInEngagementRef.current}:${String(entry?.id ?? "unknown")}`
+      );
+      return;
     }
 
     // Ne pas remettre l'index à 0 ici : en fin de boucle normale l'index a déjà été avancé
@@ -10066,6 +10136,71 @@ export default function ChatInterface() {
 
   const runEnemyTurnsUntilPlayerRef = useRef(() => Promise.resolve());
   runEnemyTurnsUntilPlayerRef.current = runEnemyTurnsUntilPlayer;
+
+  /**
+   * Trace chat (mode debug) des changements d'initiative réellement visibles côté UI.
+   * Aide à diagnostiquer les resyncs/stales qui écrasent le tour actif.
+   */
+  const lastTurnDebugSnapshotRef = useRef({
+    gameMode: null,
+    idx: null,
+    seq: null,
+    activeId: null,
+  });
+  useEffect(() => {
+    const order = Array.isArray(combatOrder) ? combatOrder : [];
+    const len = order.length;
+    const idx = len > 0 ? Math.min(Math.max(0, combatTurnIndex), len - 1) : 0;
+    const active = len > 0 ? order[idx] ?? null : null;
+    const activeId = String(active?.id ?? "").trim() || null;
+    const activeName = String(active?.name ?? "").trim() || activeId || "—";
+    const seq = typeof combatTurnWriteSeq === "number" && Number.isFinite(combatTurnWriteSeq)
+      ? Math.trunc(combatTurnWriteSeq)
+      : 0;
+    const prev = lastTurnDebugSnapshotRef.current;
+    const gameModeNow = String(gameMode ?? "");
+    const changed =
+      prev.gameMode !== gameModeNow ||
+      prev.idx !== idx ||
+      prev.seq !== seq ||
+      prev.activeId !== activeId;
+    if (debugMode && changed) {
+      const sourceHint = enemyTurnLoopInProgressRef.current
+        ? "enemy-loop"
+        : apiProcessingDepthRef.current > 0
+          ? "api-processing"
+          : "sync/effect";
+      addMessage(
+        "ai",
+        `[DEBUG][TURN] activeTurn changed\n` +
+          safeJson({
+            from: {
+              gameMode: prev.gameMode,
+              idx: prev.idx,
+              seq: prev.seq,
+              activeId: prev.activeId,
+            },
+            to: {
+              gameMode: gameModeNow,
+              idx,
+              seq,
+              activeId,
+              activeName,
+              orderLen: len,
+            },
+            sourceHint,
+          }),
+        "debug",
+        makeMsgId()
+      );
+    }
+    lastTurnDebugSnapshotRef.current = {
+      gameMode: gameModeNow,
+      idx,
+      seq,
+      activeId,
+    };
+  }, [debugMode, gameMode, combatOrder, combatTurnIndex, combatTurnWriteSeq]);
 
   const handleCommitInitiativeRef = useRef(() => {});
   /** Évite plusieurs acquire lock / plusieurs bulles « session occupée » en même temps. */
@@ -10720,6 +10855,17 @@ export default function ChatInterface() {
       const selfT = postEntities.find((e) => e && e.id === casterId) ?? target;
       applyCondsToId(selfT.id, [`${BUFF_DETECT_MAGIC} (auras visibles)`], selfT.conditions ?? player?.conditions);
       summary = `**Détection de la magie** — vous percevez les auras magiques à portée${conc ? " (concentration)" : ""}.`;
+    } else if (spellName === "Main de mage") {
+      if (String(target?.type ?? "").toLowerCase() === "hostile") {
+        summary =
+          "**Main de mage** — vous tentez de gêner **" +
+          `${target?.name ?? "la cible"}** avec une interaction d'objet (max 5 kg, pas d'attaque). ` +
+          "Effet utilitaire uniquement ; la concentration n'est rompue que si un effet concret l'impose.";
+      } else {
+        summary =
+          "**Main de mage** — une main spectrale apparaît à portée (9 m). " +
+          "Elle peut manipuler des objets non verrouillés (max 5 kg), sans jet d'attaque.";
+      }
     } else {
       summary = `**${spellName}** est appliqué.`;
     }
@@ -20928,7 +21074,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
           Journal de Jeu
         </span>
 
-        {/* Toggles IA (MJ, images, auto-joueur) */}
+        {/* Toggles debug (cachés en mode joueur normal) */}
+        {debugMode ? (
         <div className="flex items-center gap-3">
           <div className="flex items-center rounded-md border border-slate-600 bg-slate-800/60 p-0.5 text-xs gap-0.5">
             <button
@@ -21004,6 +21151,9 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             </button>
           )}
         </div>
+        ) : (
+          <div />
+        )}
 
         <div className="flex items-center gap-2 flex-wrap justify-end">
           <button

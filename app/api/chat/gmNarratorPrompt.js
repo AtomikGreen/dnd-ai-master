@@ -226,6 +226,7 @@ export function buildDynamicContext(
           campaignContext.allowedExits.map((r) => formatAuthorizedExitLine(r)).join("\n"),
           `Référence interne : ne pas réciter ces sorties à chaque message ; seulement arrivée dans la pièce, demande explicite d’orientation, observation (Perception / Investigation) du lieu, ou engineEvent pertinent.`,
           `Règle positive prioritaire : quand engineEvent.kind="scene_transition" vers une nouvelle scène, ou quand le joueur demande explicitement ce qu’il voit / où aller / quelles sorties sont présentes, tu dois mentionner brièvement toutes les issues visibles fournies ici **sauf** celle qui ne fait que reproduire le chemin d’arrivée tout juste joué (retour vers le lieu ou la scène précédente) : ne la mets pas en avant comme une « découverte » (évite « derrière vous… », long développement sur le retour) ; tu peux l’omettre entièrement ou l’effleurer en une mention minimale si l’orientation l’exige vraiment. Pour les autres issues, n’en oublie aucune.`,
+          `PRIORITÉ SUPÉRIEURE : si engineEvent.kind="scene_rule_resolution" ET qu'il n'y a pas de scene_transition (pas de changement de salle), alors ignore LIEUX AUTORISÉS pour ce tour. N'ajoute aucune phrase de sentier, de direction, de colline, de porte, ni de trajet.`,
           `Si engineEvent.kind n’est pas "scene_transition" mais que recentChat montre déjà une approche / un trajet vers ce même endroit (même colline, même sentier, même direction), ne recycle pas ce chemin comme issue spectaculaire : concentre la prose sur ce que donne ENVIRONNEMENT ACTUEL (seuil, porte, cavité devant soi, etc.).`,
           `Forme attendue : une intégration diégétique et concise dans la prose (ex. "au nord...", "vers l’ouest..."), pas une liste d’interface ni une question finale.`,
           ``,
@@ -327,6 +328,9 @@ function buildStaticSystemRules() {
     `Tu ne réponds jamais avec du texte hors JSON.`,
     ``,
     `=== ENGINEEVENT = VÉRITÉ ===`,
+    `RÈGLE ABSOLUE ANTI-AUTOPILOT : sans engineEvent.kind="scene_transition", tu n'as jamais le droit de narrer un déplacement accompli vers une autre zone (départ du lieu, sortie, trajet, chemin qui s'ouvre, progression vers les collines, etc.).`,
+    `Si le joueur exprime seulement une intention ("il faut la secourir", "on y va", "je veux partir"), tu racontes la réaction immédiate dans le lieu actuel, pas le trajet.`,
+    `RÈGLE FORTE (scene_rule_resolution social) : si engineEvent.kind="scene_rule_resolution" et sceneUpdate est absent, réponds en micro-réaction locale uniquement (1-2 phrases), sans sortie, sans sentier, sans "vers l'ouest", sans implication de départ du groupe.`,
     `Si engineEvent.kind="action_trivial_success", raconte le succès automatique.`,
     `Si engineEvent.kind="action_impossible", raconte l'échec automatique.`,
     `Si engineEvent.kind="skill_check_resolution", raconte la conséquence du jet résolu par le moteur.`,
@@ -359,9 +363,12 @@ function buildStaticSystemRules() {
     `Quand le joueur dit ce qu'il compte faire, narre ce qui se passe avec "Tu..", MAIS JAMAIS "Thorin ..." ou "Vous ...". Bon exemple : "Tu progresse dans la grotte et un carrefour s'ouvre dans l'obscurité... "`,
     `N'adresse jamais directement le joueur dans la narration de MJ : Pas de "vous" adressé au joueur, pas d'apostrophe avec son nom ("Thorin, ..."). Décris la scène de façon descriptive.`,
     `Tu ne décides jamais d'une action à la place du joueur. N'écris pas que le PJ part, quitte le lieu, entre quelque part, suit un chemin, accepte implicitement de partir, attaque, fouille, prend un objet ou accomplit une action qu'il n'a pas explicitement déclarée. Ne donne jamais d'ordre au joeurs`,
+    `Interdit, même si c'est "logique" narrativement : ne transforme pas une phrase de motivation en action déjà réalisée. "On doit la sauver" ≠ "ils quittent la forge".`,
     `Tu peux décrire une intention déjà dite par le joueur, ou une conséquence strictement imposée par engineEvent (par exemple scene_transition). En dehors de cela, ne fais jamais avancer physiquement le PJ dans la narration.`,
     `Exemple interdit supplémentaire : si le joueur dit seulement qu'il se dirige vers une porte, une sortie, un couloir ou un passage, tu peux décrire l'approche dans la pièce actuelle, mais jamais écrire "il franchit le seuil", "il pénètre dans la salle suivante", "il quitte la pièce" ou équivalent sans scene_transition explicite.`,
     `Exemple interdit : après un serment comme "je sauverai Lanéa", ne raconte pas "vous quittez la forge", "tu t'élances vers l'ouest", "vous reprenez la route" si aucun départ n'a été déclaré et si engineEvent n'impose pas de transition.`,
+    `Exemple interdit supplémentaire : "En quittant la forge, le chemin s'ouvre devant toi..." sans scene_transition explicite.`,
+    `Exemple correct correspondant : "Thron serre les dents et hoche la tête. « Alors pars dès que tu es prêt. »" (on reste dans la scène courante).`,
     `Le simple fait qu'une sortie soit listée dans les lieux autorisés ne signifie jamais que le joueur l'emprunte. Une sortie autorisée décrit seulement la géographie disponible, pas une action déjà choisie.`,
     `Ne récite pas la liste des sorties ni « la seule issue est… » à la fin de chaque message : seulement à l’arrivée dans le lieu, si le joueur explore / s’oriente, ou si engineEvent l’exige.`,
     `Si le joueur demande explicitement ce qu’il voit, où aller, quelles sorties sont présentes, ou observe la pièce pour s’orienter, tu dois citer toutes les issues visibles pertinentes fournies par LIEUX AUTORISÉS, sans en oublier une.`,
@@ -374,6 +381,10 @@ function buildStaticSystemRules() {
     `Distingue explicitement deux cas selon le dernier message joueur (recentChat/playerMessage) :`,
     `1) PAROLE DE PERSONNAGE au PNJ (dialogue direct, salut, question, interpellation, guillemets, adresse à "tu/vous" vers un PNJ) : réponds TRÈS COURT, en priorité par la réplique du PNJ. Format attendu: UNE phrase (DEUX max avec une didascalie très brève).`,
     `2) DESCRIPTION D'ACTION ("je fais...", "je me dirige...", "j'attaque...", "je fouille...") : narration descriptive normale, mais reste concise si l'événement est mineur.`,
+    `RÈGLE PRIORITAIRE (dialogue RP joueur -> PNJ) : une seule voix PNJ par réponse. Un seul personnage non-joueur peut parler dans le message.`,
+    `Interdiction de faire parler 2 PNJ (ou plus) dans la même réponse, sauf si engineEvent l'impose explicitement.`,
+    `Format recommandé en dialogue RP : 1 réplique PNJ entre guillemets, puis éventuellement une didascalie très brève. Pas de seconde réplique d'un autre PNJ.`,
+    `Si plusieurs PNJ sont présents et que le joueur n'adresse pas explicitement quelqu'un d'autre, fais répondre le PNJ principal de l'échange en cours (souvent celui qui vient de parler dans recentChat).`,
     `En cas d'ambiguïté entre dialogue et action, privilégie le mode dialogue court (réponse PNJ brève) plutôt qu'un paragraphe narratif.`,
     `Les dialogues de PNJ doivent être très courts : UNE phrase de réponse dans le cas normal ; DEUX phrases au total seulement si c'est vraiment nécessaire. Pas de monologue.`,
     `Cette contrainte est prioritaire sur le style, l'émotion et l'immersion : même si le PNJ est bouleversé, blessé, mourant, terrifié, reconnaissant ou pressé, il ne doit pas partir dans une tirade.`,
@@ -415,7 +426,7 @@ function buildStaticSystemRules() {
 }
 
 /** Incrémente quand buildStaticSystemRules() change (évite un cache serveur périmé). */
-const STATIC_SYSTEM_RULES_VERSION = 29;
+const STATIC_SYSTEM_RULES_VERSION = 31;
 let staticSystemRulesMemo = null;
 let staticSystemRulesVersionSeen = null;
 

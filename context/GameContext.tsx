@@ -3424,11 +3424,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
       typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
         ? Math.trunc(p.combatTurnWriteSeq)
         : null;
+    const localCombatOrderLenForSeqGuard = Array.isArray(combatOrderRef.current) ? combatOrderRef.current.length : 0;
+    const localInitiativeAlreadyEstablished =
+      combatTurnWriteSeqRef.current > 0 || localCombatOrderLenForSeqGuard > 0;
+    // Durcissement anti-rejeu : dès qu'une initiative locale a déjà vécu, un snapshot
+    // sans combatTurnWriteSeq n'est plus autoritaire pour réécrire l'index.
     const hasAuthoritativeIncomingTurnSeq =
-      incomingTurnWriteSeq !== null || combatTurnWriteSeqRef.current <= 0;
+      incomingTurnWriteSeq !== null || !localInitiativeAlreadyEstablished;
     /** Snapshot plus ancien que nos derniers commits locaux d’index — ne pas réappliquer l’index (vas-et-vient initiative). */
     const staleCombatTurnWrite =
       incomingTurnWriteSeq !== null && incomingTurnWriteSeq < combatTurnWriteSeqRef.current;
+    /**
+     * Collision de writers : même write-seq mais index différent.
+     * Le snapshot entrant est ambigu, on garde donc l'index local pour éviter les retours arrière visuels.
+     */
+    const conflictingSameSeqTurnWrite =
+      incomingTurnWriteSeq !== null &&
+      incomingTurnWriteSeq === combatTurnWriteSeqRef.current &&
+      incomingCombatTurnIdx !== prevCombatTurnIdxBeforeApply;
     const incomingInitiativeMs =
       typeof p.initiativeStateUpdatedAtMs === "number" && Number.isFinite(p.initiativeStateUpdatedAtMs)
         ? Math.trunc(p.initiativeStateUpdatedAtMs)
@@ -3468,14 +3481,18 @@ export function GameProvider({ children }: { children: ReactNode }) {
         if (!shouldIgnoreTransientEmptyCombatOrder && hasAuthoritativeIncomingTurnSeq) {
           setCombatOrderState(incomingCombatOrder);
           combatOrderRef.current = incomingCombatOrder;
-          if (!staleCombatTurnWrite) {
+          if (!staleCombatTurnWrite && !conflictingSameSeqTurnWrite) {
             setCombatTurnIndex(
               incomingCombatTurnIdx,
               incomingTurnWriteSeq !== null ? { forceWriteSeq: incomingTurnWriteSeq } : undefined
             );
           }
         }
-      } else if (!staleCombatTurnWrite && hasAuthoritativeIncomingTurnSeq) {
+      } else if (
+        !staleCombatTurnWrite &&
+        !conflictingSameSeqTurnWrite &&
+        hasAuthoritativeIncomingTurnSeq
+      ) {
         setCombatTurnIndex(
           incomingCombatTurnIdx,
           incomingTurnWriteSeq !== null ? { forceWriteSeq: incomingTurnWriteSeq } : undefined
@@ -3617,8 +3634,15 @@ export function GameProvider({ children }: { children: ReactNode }) {
         // Solo : sans cette condition, `sameCombatSegment` était toujours faux → on remplaçait
         // tout l'état local par le snapshot (souvent périmé) et on perdait ex. movement:false.
         // Si on a ignoré un index distant périmé (staleCombatTurnWrite), on reste sur le segment local.
+        const localTurnWriteSeqBeforeApply = combatTurnWriteSeqRef.current;
+        // Même index ne veut pas forcément dire même tour (wrap de round, bump seq).
+        // Sans ce garde, un snapshot peut AND-fusionner des ressources "consommées"
+        // du tour précédent sur un nouveau tour du même combattant.
+        const sameCombatSegmentBySeq =
+          incomingTurnWriteSeq === null || incomingTurnWriteSeq === localTurnWriteSeqBeforeApply;
         const sameCombatSegment =
           p.gameMode === "combat" &&
+          sameCombatSegmentBySeq &&
           (staleCombatTurnWrite || prevCombatTurnIdxBeforeApply === incomingCombatTurnIdx);
         let mergedMap: TurnResourcesMap = sameCombatSegment
           ? mergeTurnResourcesMapSameCombatSegment(localMap, remoteMap)
@@ -3805,10 +3829,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
         typeof p.combatTurnWriteSeq === "number" && Number.isFinite(p.combatTurnWriteSeq)
           ? Math.trunc(p.combatTurnWriteSeq)
           : null;
+      const localCombatOrderLenForSeqGuardP = Array.isArray(combatOrderRef.current) ? combatOrderRef.current.length : 0;
+      const localInitiativeAlreadyEstablishedP =
+        combatTurnWriteSeqRef.current > 0 || localCombatOrderLenForSeqGuardP > 0;
+      // Même garde-fou sur le 2e bloc d'application initiative : ne jamais accepter
+      // un index sans write-seq après démarrage local de l'initiative.
       const hasAuthoritativeIncomingTurnSeqP =
-        incomingTurnWriteSeqP !== null || combatTurnWriteSeqRef.current <= 0;
+        incomingTurnWriteSeqP !== null || !localInitiativeAlreadyEstablishedP;
       const staleCombatTurnWriteP =
         incomingTurnWriteSeqP !== null && incomingTurnWriteSeqP < combatTurnWriteSeqRef.current;
+      const prevCombatTurnIdxBeforePersistApply = combatTurnIndexRef.current;
+      const incomingCombatTurnIdxP =
+        typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
+          ? Math.trunc(p.combatTurnIndex)
+          : prevCombatTurnIdxBeforePersistApply;
+      const conflictingSameSeqTurnWriteP =
+        incomingTurnWriteSeqP !== null &&
+        incomingTurnWriteSeqP === combatTurnWriteSeqRef.current &&
+        incomingCombatTurnIdxP !== prevCombatTurnIdxBeforePersistApply;
       if (canApplyIncomingInitiativeP) {
         initiativeStateUpdatedAtMsRef.current = Math.max(
           initiativeStateUpdatedAtMsRef.current,
@@ -3831,22 +3869,26 @@ export function GameProvider({ children }: { children: ReactNode }) {
           if (!shouldIgnoreTransientEmptyCombatOrderP && hasAuthoritativeIncomingTurnSeqP) {
             setCombatOrderState(incomingCombatOrderP);
             combatOrderRef.current = incomingCombatOrderP;
-            if (!staleCombatTurnWriteP) {
+            if (!staleCombatTurnWriteP && !conflictingSameSeqTurnWriteP) {
               const idx =
                 typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
                   ? Math.trunc(p.combatTurnIndex)
-                  : 0;
+                  : prevCombatTurnIdxBeforePersistApply;
               setCombatTurnIndex(
                 idx,
                 incomingTurnWriteSeqP !== null ? { forceWriteSeq: incomingTurnWriteSeqP } : undefined
               );
             }
           }
-        } else if (!staleCombatTurnWriteP && hasAuthoritativeIncomingTurnSeqP) {
+        } else if (
+          !staleCombatTurnWriteP &&
+          !conflictingSameSeqTurnWriteP &&
+          hasAuthoritativeIncomingTurnSeqP
+        ) {
           const idx =
             typeof p.combatTurnIndex === "number" && Number.isFinite(p.combatTurnIndex)
               ? Math.trunc(p.combatTurnIndex)
-              : 0;
+              : prevCombatTurnIdxBeforePersistApply;
           setCombatTurnIndex(
             idx,
             incomingTurnWriteSeqP !== null ? { forceWriteSeq: incomingTurnWriteSeqP } : undefined

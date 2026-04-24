@@ -71,7 +71,7 @@ export const GOBLIN_CAVE = {
     id: "scene_journey",
     title: "En chemin vers la colline",
     description: "Les joueurs se mettent en route vers l'ouest. La marche dure environ trois heures dans les collines forestières.",
-    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 20% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
+    secrets: "Si le groupe se met en route immédiatement, les personnages arrivent en vue de l’entrée de la grotte en fin d’après-midi, et ils ont 99% de chance de se faire attaquer par un groupe de deux gobelins en patrouille. Si pour une raison ou une autre ils ne parviennent sur place qu’à la nuit tombée, les chances d’attaque passent alors à 80% et la patrouille est composée de trois gobelins. Chaque gobelin possède 18 pa. Si ils ne se font pas attaquer ils arrivent directement dans la grotte (room_intro).",
     exits: [
       {
         id: "room_intro",
