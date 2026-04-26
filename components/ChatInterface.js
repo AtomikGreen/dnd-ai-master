@@ -2649,6 +2649,7 @@ function executeCombatActionIntent(intent, ctx) {
             engineContext: {
               stage: "spell_heal",
               spellName: resolved.spellName,
+              casterCombatantId: String(localCombatantId ?? "").trim() || null,
               targetId: targetEnt.id,
               targetName: targetEnt.name,
               targetHpCurrent: spellHealTargetHpCurrent,
@@ -2674,6 +2675,7 @@ function executeCombatActionIntent(intent, ctx) {
             engineContext: {
               stage: "spell_auto_hit",
               spellName: resolved.spellName,
+              casterCombatantId: String(localCombatantId ?? "").trim() || null,
               targetId: targetEnt.id,
               dmgNotation,
               spellDamageType: spell.damageType ?? "",
@@ -5931,6 +5933,8 @@ export default function ChatInterface() {
   const tacticianFetchTailRef = useRef(Promise.resolve());
   /** Promesses en cours par clé tacticien : deux appels concurrents avec la même clé partagent le même fetch. */
   const tacticianInFlightByKeyRef = useRef(new Map());
+  /** Mémoire légère de ciblage: dernier PJ visé offensivement par ennemi (anti-focus prompt tacticien). */
+  const enemyLastOffensiveTargetByIdRef = useRef(new Map());
   /** Anti-rejeu robuste : tours ennemis déjà résolus pour (engagement, round, enemyId). */
   const processedEnemyTurnKeysRef = useRef(new Set());
   /** Anti-rollback : ennemis déjà joués depuis le dernier passage sur un slot joueur. */
@@ -7830,6 +7834,12 @@ export default function ChatInterface() {
       const effectiveDamageBonus = enemy.damageBonus ?? enemyTemplate?.damageBonus ?? null;
       const hasWeaponAttackOption =
         enemyWeapons.length > 0 || effectiveAttackBonus != null || !!effectiveDamageDice;
+      const previousTargetIdForEnemy = String(
+        enemyLastOffensiveTargetByIdRef.current.get(String(enemy?.id ?? "").trim()) ?? ""
+      ).trim();
+      const previousTargetCombatant = previousTargetIdForEnemy
+        ? getRuntimeCombatant(previousTargetIdForEnemy, pool)
+        : null;
       body = {
         provider: aiProvider,
         enemy: {
@@ -7943,6 +7953,13 @@ export default function ChatInterface() {
                 available: !!context?.movementOk,
               },
             ],
+          },
+          recentTargeting: {
+            lastOffensiveTargetId: previousTargetIdForEnemy || null,
+            lastOffensiveTargetName:
+              previousTargetCombatant && previousTargetCombatant.name
+                ? String(previousTargetCombatant.name)
+                : null,
           },
           roundContext: context?.roundContext ?? null,
         },
@@ -9479,7 +9496,12 @@ export default function ChatInterface() {
           );
         }
         if (ok === "player_dead" || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
-        if (ok) spentEnemyAction = true;
+        if (ok) {
+          spentEnemyAction = true;
+          if (controllerForCombatantId(targetCombatant.id, gameStateRef.current?.entities ?? entities) === "player") {
+            enemyLastOffensiveTargetByIdRef.current.set(String(enemy.id ?? "").trim(), String(targetCombatant.id));
+          }
+        }
         if (!enemyStillAlive()) break;
         await pauseEnemyTacticalStep();
         continue;
@@ -9614,7 +9636,12 @@ export default function ChatInterface() {
             { type: "action", name: chosenWeapon.name, target: "player", fallback: true }
           );
           if (result === "player_dead" || !hasLivingPlayerCombatant(gameStateRef.current?.entities ?? entities)) return;
-          if (result) spentEnemyAction = true;
+          if (result) {
+            spentEnemyAction = true;
+            if (controllerForCombatantId(fbFromMelee.id, gameStateRef.current?.entities ?? entities) === "player") {
+              enemyLastOffensiveTargetByIdRef.current.set(String(enemy.id ?? "").trim(), String(fbFromMelee.id));
+            }
+          }
         }
       }
     }
@@ -10020,8 +10047,25 @@ export default function ChatInterface() {
       if (!entry) break;
 
       if (controllerForCombatantId(entry.id, currentEntities) === "player") {
-        processedEnemySinceLastPlayerSlotRef.current.clear();
         commitCombatTurnIndex(idx);
+        // Ne pas vider immédiatement l'anti-rejeu "sticky" au simple passage local sur un slot joueur.
+        // En multijoueur, un snapshot stale peut encore revenir brièvement sur un slot ennemi juste après
+        // ce commit. On confirme d'abord que le slot joueur est stable sur un tick UI/sync.
+        await yieldCombatUiSync();
+        order = gameStateRef.current?.combatOrder ?? order;
+        {
+          const lenAfterPlayerCommit = Array.isArray(order) ? order.length : 0;
+          if (lenAfterPlayerCommit > 0) {
+            const idxAfterPlayerCommit = Math.min(Math.max(0, idx), lenAfterPlayerCommit - 1);
+            const entryAfterPlayerCommit = order[idxAfterPlayerCommit];
+            const stillPlayerSlot =
+              !!entryAfterPlayerCommit &&
+              controllerForCombatantId(entryAfterPlayerCommit.id, currentEntities) === "player";
+            if (stillPlayerSlot) {
+              processedEnemySinceLastPlayerSlotRef.current.clear();
+            }
+          }
+        }
         // Tour d'un autre PJ (MP ou 2ᵉ fiche solo) : à 0 PV stabilisé, avancer une seule fois (évite initiative figée / double tour PNJ).
         if (!isLocalPlayerCombatantId(entry.id)) {
           if (tryScheduleRemoteMpDownPlayerTurnAdvance(entry, idx)) {
@@ -11159,7 +11203,8 @@ export default function ChatInterface() {
     postEntities,
     effGameModeForIntent,
     baseRoomId,
-    baseScene
+    baseScene,
+    options = {}
   ) {
     if (!intentResult?.runSpellSave) {
       return { exitCallApi: false, suppressReply: false };
@@ -11197,8 +11242,25 @@ export default function ChatInterface() {
       );
       return { exitCallApi: true, suppressReply: true };
     }
+    const actingPlayerForSpell =
+      options?.actingPlayer && typeof options.actingPlayer === "object"
+        ? options.actingPlayer
+        : player;
+    const rollSubmitterClientId =
+      typeof options?.rollSubmitterClientId === "string" && options.rollSubmitterClientId.trim()
+        ? options.rollSubmitterClientId.trim()
+        : String(clientId ?? "").trim() || null;
+    const turnResourcesForSpellSave =
+      options?.turnResources && typeof options.turnResources === "object"
+        ? options.turnResources
+        : turnResourcesRef.current;
+    const setTurnResourcesForSpellSave =
+      typeof options?.setTurnResources === "function"
+        ? options.setTurnResources
+        : setTurnResourcesSynced;
+
     const resourceKind = resourceKindForCastingTime(spell.castingTime);
-    if (!hasResource(turnResourcesRef.current, effGameModeForIntent, resourceKind)) {
+    if (!hasResource(turnResourcesForSpellSave, effGameModeForIntent, resourceKind)) {
       const label =
         resourceKind === "bonus"
           ? "Action bonus"
@@ -11213,7 +11275,7 @@ export default function ChatInterface() {
       );
       return { exitCallApi: false, suppressReply: true };
     }
-    const slotResult = spendSpellSlot(player, updatePlayer, spell.level ?? 0);
+    const slotResult = spendSpellSlot(actingPlayerForSpell, updatePlayer, spell.level ?? 0);
     if (!slotResult.ok) {
       addMessage(
         "ai",
@@ -11227,7 +11289,7 @@ export default function ChatInterface() {
     if (sm.concentration) {
       applyPlayerConcentrationSwap(canonicalSpellName);
     }
-    const dc = computeSpellSaveDC(player);
+    const dc = computeSpellSaveDC(actingPlayerForSpell);
     const nat = debugNextRoll ?? (Math.floor(Math.random() * 20) + 1);
     if (debugNextRoll !== null) setDebugNextRoll(null);
     const saveBonus = computeEntitySaveBonus(target, spell.save);
@@ -11252,7 +11314,7 @@ export default function ChatInterface() {
       const nextEntities = myUpdates.length ? applyUpdatesLocally(postEntities, myUpdates) : postEntities;
       if (myUpdates.length) applyEntityUpdates(myUpdates);
       ensureCombatState(nextEntities);
-      consumeResource(setTurnResourcesSynced, effGameModeForIntent, resourceKind);
+      consumeResource(setTurnResourcesForSpellSave, effGameModeForIntent, resourceKind);
 
       const saveLabel = `${spell.save}`;
       const bonusStr = fmtMod(saveBonus);
@@ -11312,7 +11374,7 @@ export default function ChatInterface() {
       return { exitCallApi: true, suppressReply: true };
     }
 
-    consumeResource(setTurnResourcesSynced, effGameModeForIntent, resourceKind);
+    consumeResource(setTurnResourcesForSpellSave, effGameModeForIntent, resourceKind);
     const saveLabel = `${spell.save}`;
     const bonusStr = fmtMod(saveBonus);
     const saveLine =
@@ -11325,6 +11387,37 @@ export default function ChatInterface() {
       `ðŸŽ² Jet de sauvegarde (${saveLabel} pour ${canonicalSpellName} â†’ ${target.name}) â€” ${saveLine}`;
     const dmgNotation = String(spell.damage ?? "1d6");
     const splitDmg = splitDiceNotationAndFlatBonus(dmgNotation);
+    const saveDamageOnSuccessMode = spellSaveDamageOnSuccessMode(spell);
+    if (succeeded && saveDamageOnSuccessMode === "none") {
+      pendingRollRef.current = null;
+      setPendingRoll(null);
+      const content = `${fullSaveLine}\n✔ Réussite — aucun dégât. Aucun dégât.`;
+      await callApi(content, "dice", false, {
+        entities: postEntities,
+        currentRoomId: baseRoomId,
+        currentScene: baseScene,
+        currentSceneName,
+        gameMode: effGameModeForIntent,
+        engineEvent: {
+          kind: "spell_save_resolution",
+          spellName: canonicalSpellName,
+          targetId: target.id,
+          saveType: spell.save,
+          nat,
+          total,
+          dc,
+          succeeded: true,
+          damage: 0,
+          targetHpBefore: target.hp?.current ?? null,
+          targetHpAfter: target.hp?.current ?? null,
+          targetHpMax: target.hp?.max ?? null,
+          targetIsAlive: target.isAlive !== false,
+          slotLevelUsed: slotResult.usedLevel,
+          noDamageSave: true,
+        },
+      });
+      return { exitCallApi: true, suppressReply: true };
+    }
     const pendingDmg = stampPendingRollForActor(
       buildPendingDiceRoll({
         roll: splitDmg.diceNotation,
@@ -11344,14 +11437,14 @@ export default function ChatInterface() {
           saveNat: nat,
           saveTotal: total,
           saveDc: dc,
-          saveDamageOnSuccessMode: spellSaveDamageOnSuccessMode(spell),
+          saveDamageOnSuccessMode,
           spellDamageType: spell.damageType ?? "",
           dmgNotation,
           slotResult,
         },
       }),
-      player,
-      clientId
+        actingPlayerForSpell,
+        rollSubmitterClientId
     );
 
     addMessage(
@@ -11718,7 +11811,13 @@ export default function ChatInterface() {
         postEntities,
         effGameModeForIntent,
         baseRoomId,
-        baseScene
+        baseScene,
+        {
+          actingPlayer: combatPlayer,
+          setTurnResources: setTrForResolve,
+          turnResources: turnResourcesForIntentExec,
+          rollSubmitterClientId: rollAttribution?.submitterClientId ?? null,
+        }
       );
       return;
     }
@@ -12236,6 +12335,41 @@ export default function ChatInterface() {
         addMessage("ai", "rollRequest invalide : stat manquant.", "intent-error", makeMsgId());
         return;
       }
+      if (baseGameModeForResolve === "combat") {
+        const resourceKindRaw = String(rr?.resourceKind ?? "").trim().toLowerCase();
+        const resourceKind =
+          resourceKindRaw === "bonus" || resourceKindRaw === "reaction" || resourceKindRaw === "action"
+            ? resourceKindRaw
+            : "action";
+        const trFromOverride =
+          turnResourcesOverrideForResolve && typeof turnResourcesOverrideForResolve === "object"
+            ? normalizeTurnResourcesInput(turnResourcesOverrideForResolve)
+            : null;
+        const trFromCombatant =
+          !trFromOverride &&
+          meleeCombatantIdForResolve &&
+          turnResourcesByCombatantId &&
+          typeof turnResourcesByCombatantId === "object" &&
+          turnResourcesByCombatantId[meleeCombatantIdForResolve]
+            ? normalizeTurnResourcesInput(turnResourcesByCombatantId[meleeCombatantIdForResolve])
+            : null;
+        const trForIntentRoll = trFromOverride ?? trFromCombatant ?? normalizeTurnResourcesInput(turnResourcesRef.current);
+        if (!hasResource(trForIntentRoll, "combat", resourceKind)) {
+          const label =
+            resourceKind === "bonus"
+              ? "votre action bonus"
+              : resourceKind === "reaction"
+                ? "votre réaction"
+                : "votre action";
+          addMessage(
+            "ai",
+            `[Moteur] Vous n'avez plus ${label} disponible pour ce tour.`,
+            "intent-error",
+            makeMsgId()
+          );
+          return;
+        }
+      }
       const skill = rr.skill ?? null;
       const computed = computeCheckBonus({ player: effectiveActingPlayer, stat: rr.stat, skill });
       const audienceRaw = String(rr?.audience ?? "single").trim().toLowerCase();
@@ -12495,15 +12629,25 @@ export default function ChatInterface() {
           "debug",
           makeMsgId()
         );
-        addMessage(
-          "ai",
-          `L'arbitrage des règles du lieu (étape IA avant la narration) a échoué [ARB_ERR:${errMsg}]. Le MJ raconte quand même la suite — pièges / effets secrets du lieu n'ont peut-être pas été appliqués.`,
-          "meta-reply",
-          makeMsgId()
-        );
-        engineEvent = engineEventBeforeArbiter;
-        skipSceneRulesResolvedPipeline = false;
-        // Pas de markFlowFailure : évite de bloquer la saisie ; le narrateur /api/chat part ci-dessous.
+        markFlowFailure(`Erreur GM Arbitre (après parse-intent): ${errMsg}`, {
+          kind: "sceneArbiterAfterIntent",
+          roomId: nextRoomId,
+          scene: nextScene,
+          sceneName: nextSceneName,
+          entitiesAtEntry: nextEntities,
+          userTextForResolve,
+          baseGameMode: gameStateRef.current?.gameMode ?? baseGameModeForResolve,
+          intentDecision: {
+            resolution: apiDecision.resolution,
+            reason: apiDecision.reason ?? null,
+            sceneUpdate: hadIntentSceneTransition ? null : sceneUpdate ?? null,
+            parseIntentNavigationApplied: hadIntentSceneTransition ? true : undefined,
+          },
+          engineEventBeforeArbiter,
+          sceneUpdateSnapshot,
+          actingPlayerOverride: effectiveActingPlayer,
+        });
+        return;
       }
     }
 
@@ -15623,7 +15767,13 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                 postEntities,
                 effGameModeForIntent,
                 baseRoomId,
-                baseScene
+                baseScene,
+                {
+                  actingPlayer,
+                  setTurnResources: setTurnResourcesForActingCombatant,
+                  turnResources: turnResourcesForActingCombatant,
+                  rollSubmitterClientId: rollSubmitterClientId ?? null,
+                }
               );
               if (spellBranch.suppressReply) suppressReplyForThisResponse = true;
               if (spellBranch.exitCallApi) return;
@@ -19346,6 +19496,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
         playerHpRef,
         updatePlayer,
         spendSpellSlot,
+        spendSpellSlotForCombatant,
         hasResource,
         consumeResource,
         setTurnResourcesSynced,
@@ -19750,8 +19901,38 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
               : `Nat ${nat} ${bonusStr} = **${total}** vs DD ${dc}${advNpcSuffix}`;
           const fullSaveLine =
             `ðŸŽ² Jet de sauvegarde (${saveLabel} pour ${roll.weaponName} â†’ ${target.name}) â€” ${natLine}`;
+          const saveDamageOnSuccessMode = spellSaveDamageOnSuccessMode(spell);
 
           consumeResource(setTurnResourcesSynced, effGm, resourceKind);
+
+          if (succeeded && saveDamageOnSuccessMode === "none") {
+            pendingRollRef.current = null;
+            setPendingRoll(null);
+            const content = `${fullSaveLine}\n✔ Réussite — aucun dégât. Aucun dégât.`;
+            await callApi(content, "dice", false, {
+              skipSessionLock: true,
+              skipAutoPlayerTurn: true,
+              entities: entPool,
+              engineEvent: {
+                kind: "spell_save_resolution",
+                spellName: roll.weaponName,
+                targetId: target.id,
+                saveType: spell.save,
+                nat,
+                total,
+                dc,
+                succeeded: true,
+                damage: 0,
+                targetHpBefore: target.hp?.current ?? null,
+                targetHpAfter: target.hp?.current ?? null,
+                targetHpMax: target.hp?.max ?? null,
+                targetIsAlive: target.isAlive !== false,
+                slotLevelUsed: slotResult.usedLevel,
+                noDamageSave: true,
+              },
+            });
+            return;
+          }
 
           const pendingDmg = stampPendingRollForActor(
             buildPendingDiceRoll({
@@ -19772,7 +19953,7 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
                 saveNat: nat,
                 saveTotal: total,
                 saveDc: dc,
-                saveDamageOnSuccessMode: spellSaveDamageOnSuccessMode(spell),
+                saveDamageOnSuccessMode,
                 spellDamageType: spell.damageType ?? "",
                 dmgNotation,
                 slotResult,

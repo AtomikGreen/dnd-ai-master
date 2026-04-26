@@ -1653,6 +1653,8 @@ interface PersistedPayload {
   currentScene: string;
   currentRoomId: string;
   sceneVersion: number;
+  /** Horodatage logique (ms) de la dernière mutation explicite d'identité de scène (room/scene). */
+  roomIdentityUpdatedAtMs?: number;
   entities: Entity[];
   /** Entités par salle (hors salle courante) pour retrouver cadavres / état au retour. */
   entitiesByRoom?: Record<string, Entity[]>;
@@ -1698,6 +1700,8 @@ interface SharedSessionPayload {
   currentScene: string;
   currentRoomId: string;
   sceneVersion: number;
+  /** Horodatage logique (ms) de la dernière mutation explicite d'identité de scène (room/scene). */
+  roomIdentityUpdatedAtMs?: number;
   entities: Entity[];
   entitiesByRoom?: Record<string, Entity[]>;
   roomMemoryByRoom?: Record<string, string>;
@@ -2100,6 +2104,7 @@ function buildLobbySharedSessionPayload(): SharedSessionPayload {
       "Les aventuriers se retrouvent avant d’entrer dans la campagne. Choisissez vos personnages, partagez le lien, puis lancez quand vous êtes prêts.",
     currentRoomId: "lobby",
     sceneVersion: 0,
+    roomIdentityUpdatedAtMs: 0,
     entities: [],
     entitiesByRoom: {},
     roomMemoryByRoom: {},
@@ -2226,6 +2231,7 @@ function buildInitialCampaignSharedPayload(): SharedSessionPayload {
     currentScene: start?.description ?? "",
     currentRoomId: start?.id ?? "scene_village",
     sceneVersion: 1,
+    roomIdentityUpdatedAtMs: 0,
     entities: loadedEntities as Entity[],
     entitiesByRoom: {},
     roomMemoryByRoom: {},
@@ -2422,10 +2428,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const currentRoomIdLiveRef = useRef<string>("scene_village");
   const currentSceneNameLiveRef = useRef<string>(DEFAULT_SCENE_NAME);
   const currentSceneLiveRef = useRef<string>(DEFAULT_SCENE_DESCRIPTION);
+  /** Source de vérité LWW pour les changements de salle/scène en multijoueur. */
+  const roomIdentityUpdatedAtMsRef = useRef<number>(0);
 
   const setCurrentRoomId = useCallback((id: string) => {
+    const prev = currentRoomIdLiveRef.current;
     currentRoomIdLiveRef.current = id;
-    setCurrentRoomIdState(id);
+    if (String(prev ?? "").trim() !== String(id ?? "").trim()) {
+      roomIdentityUpdatedAtMsRef.current = Date.now();
+      setCurrentRoomIdState(id);
+    }
   }, []);
 
   const setCurrentSceneName = useCallback((name: string) => {
@@ -2479,7 +2491,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const takeEntitiesForRoom = useCallback((roomId: string): Entity[] => {
-    if (!roomId || roomId === "scene_journey") return [];
+    if (!roomId) return [];
     const raw = entitiesByRoomRef.current[roomId];
     if (!raw || !Array.isArray(raw)) return [];
     return normalizeLoadedEntitiesList(raw).filter((e) => e.type !== "object");
@@ -3011,6 +3023,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       currentScene: currentSceneLiveRef.current,
       currentRoomId: currentRoomIdLiveRef.current,
       sceneVersion,
+      roomIdentityUpdatedAtMs: roomIdentityUpdatedAtMsRef.current,
       entities: entitiesRef.current,
       entitiesByRoom: { ...entitiesByRoomRef.current },
       roomMemoryByRoom: { ...roomMemoryByRoomRef.current },
@@ -3091,6 +3104,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       currentScene: currentSceneLiveRef.current,
       currentRoomId: currentRoomIdLiveRef.current,
       sceneVersion,
+      roomIdentityUpdatedAtMs: roomIdentityUpdatedAtMsRef.current,
       entities: entitiesRef.current,
       entitiesByRoom: { ...entitiesByRoomRef.current },
       roomMemoryByRoom: { ...roomMemoryByRoomRef.current },
@@ -3319,7 +3333,13 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const localRoomBeforeApply = currentRoomIdLiveRef.current;
     const localSvBeforeApply = sceneVersionRef.current;
     const remoteSv = typeof p.sceneVersion === "number" ? p.sceneVersion : 0;
-    const canApplyRemoteSceneIdentity = remoteSv >= localSvBeforeApply;
+    const localRoomIdentityMs = Math.trunc(Number(roomIdentityUpdatedAtMsRef.current ?? 0) || 0);
+    const remoteRoomIdentityMs =
+      typeof p.roomIdentityUpdatedAtMs === "number" && Number.isFinite(p.roomIdentityUpdatedAtMs)
+        ? Math.trunc(p.roomIdentityUpdatedAtMs)
+        : 0;
+    const canApplyRemoteSceneIdentity =
+      remoteRoomIdentityMs > localRoomIdentityMs || remoteSv >= localSvBeforeApply;
     const remoteRoomId = typeof p.currentRoomId === "string" ? p.currentRoomId : "";
     const isRemoteRoomDifferent =
       !!remoteRoomId && !!localRoomBeforeApply && String(remoteRoomId) !== String(localRoomBeforeApply);
@@ -3330,6 +3350,11 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setCurrentSceneName(typeof p.currentSceneName === "string" ? p.currentSceneName : DEFAULT_SCENE_NAME);
       setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
       setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
+      roomIdentityUpdatedAtMsRef.current = Math.max(
+        Math.trunc(Number(roomIdentityUpdatedAtMsRef.current ?? 0) || 0),
+        localRoomIdentityMs,
+        remoteRoomIdentityMs
+      );
     } else {
       // Snapshot partagé en retard : ne pas écraser la salle/scène locales déjà plus récentes.
       setCurrentSceneName(currentSceneNameLiveRef.current);
@@ -3813,6 +3838,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setCurrentScene(typeof p.currentScene === "string" ? p.currentScene : DEFAULT_SCENE_DESCRIPTION);
     setCurrentRoomId(typeof p.currentRoomId === "string" ? p.currentRoomId : "scene_village");
     setSceneVersion(typeof p.sceneVersion === "number" ? p.sceneVersion : 0);
+    roomIdentityUpdatedAtMsRef.current =
+      typeof p.roomIdentityUpdatedAtMs === "number" && Number.isFinite(p.roomIdentityUpdatedAtMs)
+        ? Math.trunc(p.roomIdentityUpdatedAtMs)
+        : roomIdentityUpdatedAtMsRef.current;
     const loadedEntities = Array.isArray(p.entities) ? normalizeLoadedEntitiesList(p.entities) : [];
     if (Array.isArray(p.entities)) {
       entitiesRef.current = loadedEntities as Entity[];
