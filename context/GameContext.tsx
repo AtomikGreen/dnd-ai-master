@@ -3453,15 +3453,13 @@ export function GameProvider({ children }: { children: ReactNode }) {
       // parce qu'encore des hostiles vivants / un vieux combatOrder (sinon MJ reste en exploration).
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !preserveCombatFromPayload) {
+        } else if (want !== "combat" && !hostileAlive && !preserveCombatFromPayload) {
           // Ordre d'initiative distant souvent encore rempli alors que tous les hostiles sont morts :
           // sans ce garde, `hasCombatOrder` seul forçait le mode combat indéfiniment.
           setGameModeState("exploration");
         } else {
           const shouldCombat =
-            want === "combat" ||
-            hasCombatOrder ||
-            (hostileAlive && (want === "combat" || inInitiativePhase));
+            preserveCombatFromPayload || hasCombatOrder || (hostileAlive && inInitiativePhase);
           setGameModeState(shouldCombat ? "combat" : want);
         }
       }
@@ -3587,13 +3585,20 @@ export function GameProvider({ children }: { children: ReactNode }) {
           typeof p.playerInitiativeRollsByEntityId === "object" &&
           !Array.isArray(p.playerInitiativeRollsByEntityId)
         ) {
-          // Multi-joueurs : on fusionne (union) les jets reçus.
-          // Les snapshots Firestore peuvent être partiels (un client n'a pas encore tous les rolls),
-          // sinon on perd des clés et on court-circuite / bloque l'attente.
-          const incoming = { ...(p.playerInitiativeRollsByEntityId as Record<string, number>) };
-          const merged = { ...(playerInitiativeRollsByEntityIdRef.current ?? {}), ...incoming };
-          playerInitiativeRollsByEntityIdRef.current = merged;
-          setPlayerInitiativeRollsByEntityIdState(merged);
+          // Nouveau cycle d'initiative: ne jamais conserver des clés locales d'un cycle précédent.
+          // Garder une union ici peut réutiliser un ancien d20 (ex: "15") sur un nouveau combat.
+          const incomingRaw = p.playerInitiativeRollsByEntityId as Record<string, number>;
+          const nextRolls = Object.fromEntries(
+            Object.entries(incomingRaw).filter(
+              ([id, v]) => String(id ?? "").trim() !== "" && typeof v === "number" && Number.isFinite(v)
+            )
+          );
+          playerInitiativeRollsByEntityIdRef.current = nextRolls;
+          setPlayerInitiativeRollsByEntityIdState(nextRolls);
+        } else if (p.awaitingPlayerInitiative === true) {
+          // Snapshot d'ouverture initiative sans map de jets: purger les reliquats locaux.
+          playerInitiativeRollsByEntityIdRef.current = {};
+          setPlayerInitiativeRollsByEntityIdState({});
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {
@@ -3886,13 +3891,11 @@ export function GameProvider({ children }: { children: ReactNode }) {
         const want = p.gameMode;
         if (want === "short_rest") {
           setGameModeState("short_rest");
-        } else if (!hostileAlive && !preserveCombatFromPayload) {
+        } else if (want !== "combat" && !hostileAlive && !preserveCombatFromPayload) {
           setGameModeState("exploration");
         } else {
           const shouldCombat =
-            want === "combat" ||
-            hasCombatOrder ||
-            (hostileAlive && (want === "combat" || inInitiativePhase));
+            preserveCombatFromPayload || hasCombatOrder || (hostileAlive && inInitiativePhase);
           setGameModeState(shouldCombat ? "combat" : want);
         }
       }
@@ -4012,9 +4015,18 @@ export function GameProvider({ children }: { children: ReactNode }) {
           typeof p.playerInitiativeRollsByEntityId === "object" &&
           !Array.isArray(p.playerInitiativeRollsByEntityId)
         ) {
-          const nextRolls = { ...p.playerInitiativeRollsByEntityId };
+          const incomingRaw = p.playerInitiativeRollsByEntityId as Record<string, number>;
+          const nextRolls = Object.fromEntries(
+            Object.entries(incomingRaw).filter(
+              ([id, v]) => String(id ?? "").trim() !== "" && typeof v === "number" && Number.isFinite(v)
+            )
+          );
           playerInitiativeRollsByEntityIdRef.current = nextRolls;
           setPlayerInitiativeRollsByEntityIdState(nextRolls);
+        } else if (p.awaitingPlayerInitiative === true) {
+          // Même garde-fou sur le chargement persisted.
+          playerInitiativeRollsByEntityIdRef.current = {};
+          setPlayerInitiativeRollsByEntityIdState({});
         }
         if (typeof p.awaitingPlayerInitiative === "boolean") {
           if (!p.awaitingPlayerInitiative) {

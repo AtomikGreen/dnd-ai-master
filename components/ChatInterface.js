@@ -1887,6 +1887,8 @@ function executeCombatActionIntent(intent, ctx) {
     messagesRef = { current: [] },
     multiplayerParticipantProfilesRef = { current: [] },
     multiplayerSessionId = null,
+    setMultiplayerGameModeImmediate = null,
+    flushMultiplayerSharedState = null,
     clientId = "",
     patchParticipantProfileHp = null,
     combatEngagementSeqRef = { current: 0 },
@@ -2496,7 +2498,15 @@ function executeCombatActionIntent(intent, ctx) {
     if (awarenessUpdates.length) {
       applyEntityUpdates?.(awarenessUpdates);
     }
-    setGameMode?.("combat");
+    if (multiplayerSessionId && typeof setMultiplayerGameModeImmediate === "function") {
+      void setMultiplayerGameModeImmediate("combat");
+      if (typeof flushMultiplayerSharedState === "function") {
+        // Combat opening durability: persist awareOfPlayer + combat mode immediately.
+        void flushMultiplayerSharedState().catch(() => {});
+      }
+    } else {
+      setGameMode?.("combat");
+    }
     // Ouverture de combat D&D 5e : on entre d'abord en initiative.
     // L'attaque déclarée ne se résout pas avant que l'ordre de tour soit établi.
     return { ok: true, pendingRoll: null };
@@ -4324,11 +4334,22 @@ export default function ChatInterface() {
     const latest = multiplayerPendingCommandRef.current;
     if (!latest || String(latest.id).trim() !== cmdId) return;
 
-    /** Une seule exécution moteur / parse-intent par commande : le garde-fou global est par onglet,
-     * donc sans ceci chaque client lançait callApi → doublons MJ + coût API. */
-    const submitterClient = String(latest?.submittedBy ?? "").trim();
-    const localClient = String(clientId ?? "").trim();
-    if (submitterClient && localClient && submitterClient !== localClient) {
+    /** Une seule exécution moteur / parse-intent par commande.
+     * IMPORTANT MP: exécuter sur le résolveur autoritaire (hôte si présent), pas sur le submitter,
+     * sinon une action d'invité peut rester locale et ne pas persister durablement le mode combat. */
+    const participantIdsForResolverElection = Array.isArray(multiplayerParticipantProfilesRef.current)
+      ? multiplayerParticipantProfilesRef.current
+          .map((p) => String(p?.clientId ?? "").trim())
+          .filter(Boolean)
+      : [];
+    if (
+      !shouldRunGlobalArbiterFollowup({
+        multiplayerSessionId,
+        clientId,
+        hostClientId: multiplayerHostClientId,
+        expectedClientIds: participantIdsForResolverElection,
+      })
+    ) {
       return;
     }
 
@@ -4534,6 +4555,7 @@ export default function ChatInterface() {
   }, [
     clearMultiplayerPendingCommand,
     clientId,
+    multiplayerHostClientId,
     multiplayerPendingCommand?.id,
     multiplayerPendingCommand?.submittedBy,
     multiplayerSessionId,
@@ -7213,7 +7235,11 @@ export default function ChatInterface() {
       nextGameMode = "exploration";
     }
     if (combatPatch?.gameMode === "combat") {
-      setGameMode("combat");
+      if (multiplayerSessionId) {
+        void setMultiplayerGameModeImmediate("combat");
+      } else {
+        setGameMode("combat");
+      }
       nextGameMode = "combat";
     } else if (combatPatch?.gameMode === "exploration") {
       setGameMode("exploration", entities, { force: true });
@@ -9772,7 +9798,11 @@ export default function ChatInterface() {
     if (liveMode !== "combat") {
       if (!anyCombatReadyHostile) return;
       addMessage("ai", "[DEBUG] Hostiles engagés â†’ passage en COMBAT", "debug", makeMsgId());
-      setGameMode("combat");
+      if (multiplayerSessionId) {
+        void setMultiplayerGameModeImmediate("combat");
+      } else {
+        setGameMode("combat");
+      }
       // En entrant en combat, on active Bonus/Réaction (disponibles par défaut),
       // sans "rendre" une Action déjÃ  dépensée ce tour (ex: attaque qui déclenche le combat).
       setHasDisengagedThisTurn(false);
@@ -11753,6 +11783,8 @@ export default function ChatInterface() {
       messagesRef,
       multiplayerParticipantProfilesRef,
       multiplayerSessionId,
+      setMultiplayerGameModeImmediate,
+      flushMultiplayerSharedState,
       clientId,
       patchParticipantProfileHp,
       combatEngagementSeqRef,
@@ -15746,6 +15778,8 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
             messagesRef,
             multiplayerParticipantProfilesRef,
             multiplayerSessionId,
+            setMultiplayerGameModeImmediate,
+            flushMultiplayerSharedState,
             clientId,
             patchParticipantProfileHp,
             combatEngagementSeqRef,
@@ -17261,7 +17295,11 @@ function shouldNarrateArbiterOutcome({ phase = null, resolution = null, engineEv
       if (playerIdx >= 0) {
         commitCombatTurnIndex(playerIdx);
       }
-      setGameMode("combat");
+      if (multiplayerSessionId) {
+        void setMultiplayerGameModeImmediate("combat");
+      } else {
+        setGameMode("combat");
+      }
     }
     grantPlayerTurnResources();
     setPendingRoll(null);
